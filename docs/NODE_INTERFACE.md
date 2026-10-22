@@ -87,25 +87,35 @@ every connect (including reconnects after a dropped connection).
 
 ### 5.1 UE → bridge: `UserInput` command schema
 
-**Status: placeholder, to be refined.** The bridge watches the preset's
-`UserInput` string property for changes (delivered as a `ChangedFields`
-WebSocket event) and parses each new value as one JSON object. The command
-set below (`select_object`/`deselect`/`control`/`execute_action`) is a
-first draft and will be revised once the §5.2.C `InteractionPanel` schema
-is finalized -- in particular, a button tap must be reportable as a
-**button press referencing the `button_id` from the most recently pushed
-`InteractionPanel`**, so the bridge can resolve "which button" without UE
-needing any domain knowledge of what that button does. Exact field name/
-shape for that (`{"cmd": "button_press", "button_id": "..."}` or folded
-into the existing commands) is still open -- do not treat this subsection
-as final.
+The bridge watches the preset's `UserInput` string property for changes
+(delivered as a `ChangedFields` WebSocket event) and parses each new value
+as one JSON object.
+
+**Governing principle: UE is domain-agnostic and only echoes back opaque
+IDs the bridge most recently assigned it.** UE never needs to know what an
+object or button *means* -- it just reports which `instance_id` the user
+tapped (from the last `UpdateDetectedObjects` push, §5.2.D) or which
+`button_id` the user tapped (from the last `InteractionPanel` push,
+§5.2.C). The bridge is the only side that knows what each ID actually maps
+to (an Orchestrator object, an action to execute, a dismiss/retry/cancel
+behavior, etc.) and resolves that internally when the command arrives.
 
 | `cmd` | Fields | Orchestrator call triggered |
 |---|---|---|
-| `select_object` | `instance_id` (string), `perception_class` (string) | `select_object` |
+| `select_object` | `instance_id` (string) -- echoed from `UpdateDetectedObjects`; `perception_class` (string) | `select_object` |
 | `deselect` | *(none)* | `deselect` |
 | `control` | `command`: one of `"PAUSE"`, `"RESUME"`, `"CANCEL"` | `control` |
 | `execute_action` | `engine_id` (string), `action_id` (string), `params` (object, optional) | `execute_action` |
+| `button_press` | `button_id` (string) -- echoed from the most recently pushed `InteractionPanel` (§5.2.C) | resolved by the bridge: it looks up what `button_id` meant when that panel was built (e.g. a specific `execute_action` call, a `control` command, or purely dismissing the panel client-side) and performs that |
+
+The bridge is responsible for maintaining the `button_id → action` mapping
+for whatever panel it most recently pushed; a stale/unknown `button_id`
+(e.g. from a panel that has since been replaced) must be treated like any
+other unresolvable command (see error handling below), not forwarded
+blindly. `select_object`'s `perception_class` field is likely redundant
+with `instance_id` alone (the Orchestrator can look up the class from the
+instance) -- kept for now since it was already part of the Gen1-derived
+first draft; may be dropped once §5.1 is next revisited.
 
 Unknown `cmd` values, and values that don't parse as JSON at all, are
 logged and must **not** be forwarded to the Orchestrator; the bridge
