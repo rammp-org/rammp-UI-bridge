@@ -104,9 +104,8 @@ Reuses the Gen1 prototype's TCP streaming mechanism unchanged
 WebSocket, since this is bulk pixel data). Two kinds of sources:
 
 - **RGBD from a Perception node** -- color + depth, optionally accompanied
-  by detected-object information for that frame (e.g. a segmentation mask
-  and/or bounding-box list, following the Gen1 `send_mask`/metadata
-  pattern) when Perception has detections for the frame; absent otherwise.
+  by detected-object information for that frame when Perception has
+  detections; absent otherwise.
 - **RGB-only from an Engine node's own camera** (e.g. a wrist camera active
   only during a manipulation action), likewise optionally accompanied by
   detections.
@@ -115,10 +114,27 @@ Each source gets its own channel/`stream_id`, tagged with
 `source`/`role`/`group` metadata so UE can route each frame to the right
 material/viewport -- same conventions as Gen1's per-camera channel
 numbering (see that bridge's `image_channel`/`depth_channel`/`mask_channel`
-parameters for precedent). **Open/TBD:** neither perception nor engine
-camera topics are defined in `rammp_orchestrator_interfaces` /
+parameters for precedent).
+
+**Important correction re: "detected objects" transport.** The Gen1
+streaming protocol itself (`StreamHeader`/`StreamMessage`) carries **no
+semantic labelling** -- its metadata is just `w`/`h`/`fmt`/`group`/`role`/
+`stream_id`/`name`/`material_params`, and `send_mask()` sends only a
+per-pixel segmentation-ID image plus a `NumSegmentIDs` count (a shader
+hint, not a label list). In Gen1, the actual object semantics (e.g.
+"segment ID 1 = cup, state = full") were pushed **separately** via Remote
+Control calls (`UpdateCupInfo`/`UpdateButtonInfo`), correlated with the
+mask stream only by convention, not carried in-band. This bridge should do
+the same: a segmentation mask (if sent) travels on the camera-stream
+channel as pixel data only, while any accompanying detected-object
+semantics (class, instance ID, bounding box, pose) are pushed as data on
+the **`InteractionPanel`/world-state side** (§5.2.C and the existing
+`get_detected_objects`/`UpdateDetectedObjects`-style push), not embedded in
+the stream's metadata. **Open/TBD:** neither perception nor engine camera
+topics are defined in `rammp_orchestrator_interfaces` /
 `rammp_perception_interfaces` yet -- this channel's exact ROS2-side source
-topics need to be defined before implementation.
+topics (and whether a segmentation mask is even produced) need to be
+defined before implementation.
 
 #### B. System status (robot proprioception)
 
