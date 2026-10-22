@@ -271,6 +271,34 @@ object consistently. `box`-only hit-testing (UE does a simple
 point-in-rectangle check against the latest pushed `box`) is simpler and
 is now the **sole** tap-to-select overlay mechanism, not a fallback.
 
+**Interactive objects during an active task (e.g. "what can I pick up
+right now").** The same mechanism above also covers an engine
+*introducing* objects mid-task, not just refining ones Perception already
+found. For a task like pick-and-place, the engine can call
+`update_object_state` to populate `ObjectRecord`s for candidate pickable
+objects it detects via its own camera (§3.3's overlay stream) -- these
+flow through `get_detected_objects`/`UpdateDetectedObjects` (§5.2.D)
+exactly like any other object, letting the user tap to select one mid-task
+without any new interface. A task with nothing to select (e.g. an
+articulation engine opening a door) simply never calls
+`update_object_state` for this purpose, so the panel correctly shows no
+objects -- pushing candidates this way is per-engine/per-task behavior,
+not something every engine is required to do.
+
+Crucially, `stream_id` (above) is what keeps this coherent once the
+*source* camera changes mid-session: a box pushed while Perception was
+the source is in the scene camera's pixel space (§3.2, the base layer in
+§5.2.A), while a box pushed by an active engine's `update_object_state`
+call is in *that engine's own camera's* pixel space (§3.3, the overlay
+layer) -- a different resolution/field of view in general. UE must look
+up which stream (base or overlay) a given `stream_id` refers to and
+hit-test/draw the box against *that* stream's frame, not always the base
+layer. This is also why boxes can't simply keep streaming from Perception
+once an engine is active and assumed to have paused it (see the Perception
+lifecycle note in §7) -- without a live scene-camera detector, only the
+active engine's own detections are available to populate the panel during
+that window.
+
 ### 3.2 Bridge ↔ Camera
 
 No shared interface package defines this today, and nothing in this
@@ -622,6 +650,18 @@ to the task/button-dialog lifecycle.
   `update_object_state` call. This is the bbox gap's actual resolution
   (superseding an earlier revision's "bridge subscribes directly to
   Perception" design) -- not yet implemented.
+- **Perception's start/stop lifecycle during an active task is an
+  unconfirmed assumption, not a documented fact.** §3.1's
+  `get_detected_objects` note assumes Perception may be paused/stopped
+  while an engine is active (e.g. the scene camera's view is obstructed
+  by the arm, or to free compute), which is why an engine pushing its
+  own candidate objects via `update_object_state` is the only source of
+  detections during that window. But nothing in this workspace currently
+  starts/stops Perception's tracking session (`StartTracking.srv`/
+  `StopTracking.srv`) -- not the Orchestrator, not this bridge -- so
+  whatever node *does* own that decision, and the exact conditions under
+  which it stops Perception, still needs to be confirmed before this
+  behavior can be relied on.
 - **Raw RGB/depth image topics for §5.2.A (camera streams, §3.2's scene
   camera and §3.3's per-engine camera)** are undefined -- no camera
   driver node, and no engine publishing its own camera, exist in this
