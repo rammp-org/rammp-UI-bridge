@@ -37,7 +37,7 @@ never advertises any of these itself.
 | Orchestrator interface | Type | Used for |
 |---|---|---|
 | `<orchestrator_ns>/get_world_state` | `GetWorldState.srv` | Polled; result pushed to UE on version change |
-| `<orchestrator_ns>/get_detected_objects` | `GetDetectedObjects.srv` | Polled; result pushed to UE on instance-set change |
+| `<orchestrator_ns>/get_detected_objects` | `GetDetectedObjects.srv` | Polled; result pushed to UE on instance-set change (see note below re: bounding boxes) |
 | `<orchestrator_ns>/select_object` | `SelectObject.srv` | Called when UE sends a `select_object` command |
 | `<orchestrator_ns>/deselect` | `Deselect.srv` | Called when UE sends a `deselect` command |
 | `<orchestrator_ns>/control` | `Control.srv` | Called when UE sends a `control` command (pause/resume/cancel) |
@@ -46,6 +46,29 @@ never advertises any of these itself.
 The bridge never calls `register_engine`, `write_world_state`,
 `update_object_state`, or `request_intent` -- those are engine-facing, not
 UI-facing (see `rammp_orchestrator_interfaces` package docs).
+
+**Note on tap-to-select overlays / bounding boxes.** `ObjectRecord` today
+carries `instance_id`/`perception_class`/`last_pose_json` (a world/robot-
+frame pose) /`location`/`opened`/`last_seen` -- no camera-pixel-space
+bounding box. For UE to let a user tap an object directly in the live
+camera-stream video (§5.2.A) and have that resolve to a `select_object`
+call, each detected object needs a 2D bbox in that camera's pixel space,
+tagged with which `stream_id` it overlays.
+
+The recommended design (not yet implemented, needs `ObjectRecord`/
+perception changes upstream) is to **extend the existing detected-objects
+push** with an optional `bbox: {x, y, w, h}` + `stream_id` per object,
+reusing the same `instance_id` that `select_object` already consumes --
+rather than routing object/bbox data through `InteractionPanel` (§5.2.C).
+`InteractionPanel` is a one-shot task dialog (title/message/buttons/
+progress) with a different update cadence and payload shape than per-
+frame, per-camera-stream object detections; keeping detected-object data on
+its existing dedicated channel keeps the "tap an object" and "tap a task
+button" interactions on two cleanly separate paths while still sharing one
+`instance_id`/`button_id`-style identifier scheme. This needs upstream
+`ObjectRecord`/perception support before it can be implemented -- not
+blocking this doc, but tracked here as the resolved direction pending
+perception-side bbox availability.
 
 ## 4. UI-facing interface (ROS2 server/publisher side)
 
@@ -127,11 +150,11 @@ Control calls (`UpdateCupInfo`/`UpdateButtonInfo`), correlated with the
 mask stream only by convention, not carried in-band. This bridge should do
 the same: a segmentation mask (if sent) travels on the camera-stream
 channel as pixel data only, while any accompanying detected-object
-semantics (class, instance ID, bounding box, pose) are pushed as data on
-the **`InteractionPanel`/world-state side** (§5.2.C and the existing
-`get_detected_objects`/`UpdateDetectedObjects`-style push), not embedded in
-the stream's metadata. **Open/TBD:** neither perception nor engine camera
-topics are defined in `rammp_orchestrator_interfaces` /
+semantics (class, instance ID, 2D bounding box, pose) are pushed as data on
+the **existing detected-objects push** (§3's note on tap-to-select
+overlays/bounding boxes), *not* on `InteractionPanel` (§5.2.C), which stays
+reserved for the task/button dialog only. **Open/TBD:** neither perception
+nor engine camera topics are defined in `rammp_orchestrator_interfaces` /
 `rammp_perception_interfaces` yet -- this channel's exact ROS2-side source
 topics (and whether a segmentation mask is even produced) need to be
 defined before implementation.
@@ -220,6 +243,11 @@ than a growing set of bespoke RPC function signatures.
   joint/base state. Camera streaming and system status are *intended*
   channels of this bridge (unlike in the prior version of this doc), but
   implementation is blocked on those source topics being defined first.
+- **2D bounding boxes for tap-to-select camera overlays** (§3's note) are
+  undefined on the perception side -- `ObjectRecord` has no camera-pixel-
+  space bbox field today. The direction (extend the detected-objects push,
+  not `InteractionPanel`) is decided; the upstream `ObjectRecord`/
+  perception change to actually produce it is not.
 - Joint-state → UE skeleton **mapping logic** (the specific joint-index
   layout the Gen1 prototype's `set_ui_joints` hardcoded for its chair+arm
   robot) does not carry over as-is, since it was specific to that
