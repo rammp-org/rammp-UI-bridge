@@ -48,10 +48,13 @@ server/publisher side is §4):
 - **§3.3 Bridge ↔ Engine node** -- a *direct* subscription to the
   currently-active engine's own camera stream (e.g. a wrist camera, with
   any interaction mask/overlay already rendered into the RGB pixels by
-  the engine itself) -- nothing else. The engine does **not** push
-  detected objects to the bridge directly; it pushes them to the
-  Orchestrator (via `update_object_state`), which is what the bridge
-  reads from §3.1 -- see the note at the end of this section.
+  the engine itself) -- nothing else. This is strictly **additional** to
+  §3.2's scene camera, not a replacement for it: the scene feed keeps
+  streaming the whole time, and UE overlays this engine stream on top of
+  it (§5.2.A) only while the engine is actively sending one. The engine
+  does **not** push detected objects to the bridge directly; it pushes
+  them to the Orchestrator (via `update_object_state`), which is what
+  the bridge reads from §3.1 -- see the note at the end of this section.
 - **§3.4 Bridge ↔ Hardware node** -- a *direct* subscription to
   always-on, hardware-level robot telemetry (arm joint states, chair/base
   speed and status) that exists independent of which engine (if any) is
@@ -301,19 +304,24 @@ generic**, unlike §3.1/§3.2. The reference engine wiring
 Orchestrator-facing, not a camera topic a UI would subscribe to -- and
 no mock or real engine in this workspace currently publishes one.
 
-**Scope is deliberately narrow: a camera stream, and nothing else.**
-While an engine is active and working a task, it may have its own camera
-(e.g. a wrist cam) that's more relevant to the user than the scene
-camera -- and unlike §3.2's scene feed, this engine stream is expected to
-already have any interaction mask/overlay the engine wants to show
-**rendered directly into the RGB pixels** by the engine itself (burned-in,
-not a separate mask/segmentation channel), since this is a
-task-in-progress view for the user to watch, not a tap-to-select surface.
+**Scope is deliberately narrow: an additional camera stream, and nothing
+else.** While an engine is active and working a task, it may have its
+own camera (e.g. a wrist cam) that's more useful to the user than the
+scene camera for that moment -- and unlike §3.2's scene feed, this engine
+stream is expected to already have any interaction mask/overlay the
+engine wants to show **rendered directly into the RGB pixels** by the
+engine itself (burned-in, not a separate mask/segmentation channel),
+since this is a task-in-progress highlight for the user to watch, not a
+tap-to-select surface. **It never replaces the scene camera** -- §3.2's
+feed keeps subscribing/streaming continuously regardless, and this
+engine stream is additive on top of it (UE composites the two, per
+§5.2.A) only for as long as the engine is actually sending frames.
 Concretely, once a real engine exists: the bridge would take a
 per-engine topic-name parameter (or a small per-engine-id config table,
 since different engines may publish different image shapes/encodings)
 and subscribe directly only while that engine is activated/selected in
-the Orchestrator, switching the §5.2.A channel over to it.
+the Orchestrator, feeding the §5.2.A overlay layer for as long as that
+subscription has frames.
 
 **No detected-objects push belongs on this peer.** An engine that
 refines or produces its own detections during a task (e.g. a wrist
@@ -411,23 +419,33 @@ Remote Control function calls:
 Reuses the Gen1 prototype's TCP streaming mechanism unchanged
 (`streaming/sender.py` + `protocol.py` + `client.py` -- per-channel
 `send_image`/`send_depth`/`send_mask` framing, not the Remote Control
-WebSocket, since this is bulk pixel data). Two kinds of sources:
+WebSocket, since this is bulk pixel data). Two layers, not two
+interchangeable sources:
 
-- **RGBD from the scene camera (§3.2)** -- color + depth; detected-object
-  information for that frame is pushed separately (§5.2.D), not in-band.
-- **RGB-only from an active Engine node's own camera (§3.3)** -- e.g. a
-  wrist camera, with any interaction mask/overlay the engine wants to
-  show already **rendered into the RGB pixels by the engine itself**
-  (not a separate mask channel). Only present while that engine is
-  active; detections during this time still arrive via §3.1/§5.2.D,
-  exactly as with the scene-camera source -- this stream never itself
-  carries detected-object semantics.
+- **Base layer -- RGBD from the scene camera (§3.2), always streaming.**
+  Color + depth, continuously, regardless of whether any engine is
+  active. Detected-object information for a given frame is pushed
+  separately (§5.2.D), not in-band.
+- **Overlay layer -- RGB from an active Engine node's own camera (§3.3),
+  optional and additional.** An engine only opens this second stream
+  when it has something detailed to show the user (e.g. a wrist-camera
+  close-up during a manipulation step); the base layer keeps streaming
+  the whole time. UE composites the overlay on top of the base layer
+  (with the base layer blurred/dimmed behind it) whenever frames are
+  arriving on the overlay stream, and falls back to just the plain base
+  layer the moment the engine stops sending (stream ends/times out) --
+  it's a highlight on top, not a channel switch. Any interaction
+  mask/overlay the engine wants to show is already **rendered into this
+  stream's RGB pixels by the engine itself** (not a separate mask
+  channel); detections during this time still arrive via §3.1/§5.2.D,
+  exactly as with the base layer -- neither layer itself carries
+  detected-object semantics.
 
-Each source gets its own channel/`stream_id`, tagged with
+Each layer gets its own channel/`stream_id`, tagged with
 `source`/`role`/`group` metadata so UE can route each frame to the right
-material/viewport -- same conventions as Gen1's per-camera channel
-numbering (see that bridge's `image_channel`/`depth_channel`/`mask_channel`
-parameters for precedent).
+material/viewport (base vs. overlay) -- same conventions as Gen1's
+per-camera channel numbering (see that bridge's
+`image_channel`/`depth_channel`/`mask_channel` parameters for precedent).
 
 **Important correction re: "detected objects" transport.** The Gen1
 streaming protocol itself (`StreamHeader`/`StreamMessage`) carries **no
@@ -436,18 +454,19 @@ semantic labelling** -- its metadata is just `w`/`h`/`fmt`/`group`/`role`/
 (e.g. "segment ID 1 = cup, state = full") were pushed **separately** via
 Remote Control calls (`UpdateCupInfo`/`UpdateButtonInfo`), correlated with
 the mask stream only by convention, not carried in-band. This bridge does
-the same: this channel carries pixel data only (color/depth, and
-optionally a plain visual segmentation overlay with no hit-test role --
-see below), while all detected-object semantics (class, instance ID, 2D
-bounding box) are pushed as data on the **existing detected-objects push**
-(§5.2.D, §3.1's `ObjectRecord.box`), *not* on `InteractionPanel` (§5.2.C),
-which stays reserved for the task/button dialog only. **Open/TBD:** the
-raw RGB/depth image topics themselves (the scene camera's output, §3.2,
-and an Engine node's wrist-camera output, §3.3) aren't defined by any
-interface package in this workspace yet -- both the camera driver node
-and any real engine's wrist-camera topic remain to be defined before
-this channel can be implemented; §3.1's `ObjectRecord.box` extension
-already covers the detection *semantics* independent of this.
+the same: both layers carry pixel data only, while all detected-object
+semantics (class, instance ID, 2D bounding box) are pushed as data on the
+**existing detected-objects push** (§5.2.D, §3.1's `ObjectRecord.box`),
+*not* on `InteractionPanel` (§5.2.C), which stays reserved for the
+task/button dialog only. **Open/TBD:** the raw RGB/depth image topics
+themselves (the scene camera's output, §3.2, and an Engine node's
+wrist-camera output, §3.3) aren't defined by any interface package in
+this workspace yet -- both the camera driver node and any real engine's
+wrist-camera topic remain to be defined before this channel can be
+implemented, and the exact UE-side blur/composite mechanics (how strong,
+whether it's a material parameter on the base layer or a UE post-process)
+are also still open; §3.1's `ObjectRecord.box` extension already covers
+the detection *semantics* independent of either.
 
 #### B. System status (robot proprioception)
 
