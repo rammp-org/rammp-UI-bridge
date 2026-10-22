@@ -113,9 +113,9 @@ reports them back to UE via an error report (see §5.2.C) rather than
 silently dropping them, so a UI/Blueprint bug is visible during
 development.
 
-### 5.2 bridge → UE: three channels
+### 5.2 bridge → UE: four channels
 
-Bridge → UE traffic is organized into three channels with different
+Bridge → UE traffic is organized into four channels with different
 transports and update rates, rather than one undifferentiated stream of
 Remote Control function calls:
 
@@ -207,6 +207,44 @@ than a growing set of bespoke RPC function signatures.
   `InteractionPanel` describes.
 - The name itself -- `InteractionPanel` was chosen over `ActionPanel`/
   `UiPanel`/the placeholder `information`; open to revision.
+
+#### D. World state / detected objects (Remote Control preset functions)
+
+Separate from `InteractionPanel`, the bridge pushes two raw-data feeds over
+the same Remote Control preset-function mechanism as §5.2.B (request/
+response RPC over the WebSocket, `PUT /remote/preset/<preset>/function/
+<FunctionName>`) -- not the streaming channel, since both are small,
+infrequent JSON payloads rather than bulk pixel data:
+
+| Function | Parameters | Pushed when |
+|---|---|---|
+| `UpdateWorldState` | `Version` (int), `SnapshotJson` (string, JSON-encoded World State) | `~/get_world_state` poll result's `version` differs from the last pushed value |
+| `UpdateDetectedObjects` | `Objects`: array of `{instance_id, perception_class, last_pose, location, opened, last_seen}` (plus `bbox`/`stream_id` per object once §3's bbox extension lands) | `~/get_detected_objects` poll result's set of `instance_id`s differs from the last pushed set |
+
+Mechanics:
+
+1. The bridge polls `~/get_world_state` every `world_state_poll_period`
+   and `~/get_detected_objects` every `detected_objects_poll_period`
+   (§2) -- polling, not a subscription, since the Orchestrator exposes
+   these as services, not topics.
+2. Each poll response is compared against what was last actually pushed
+   to UE (World State `version` number; the `frozenset` of detected
+   `instance_id`s) -- **not** against the previous poll response, so a
+   dropped/late poll can't cause a spurious re-push.
+3. Only on a real change does the bridge call the corresponding UE preset
+   function, once, with the full new snapshot/object list (not a diff) --
+   UE always receives a complete, self-consistent payload rather than
+   incremental patches to reconcile.
+4. Per-object JSON shape (`_object_record_to_dict` in the reference
+   implementation): `instance_id`/`perception_class` as-is;
+   `last_pose_json` is JSON-decoded into a nested `last_pose` object
+   (`{}` if empty); `location`/`opened`/`last_seen` passed through as-is.
+
+This is the channel §3's bounding-box extension (tap-to-select camera
+overlays) and any future per-object metadata should be added to --
+`InteractionPanel` (§5.2.C) is deliberately not used for this data, since
+it's keyed by `instance_id` on its own change-triggered cadence, not tied
+to the task/button-dialog lifecycle.
 
 ### 5.3 Push semantics
 
