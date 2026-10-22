@@ -28,11 +28,15 @@ implementation-language question itself.
 | `connection_publish_period` | double (seconds) | `1.0` | Interval between connection-status publishes |
 | `service_wait_timeout` | double (seconds) | `5.0` | How long to wait for an Orchestrator service/action server to become available before reporting it unavailable |
 
-## 3. ROS2-facing interfaces (client side)
+## 3. ROS2-facing interfaces
 
-This node is a ROS2 **client only** on four separate peers -- it never
-advertises any of the interfaces in this section itself (its own
-server/publisher side is §4):
+This node is a ROS2 **client only** on three of its four peers -- it never
+advertises any interface to the Orchestrator, Camera, or Hardware node.
+The exception is §3.3 Bridge ↔ Engine node, which is two-way: the bridge
+is a *client* of the engine's camera topic, but a *server* for direct
+engine-initiated user-input requests (new, this section) -- the
+Orchestrator is not involved in, and has no visibility into, that
+request/response exchange at all.
 
 - **§3.1 Bridge ↔ Orchestrator** -- the control/state surface: object
   selection, actions, pause/resume/cancel, world state, and detected
@@ -45,16 +49,16 @@ server/publisher side is §4):
   Perception -- Perception is itself just a consumer of this same feed
   (`Detect.srv`/`StartTracking.srv`'s `image_topic` parameter), not its
   source.
-- **§3.3 Bridge ↔ Engine node** -- a *direct* subscription to the
-  currently-active engine's own camera stream (e.g. a wrist camera, with
-  any interaction mask/overlay already rendered into the RGB pixels by
-  the engine itself) -- nothing else. This is strictly **additional** to
-  §3.2's scene camera, not a replacement for it: the scene feed keeps
-  streaming the whole time, and UE overlays this engine stream on top of
-  it (§5.2.A) only while the engine is actively sending one. The engine
-  does **not** push detected objects to the bridge directly; it pushes
-  them to the Orchestrator (via `update_object_state`), which is what
-  the bridge reads from §3.1 -- see the note at the end of this section.
+- **§3.3 Bridge ↔ Engine node** -- two parts: (a) a *direct subscription*
+  to the currently-active engine's own camera stream (e.g. a wrist
+  camera, with any interaction mask/overlay already rendered into the RGB
+  pixels by the engine itself), strictly **additional** to §3.2's scene
+  camera, not a replacement for it (§5.2.A); and (b) a *direct,
+  Orchestrator-bypassing* request/response interface the bridge **serves**
+  and an active engine **calls directly** whenever it needs user input --
+  either a button choice (the engine supplies the panel content itself),
+  an object tap on its own overlay stream from (a), or both at once. See
+  the full design below.
 - **§3.4 Bridge ↔ Hardware node** -- a *direct* subscription to
   always-on, hardware-level robot telemetry (arm joint states, chair/base
   speed and status) that exists independent of which engine (if any) is
@@ -271,33 +275,31 @@ object consistently. `box`-only hit-testing (UE does a simple
 point-in-rectangle check against the latest pushed `box`) is simpler and
 is now the **sole** tap-to-select overlay mechanism, not a fallback.
 
-**Interactive objects during an active task (e.g. "what can I pick up
-right now").** The same mechanism above also covers an engine
-*introducing* objects mid-task, not just refining ones Perception already
-found. For a task like pick-and-place, the engine can call
-`update_object_state` to populate `ObjectRecord`s for candidate pickable
-objects it detects via its own camera (§3.3's overlay stream) -- these
-flow through `get_detected_objects`/`UpdateDetectedObjects` (§5.2.D)
-exactly like any other object, letting the user tap to select one mid-task
-without any new interface. A task with nothing to select (e.g. an
-articulation engine opening a door) simply never calls
-`update_object_state` for this purpose, so the panel correctly shows no
-objects -- pushing candidates this way is per-engine/per-task behavior,
-not something every engine is required to do.
+**Interactive candidate objects during an active task are a separate,
+Orchestrator-bypassing mechanism -- see §3.3.2, not this one.** An earlier
+revision of this doc had engines push task-interactive candidates (e.g.
+"what's pickable right now") via `update_object_state`, flowing through
+this same `get_detected_objects`/`UpdateDetectedObjects` path. That's
+superseded: soliciting the user's input during a task (whether by button
+or by tapping a candidate object) is now a **direct Bridge ↔ Engine node**
+exchange (§3.3.2's `RequestUserInput` action) that the Orchestrator has no
+part in at all -- the engine supplies its own candidate objects directly
+to the bridge as part of that request, and the bridge pushes them to UE
+the same way (`UpdateDetectedObjects`, tagged with the engine's own
+overlay `stream_id`), but without ever involving `ObjectRecord` or this
+service. `update_object_state` remains valid for its original purpose --
+an engine refining the pose/box of an object the Orchestrator is already
+tracking (e.g. the one the user already selected before this action
+started) -- just not for introducing new user-choosable candidates.
 
-Crucially, `stream_id` (above) is what keeps this coherent once the
-*source* camera changes mid-session: a box pushed while Perception was
-the source is in the scene camera's pixel space (§3.2, the base layer in
-§5.2.A), while a box pushed by an active engine's `update_object_state`
-call is in *that engine's own camera's* pixel space (§3.3, the overlay
-layer) -- a different resolution/field of view in general. UE must look
-up which stream (base or overlay) a given `stream_id` refers to and
+`stream_id` (above) is still what keeps box pixel-coordinates coherent
+once the *source* camera changes: a box pushed via this service is in the
+scene camera's pixel space (§3.2, the base layer in §5.2.A); a box pushed
+via §3.3.2's direct mechanism is in *that engine's own camera's* pixel
+space (the overlay layer) -- a different resolution/field of view in
+general. UE must look up which stream a given `stream_id` refers to and
 hit-test/draw the box against *that* stream's frame, not always the base
-layer. This is also why boxes can't simply keep streaming from Perception
-once an engine is active and assumed to have paused it (see the Perception
-lifecycle note in §7) -- without a live scene-camera detector, only the
-active engine's own detections are available to populate the panel during
-that window.
+layer.
 
 ### 3.2 Bridge ↔ Camera
 
@@ -325,45 +327,124 @@ scene camera or several can't be pinned down until one does.
 
 ### 3.3 Bridge ↔ Engine node
 
-No shared interface package defines this today -- it's **per-engine, not
-generic**, unlike §3.1/§3.2. The reference engine wiring
-(`rammp_orchestrator.ros.engine_node.EngineNode`) only advertises
+No shared interface package defines this today. This peer has two
+distinct parts, one in each direction:
+
+#### 3.3.1 Camera subscription (bridge is client)
+
+It's **per-engine, not generic**, unlike §3.1/§3.2. The reference engine
+wiring (`rammp_orchestrator.ros.engine_node.EngineNode`) only advertises
 `~/activate`/`~/hibernate`/`~/control`/`~/execute_action` -- all
 Orchestrator-facing, not a camera topic a UI would subscribe to -- and
 no mock or real engine in this workspace currently publishes one.
 
-**Scope is deliberately narrow: an additional camera stream, and nothing
-else.** While an engine is active and working a task, it may have its
-own camera (e.g. a wrist cam) that's more useful to the user than the
-scene camera for that moment -- and unlike §3.2's scene feed, this engine
-stream is expected to already have any interaction mask/overlay the
-engine wants to show **rendered directly into the RGB pixels** by the
-engine itself (burned-in, not a separate mask/segmentation channel),
-since this is a task-in-progress highlight for the user to watch, not a
-tap-to-select surface. **It never replaces the scene camera** -- §3.2's
-feed keeps subscribing/streaming continuously regardless, and this
-engine stream is additive on top of it (UE composites the two, per
-§5.2.A) only for as long as the engine is actually sending frames.
-Concretely, once a real engine exists: the bridge would take a
-per-engine topic-name parameter (or a small per-engine-id config table,
-since different engines may publish different image shapes/encodings)
-and subscribe directly only while that engine is activated/selected in
-the Orchestrator, feeding the §5.2.A overlay layer for as long as that
-subscription has frames.
-
-**No detected-objects push belongs on this peer.** An engine that
-refines or produces its own detections during a task (e.g. a wrist
-camera finding a more precise grasp pose) reports them to the
-**Orchestrator** via `update_object_state` (§3.1), the same path any
-other detection source uses -- it does not push them to the bridge
-directly. The bridge still gets detected-object data for such a task
-from §3.1's `get_detected_objects`/`ObjectRecord.box`, exactly as when
-no engine is active; this peer carries pixel data only.
+While an engine is active and working a task, it may have its own camera
+(e.g. a wrist cam) that's more useful to the user than the scene camera
+for that moment -- and unlike §3.2's scene feed, this engine stream is
+expected to already have any interaction mask/overlay the engine wants to
+show **rendered directly into the RGB pixels** by the engine itself
+(burned-in, not a separate mask/segmentation channel), since this is a
+task-in-progress highlight for the user to watch, not a tap-to-select
+surface on its own (see §3.3.2 for how tap-to-select works against it).
+**It never replaces the scene camera** -- §3.2's feed keeps
+subscribing/streaming continuously regardless, and this engine stream is
+additive on top of it (UE composites the two, per §5.2.A) only for as
+long as the engine is actually sending frames. Concretely, once a real
+engine exists: the bridge would take a per-engine topic-name parameter
+(or a small per-engine-id config table, since different engines may
+publish different image shapes/encodings) and subscribe directly only
+while that engine is activated/selected in the Orchestrator, feeding the
+§5.2.A overlay layer for as long as that subscription has frames.
 
 **Still TBD** (tracked in §7): no concrete engine publishes this camera
 topic yet, so the exact topic name/message type/per-engine config shape
 can't be pinned down until a real engine (e.g. a manipulation engine with
 a wrist camera) exists to look at.
+
+#### 3.3.2 User-input request (bridge is server) -- **proposed, not yet implemented**
+
+**Design decision: an active engine asks the bridge for user input
+directly, with the Orchestrator never involved.** An earlier revision of
+this doc routed a mid-task object tap through a new Orchestrator service
+(`provide_input`, forwarded to whichever engine holds execution
+resources). That's been dropped in favor of this: the engine that's
+*already* holding execution resources (so it, and only it, could
+possibly be the one waiting on this) calls the bridge **directly** --
+no intermediary, no Orchestrator routing logic, no extra hop. This fits
+the existing division of responsibility better: the Orchestrator owns
+*lifecycle* (activate/execute/pause/resume/cancel/hibernate), while the
+bridge owns *everything UE-facing* -- and "ask the user something" is
+squarely UE-facing.
+
+Proposed shape (a new interfaces package, e.g. `rammp_ui_bridge_interfaces`,
+since this is bridge-specific, not a generic Orchestrator concept):
+
+```
+# RequestUserInput.action (proposed)
+
+# goal
+string panel_json                              # optional: InteractionPanel-shaped JSON
+                                                 # (title/message/buttons, §5.2.C) the engine
+                                                 # wants shown; empty if this request is
+                                                 # object-only
+ObjectCandidate[] objects                       # optional: candidate objects the user can tap
+                                                 # on this engine's own overlay stream (§3.3.1);
+                                                 # empty if this request is panel-only
+# (at least one of panel_json / objects must be non-empty)
+---
+# result
+uint8 STATUS_BUTTON = 0      # user tapped one of panel_json's buttons
+uint8 STATUS_OBJECT = 1      # user tapped one of objects
+uint8 STATUS_CANCELLED = 2   # engine cancelled the goal before either happened
+uint8 status
+string button_id             # set iff status == STATUS_BUTTON
+string instance_id           # set iff status == STATUS_OBJECT
+---
+# feedback: (none needed -- this is a single wait-for-one-tap request, not
+# a long-running operation with intermediate progress)
+```
+`ObjectCandidate` (new, small, UI-facing -- not `ObjectRecord`, which is
+an Orchestrator/world-state concept): just `{instance_id, perception_class,
+box}`, the minimum UE needs to render and hit-test a tappable box. No
+`stream_id` field is needed per-object since every object in one goal
+implicitly belongs to the calling engine's own overlay stream -- the
+bridge tags them all with that engine's known `stream_id` when forwarding
+to UE.
+
+Bridge behavior while a goal is active:
+1. If `panel_json` is non-empty, push it to UE's `InteractionPanel`
+   channel (§5.2.C) immediately -- this **takes over** whatever would
+   otherwise be shown there (e.g. `ExecuteAction` progress, §3.1.1),
+   reverting to the prior content once the goal ends.
+2. If `objects` is non-empty, push them to UE's `UpdateDetectedObjects`
+   channel (§5.2.D) tagged with the engine's own overlay `stream_id`,
+   exactly like any other detected-objects push -- tappable the same way
+   base-layer objects are.
+3. Whichever happens first -- UE reports a `button_press` matching one of
+   `panel_json`'s `button_id`s, or a `select_object` matching one of
+   `objects`' `instance_id`s -- the bridge completes the goal with the
+   corresponding result/status. There's only ever one result per goal.
+4. The engine can cancel the goal at any time (e.g. it no longer needs
+   the answer); the bridge then withdraws whatever panel/objects it had
+   pushed on the engine's behalf and reports `STATUS_CANCELLED`.
+5. Only one engine can have a goal active at a time, matching the
+   Orchestrator's own one-engine-executing-at-a-time invariant -- a
+   second concurrent goal should be rejected by the bridge.
+
+**Bridge-side dispatch priority (§5.1):** a UE `select_object`/
+`button_press` is resolved against an active `RequestUserInput` goal
+*first*, if one exists and the tapped ID matches something it's
+currently offering -- completing that goal rather than calling into the
+Orchestrator at all. Only if there's no active goal, or the ID doesn't
+match what it's offering, does the bridge fall back to the normal
+Orchestrator dispatch (§3.1's `select_object`/`deselect`/`control`/
+`execute_action`), unchanged from before this section existed.
+
+**Still TBD** (tracked in §7): this entire interface is newly proposed --
+the interfaces package it should live in, exact message/field names, and
+how an engine discovers the bridge's own service/action namespace (a
+fixed, well-known name is enough since there's exactly one bridge per
+§1, but this still needs to be pinned down) are all undecided.
 
 ### 3.4 Bridge ↔ Hardware node
 
@@ -388,12 +469,15 @@ pinned down until one does.
 
 ## 4. UI-facing interface (ROS2 server/publisher side)
 
-| Topic | Type | Direction | Meaning |
+| Interface | Type | Direction | Meaning |
 |---|---|---|---|
 | `~/ue_connection` | `std_msgs/Bool` | published | Whether the UE WebSocket is currently connected, at `connection_publish_period` |
+| `~/request_user_input` | `RequestUserInput.action` (proposed, §3.3.2) | server | Called directly by an active engine node, bypassing the Orchestrator, whenever it needs the user to tap a button or a candidate object |
 
-No services or actions are currently advertised by this node to other ROS2
-clients; all UI interaction happens over the UE WebSocket, not ROS2.
+Aside from `~/request_user_input` (§3.3.2), no other services or actions
+are advertised by this node to other ROS2 clients; all UI interaction
+besides that one engine-facing exception happens over the UE WebSocket,
+not ROS2.
 
 ## 5. UE-facing interface (Remote Control WebSocket)
 
@@ -418,7 +502,17 @@ opaque ID (`instance_id` or `button_id`) the bridge most recently assigned
 it; the bridge is the only side that knows what that ID actually means and
 resolves it internally.
 
-| `cmd` | Fields | Bridge behavior |
+**Dispatch priority: an active engine input request (§3.3.2) wins
+first.** Before doing anything else with a `select_object`/`button_press`
+command, the bridge checks whether a `RequestUserInput` goal is currently
+active *and* the tapped ID matches something that goal is offering (one
+of its `objects`' `instance_id`s, or one of its `panel_json`'s
+`button_id`s). If so, the bridge completes that goal with the matching
+result and does **not** call the Orchestrator at all for this tap. Only
+when there's no active goal, or the tapped ID doesn't match what it's
+offering, does the table below apply.
+
+| `cmd` | Fields | Bridge behavior (no active engine input request matches) |
 |---|---|---|
 | `select_object` | `instance_id` (string) -- echoed from the last `UpdateDetectedObjects` push (§5.2.D) | Calls Orchestrator `select_object`, then rebuilds and pushes an updated `InteractionPanel` reflecting the newly available actions/controls for that object (as buttons) |
 | `button_press` | `button_id` (string) -- echoed from the last `InteractionPanel` push (§5.2.C) | The bridge looks up what `button_id` meant when it built that panel, and performs the corresponding Orchestrator call: `execute_action` (a specific action button), `control` (a pause/resume/cancel button), `deselect` (a "deselect"/"back" button), or no Orchestrator call at all (e.g. a purely client-side "dismiss this panel" button) |
@@ -539,6 +633,18 @@ mapping that records which of these each `button_id` represents (plus
 whatever call parameters it needs) is never part of the JSON sent to
 UE** -- it's bridge-side state keyed by `button_id`, rebuilt every time a
 new panel is pushed.
+
+**Engine-driven override (§3.3.2):** while an active engine's
+`RequestUserInput` goal has a non-empty `panel_json`, that content
+**takes over this channel entirely**, replacing whatever would otherwise
+be shown (e.g. `ExecuteAction` progress, or the action/control buttons for
+the currently selected object). The bridge pushes it as-is (it's already
+`InteractionPanel`-shaped) and resolves any resulting `button_press`
+against that goal, not against the normal Orchestrator-call mapping
+above (per §5.1's dispatch priority). Once the goal completes or is
+cancelled, the bridge reverts to pushing whatever panel content the
+normal Orchestrator-driven state (selected object, in-progress action,
+etc.) calls for.
 
 This is deliberately a superset that can express what §5.2 previously
 modeled as four separate functions (`UpdateSelection` i.e. available
@@ -665,26 +771,34 @@ to the task/button-dialog lifecycle.
   unconfirmed assumption, not a documented fact.** §3.1's
   `get_detected_objects` note assumes Perception may be paused/stopped
   while an engine is active (e.g. the scene camera's view is obstructed
-  by the arm, or to free compute), which is why an engine pushing its
-  own candidate objects via `update_object_state` is the only source of
-  detections during that window. But nothing in this workspace currently
-  starts/stops Perception's tracking session (`StartTracking.srv`/
-  `StopTracking.srv`) -- not the Orchestrator, not this bridge -- so
-  whatever node *does* own that decision, and the exact conditions under
-  which it stops Perception, still needs to be confirmed before this
-  behavior can be relied on.
+  by the arm, or to free compute), which is why an active engine's own
+  task-interactive candidates are offered via §3.3.2's direct
+  `RequestUserInput` mechanism instead, rather than through Perception's
+  base-layer feed. But nothing in this workspace currently starts/stops
+  Perception's tracking session (`StartTracking.srv`/`StopTracking.srv`)
+  -- not the Orchestrator, not this bridge -- so whatever node *does* own
+  that decision, and the exact conditions under which it stops
+  Perception, still needs to be confirmed before this behavior can be
+  relied on.
 - **Raw RGB/depth image topics for §5.2.A (camera streams, §3.2's scene
-  camera and §3.3's per-engine camera)** are undefined -- no camera
+  camera and §3.3.1's per-engine camera)** are undefined -- no camera
   driver node, and no engine publishing its own camera, exist in this
   workspace yet. Camera streaming is an *intended* channel of this bridge
   (unlike in the prior version of this doc), but implementation is
   blocked on those source topics existing first. Note this is now purely
   a *pixel-data* gap -- the detected-object semantics (class, instance,
   box) that would otherwise ride along with a frame are already covered
-  by the `ObjectRecord` extension above, independent of whether/when a
-  raw camera topic exists, and independent of whether an engine is active
-  (an active engine reports its own detections to the Orchestrator via
-  `update_object_state`, not to the bridge directly -- see §3.3).
+  by the `ObjectRecord` extension above (base layer) and §3.3.2's
+  `ObjectCandidate` (overlay layer during an active engine's input
+  request), independent of whether/when a raw camera topic exists.
+- **§3.3.2's `RequestUserInput` interface is newly proposed and entirely
+  unimplemented.** No `rammp_ui_bridge_interfaces` (or equivalent)
+  package exists yet to define the action/message; no engine calls it;
+  the bridge doesn't serve it. Open questions: the interfaces package's
+  name/location, exact field names, and how an engine resolves the
+  bridge's fixed, well-known action name (presumably no discovery needed,
+  since there's exactly one bridge per §1, but this hasn't been
+  confirmed against how engine nodes are typically configured/launched).
 - **System status telemetry for §5.2.B (§3.4 Hardware node)** is
   undefined -- no hardware driver node in this workspace publishes joint
   states or chair/base speed and status today. System status is an
