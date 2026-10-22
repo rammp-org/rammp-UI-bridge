@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>rammp_ui_bridge</name>
+  <version>0.1.0</version>
+  <description>
+    Bridges an Unreal Engine touchscreen UI to the RAMMP Orchestrator's public
+    ROS2 interface (rammp_orchestrator_interfaces). Translates UE user-input
+    events into Orchestrator service/action calls (select_object, deselect,
+    control, execute_action) and pushes world-state/detected-object/
+    InteractionPanel updates back to UE over its Remote Control WebSocket API.
+    Also serves rammp_ui_bridge_interfaces/RequestUserInput, letting an active
+    engine ask the user for input directly, bypassing the Orchestrator.
+  </description>
+  <maintainer email="guo@assistivetech.dev">Liyun Guo</maintainer>
+  <license>Proprietary</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>rammp_orchestrator_interfaces</exec_depend>
+  <exec_depend>rammp_ui_bridge_interfaces</exec_depend>
+  <exec_depend>python3-websockets</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

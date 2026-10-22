@@ -21,22 +21,29 @@ objects, action progress/results) back to UE for rendering.
 1. **Connects to UE** over its Remote Control WebSocket API (a preset-based
    RPC + property-change-notification protocol UE exposes natively), and
    registers the configured preset on connect/reconnect.
-2. **Translates UE user input into Orchestrator calls.** UE sets a
-   `UserInput` preset property to a JSON command (e.g. "user tapped this
-   object" / "user tapped this action button" / "user tapped cancel"); the
-   bridge parses it and calls the matching Orchestrator service or action:
-   `select_object`, `deselect`, `control` (pause/resume/cancel), and
-   `execute_action`.
-3. **Pushes state back to UE over three channels**: a camera video stream
+2. **Translates UE user input into Orchestrator calls.** UE only ever
+   reports that the user tapped an object or a button (`select_object` /
+   `button_press` -- it has no notion of what a button *means*); the bridge
+   maps the reported `button_id` back to the right Orchestrator call
+   (`deselect`, `control` pause/resume/cancel, or `execute_action`) using a
+   mapping it builds whenever it pushes a panel. When an engine is directly
+   blocked waiting on user input (via the `~/request_user_input` action,
+   below), the bridge checks that pending request first before falling back
+   to its own Orchestrator-driven dispatch.
+3. **Pushes state back to UE over four channels**: a camera video stream
    (RGBD from Perception and/or RGB from an engine's own camera, each
    optionally carrying detected-object info), system status (arm
-   joints/base status), and a single dynamic `InteractionPanel` JSON
-   schema (title/message/buttons/progress) that lets UE build whatever
-   popup/dialog the current task calls for without hardcoding layouts per
-   action. See `docs/NODE_INTERFACE.md` §5.2 for the full schema -- several
-   pieces of this are still open design questions, not finalized.
+   joints/base status), world-state/detected-objects pushes, and a single
+   dynamic `InteractionPanel` JSON schema (title/message/buttons/progress)
+   that lets UE build whatever popup/dialog the current task calls for
+   without hardcoding layouts per action. See `docs/NODE_INTERFACE.md` §5.2
+   for the full schema.
 4. **Reports bridge health.** Publishes a connection-status topic so other
    ROS2 nodes/operators can see whether a UE instance is currently attached.
+5. **Serves engines directly.** Exposes a `~/request_user_input` action
+   (`rammp_ui_bridge_interfaces/RequestUserInput`) so an engine that needs
+   user input mid-task (an overlay selection, a panel of buttons, or both)
+   can ask the bridge directly, without going through the Orchestrator.
 
 This node is intentionally "dumb": it owns no business logic of its own
 (no capability/engine knowledge, no world-state rules) -- all of that lives
@@ -52,13 +59,22 @@ Python-vs-C++ implementation-language discussion.
 
 ## Status
 
-This repository currently contains interface/design documentation only; no
-implementation has been committed here yet. An earlier Python prototype
-exists in a local, uncommitted workspace folder (`rammp-ui-bridge-local`),
-built against an earlier draft of `docs/NODE_INTERFACE.md` (pre-dating the
-three-channel Bridge→UE design below) -- useful as a reference for the
-command/service-call plumbing, but not yet updated for the camera stream/
-system status/`InteractionPanel` channels.
+The `rammp_ui_bridge` ament_python package in this repo is the current,
+maintained implementation, matching the interface spec below: Orchestrator
+world-state/detected-objects polling and push, the unified
+`InteractionPanel` scheme (built from a single `UpdatePanel` Remote Control
+call), the two-command UE→bridge dispatch (`select_object`/`button_press`
+with stale-ID error reporting), and the `~/request_user_input` action
+server for direct engine↔bridge interaction. The camera-stream and
+system-status channels (§5.2.A/B) are not yet implementable -- no camera or
+hardware driver node exists yet in the workspace to source them from (see
+"Not yet in scope" in `docs/NODE_INTERFACE.md`).
+
+An earlier Python prototype that predates this package (built against an
+outdated draft of `docs/NODE_INTERFACE.md`, before the `InteractionPanel`
+redesign) lived in a local, uncommitted workspace folder
+(`rammp-ui-bridge-local`); its Orchestrator-client wiring and UE WebSocket
+transport were ported forward into this package, and it is now superseded.
 
 ## Relationship to the Gen1 prototype GUI bridge
 
