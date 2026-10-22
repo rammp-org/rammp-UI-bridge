@@ -73,8 +73,7 @@ under `orchestrator_ns` (§2).
 |---|---|---|
 | `<orchestrator_ns>/get_world_state` | `GetWorldState.srv` | Polled; result pushed to UE on version change |
 | `<orchestrator_ns>/get_detected_objects` | `GetDetectedObjects.srv` | Polled; result pushed to UE on instance-set change (see note below re: bounding boxes) |
-| `<orchestrator_ns>/select_object` | `SelectObject.srv` | Called when UE sends a `select_object` command for a base-layer (scene-camera) object (user tapped an object not currently part of a running task) |
-| `<orchestrator_ns>/provide_input` | **proposed, not yet implemented** -- see §3.1.1/§7 | Called when UE sends a `select_object` command for an overlay-layer (active-engine-camera) object -- i.e. a tap that's input to an already-running task, not a new top-level selection |
+| `<orchestrator_ns>/select_object` | `SelectObject.srv` | Called when UE sends a `select_object` command (user tapped an object) |
 | `<orchestrator_ns>/deselect` | `Deselect.srv` | Called when the bridge resolves a `button_press` whose panel button represented "deselect"/"back" (§5.1) |
 | `<orchestrator_ns>/control` | `Control.srv` | Called when the bridge resolves a `button_press` whose panel button represented a pause/resume/cancel control (§5.1) |
 | `<orchestrator_ns>/execute_action` | `ExecuteAction.action` | Called when the bridge resolves a `button_press` whose panel button represented a specific action (§5.1); feedback and result both relayed to UE |
@@ -162,40 +161,6 @@ routing is internal to the Orchestrator, the bridge does not need to know
 which engine is actually targeted). On `accepted=false`, the bridge should
 surface `message` as an error/toast via `InteractionPanel` (§6) rather
 than silently dropping the tap.
-
-#### `provide_input` -- **proposed, not yet implemented** (see §7)
-
-```
-# request (proposed)
-string instance_id      # from the tapped object's last UpdateDetectedObjects
-                         # push (§5.2.D), same as select_object's request
-string input_json       # optional extra context (e.g. a tap point within
-                         # the object's box), empty if unneeded
----
-# response (proposed)
-bool accepted
-string message
-```
-No such service exists in `rammp_orchestrator_interfaces` today -- this
-is a gap, not an oversight. **Why it's needed:** `select_object` only
-models the Browse → ObjectSelected transition; it's meaningless once the
-Orchestrator is already `Executing`/`Delegated` (which is exactly when an
-active engine's own overlay-layer detections, §3.3, are the thing being
-tapped -- e.g. "pick this one" mid pick-and-place task). There is
-currently no interface at all for feeding a mid-task selection/tap to the
-engine that's already running. The proposed shape mirrors `control`'s
-routing property above: the Orchestrator forwards to whichever engine
-currently holds execution resources, so the bridge still never needs to
-know/track which engine is targeted, or call engines directly.
-
-**Bridge dispatch rule (how the bridge picks `select_object` vs.
-`provide_input` for the same UE `select_object` command, §5.1):** look up
-the tapped `instance_id`'s most recently pushed `stream_id` (§5.2.D). If
-it names the base layer (§3.2's scene camera), call the Orchestrator's
-`select_object` as today. If it names the overlay layer (§3.3's active
-engine camera), call `provide_input` instead -- the object came from a
-task that's already running, so this is input *to* that task, not a
-request to start a new one.
 
 #### `execute_action` (`ExecuteAction.action`)
 
@@ -455,7 +420,7 @@ resolves it internally.
 
 | `cmd` | Fields | Bridge behavior |
 |---|---|---|
-| `select_object` | `instance_id` (string) -- echoed from the last `UpdateDetectedObjects` push (§5.2.D) | Looks up `instance_id`'s last-pushed `stream_id` (§5.2.D) to decide the target: if it's the base layer (§3.2 scene camera), calls Orchestrator `select_object` and rebuilds/pushes an updated `InteractionPanel` reflecting the newly available actions/controls, same as today; if it's the overlay layer (§3.3 active engine camera), calls `provide_input` (§3.1.1, **proposed**) instead, since the tap is input to the already-running task rather than a new top-level selection -- see the dispatch-rule note under `provide_input` |
+| `select_object` | `instance_id` (string) -- echoed from the last `UpdateDetectedObjects` push (§5.2.D) | Calls Orchestrator `select_object`, then rebuilds and pushes an updated `InteractionPanel` reflecting the newly available actions/controls for that object (as buttons) |
 | `button_press` | `button_id` (string) -- echoed from the last `InteractionPanel` push (§5.2.C) | The bridge looks up what `button_id` meant when it built that panel, and performs the corresponding Orchestrator call: `execute_action` (a specific action button), `control` (a pause/resume/cancel button), `deselect` (a "deselect"/"back" button), or no Orchestrator call at all (e.g. a purely client-side "dismiss this panel" button) |
 
 The bridge owns the `button_id → (Orchestrator call + params)` mapping for
@@ -688,13 +653,6 @@ to the task/button-dialog lifecycle.
 
 ## 7. Not yet in scope
 
-- **`provide_input` has no interface yet** (§3.1.1's `provide_input`
-  note) -- an upstream `rammp_orchestrator_interfaces` addition (new
-  `.srv`, plus a matching engine-facing call the Orchestrator forwards
-  to, mirroring `control`'s routing) is needed before mid-task taps on an
-  active engine's overlay-layer objects (§3.3) can do anything. Until
-  this exists, the bridge can detect such a tap (via the `stream_id`
-  dispatch rule) but has nowhere to send it.
 - **`ObjectRecord` needs a `box` (+ `stream_id`) extension** (§3.1's
   `get_detected_objects` design-decision note) -- an upstream
   `rammp_orchestrator_interfaces` change, populated by the Orchestrator
