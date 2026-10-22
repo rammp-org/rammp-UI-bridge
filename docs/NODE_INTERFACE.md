@@ -636,6 +636,17 @@ to the task/button-dialog lifecycle.
   and return.
 - A single malformed/invalid UE command must not crash the node or stop
   subsequent commands from being processed (isolate failures per-command).
+- A `button_press`/`select_object` referencing a `button_id`/`instance_id`
+  the bridge no longer recognizes (panel already changed, object no
+  longer detected) must not crash the node or silently no-op -- report it
+  via an error-styled `InteractionPanel` (§5.2.C) so the user sees why
+  their tap did nothing, rather than the UI appearing to hang.
+- Loss of connectivity to any single ROS2 peer (§3.2 Camera, §3.3 Engine
+  node, §3.4 Hardware node) must not crash the node or block pushes
+  derived from the *other* peers -- each source's absence should degrade
+  only its own UE channel (e.g. frozen/blank overlay video, stale system
+  status) while Orchestrator-sourced channels (`InteractionPanel`,
+  detected objects, world state) keep working normally.
 - The UE WebSocket connection must reconnect automatically on drop
   (including re-registering the preset) without requiring the node to
   restart, and `~/ue_connection` must reflect disconnection promptly.
@@ -684,6 +695,14 @@ to the task/button-dialog lifecycle.
   robot) does not carry over as-is, since it was specific to that
   hardware's joint layout -- §5.2.B/§3.4 needs its own mapping once a real
   hardware driver's joint-state shape is known.
+- **Idle/default `InteractionPanel` content is undefined.** The
+  `hibernate` note (§3.1.1) says the bridge clears the panel "or replaces
+  it with whatever default/idle panel state is defined" once the
+  Orchestrator returns to Browse mode -- but no such default panel (what
+  title/message/buttons, if any, UE shows when nothing is selected and no
+  task is running) has actually been specified yet. Needed before the
+  bridge's startup/idle behavior is fully defined, not just its
+  task-in-progress behavior.
 - **Action button labels** (§3.1's `select_object` note) -- `ActionAvailability`
   carries only `action_id`, not the human-readable `ActionSpec.label` the
   Orchestrator already has at registration time. Needs an upstream
