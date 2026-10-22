@@ -30,7 +30,7 @@ implementation-language question itself.
 
 ## 3. ROS2-facing interfaces (client side)
 
-This node is a ROS2 **client only** on three separate peers -- it never
+This node is a ROS2 **client only** on four separate peers -- it never
 advertises any of the interfaces in this section itself (its own
 server/publisher side is §4):
 
@@ -45,10 +45,17 @@ server/publisher side is §4):
   Perception -- Perception is itself just a consumer of this same feed
   (`Detect.srv`/`StartTracking.srv`'s `image_topic` parameter), not its
   source.
-- **§3.3 Bridge ↔ Engine node** -- *direct* subscriptions to an
-  individual engine's own telemetry/camera topics (e.g. joint states, a
-  wrist camera), bypassing the Orchestrator, for data that's specific to
-  one engine rather than part of generic World State.
+- **§3.3 Bridge ↔ Engine node** -- a *direct* subscription to the
+  currently-active engine's own camera stream (e.g. a wrist camera, with
+  any interaction mask/overlay already rendered into the RGB pixels by
+  the engine itself) -- nothing else. The engine does **not** push
+  detected objects to the bridge directly; it pushes them to the
+  Orchestrator (via `update_object_state`), which is what the bridge
+  reads from §3.1 -- see the note at the end of this section.
+- **§3.4 Bridge ↔ Hardware node** -- a *direct* subscription to
+  always-on, hardware-level robot telemetry (arm joint states, chair/base
+  speed and status) that exists independent of which engine (if any) is
+  currently active, unlike §3.3's per-engine camera.
 
 There is deliberately **no direct Bridge ↔ Perception interface**. See
 the design-decision note after `get_detected_objects` below for why.
@@ -291,29 +298,56 @@ No shared interface package defines this today -- it's **per-engine, not
 generic**, unlike §3.1/§3.2. The reference engine wiring
 (`rammp_orchestrator.ros.engine_node.EngineNode`) only advertises
 `~/activate`/`~/hibernate`/`~/control`/`~/execute_action` -- all
-Orchestrator-facing, not telemetry a UI would subscribe to -- and no
-mock or real engine in this workspace currently publishes joint states,
-base odometry, or a wrist camera feed.
+Orchestrator-facing, not a camera topic a UI would subscribe to -- and
+no mock or real engine in this workspace currently publishes one.
 
-This category exists in the design because §5.2.B's "system status" and
-§5.2.A's "engine's own camera" (e.g. a wrist cam active only during a
-manipulation action) sources are expected to come from **the specific
-engine node that owns that hardware** (e.g. an arm-driver node's
-`/joint_states`, a base driver's odometry) rather than being proxied
-through the generic Orchestrator/World-State surface, which only exposes
-a free-form JSON snapshot (`get_world_state`'s `snapshot_json`) not meant
-for high-frequency structured telemetry, nor through §3.2's scene-camera
-peer, since a wrist camera is tied to one engine's own
-activation/execution lifecycle rather than existing independent of any
-task. Concretely, once a real engine exists: the bridge would take a
+**Scope is deliberately narrow: a camera stream, and nothing else.**
+While an engine is active and working a task, it may have its own camera
+(e.g. a wrist cam) that's more relevant to the user than the scene
+camera -- and unlike §3.2's scene feed, this engine stream is expected to
+already have any interaction mask/overlay the engine wants to show
+**rendered directly into the RGB pixels** by the engine itself (burned-in,
+not a separate mask/segmentation channel), since this is a
+task-in-progress view for the user to watch, not a tap-to-select surface.
+Concretely, once a real engine exists: the bridge would take a
 per-engine topic-name parameter (or a small per-engine-id config table,
-since different engines publish different shapes) and subscribe
-directly, independent of whether that engine is currently activated/
-selected in the Orchestrator.
+since different engines may publish different image shapes/encodings)
+and subscribe directly only while that engine is activated/selected in
+the Orchestrator, switching the §5.2.A channel over to it.
 
-**Still TBD** (tracked in §7): no concrete engine publishes these topics
-yet, so the exact topic names/message types/per-engine config shape can't
-be pinned down until a real engine (e.g. an arm driver) exists to look at.
+**No detected-objects push belongs on this peer.** An engine that
+refines or produces its own detections during a task (e.g. a wrist
+camera finding a more precise grasp pose) reports them to the
+**Orchestrator** via `update_object_state` (§3.1), the same path any
+other detection source uses -- it does not push them to the bridge
+directly. The bridge still gets detected-object data for such a task
+from §3.1's `get_detected_objects`/`ObjectRecord.box`, exactly as when
+no engine is active; this peer carries pixel data only.
+
+**Still TBD** (tracked in §7): no concrete engine publishes this camera
+topic yet, so the exact topic name/message type/per-engine config shape
+can't be pinned down until a real engine (e.g. a manipulation engine with
+a wrist camera) exists to look at.
+
+### 3.4 Bridge ↔ Hardware node
+
+No shared interface package defines this today either, and no hardware
+driver node exists in this workspace yet. Unlike §3.3's engine camera
+(which only exists/matters while a specific engine is active), this
+telemetry -- arm joint states, chair/base speed and status -- is
+**always-on and independent of engine selection**, analogous to how
+§3.2's scene camera is independent of Perception. It's expected to come
+from whatever node(s) directly own that hardware (e.g. an arm driver
+publishing `/joint_states`, a base/chair driver publishing speed/odometry/
+fault status) rather than being proxied through any engine or through the
+Orchestrator's generic World-State JSON snapshot (`get_world_state`'s
+`snapshot_json`, not meant for high-frequency structured telemetry).
+
+This is the source for §5.2.B's "system status" channel.
+
+**Still TBD** (tracked in §7): no hardware driver node/topic exists in
+this workspace yet, so the exact topic names/message types can't be
+pinned down until one does.
 
 
 ## 4. UI-facing interface (ROS2 server/publisher side)
@@ -379,12 +413,15 @@ Reuses the Gen1 prototype's TCP streaming mechanism unchanged
 `send_image`/`send_depth`/`send_mask` framing, not the Remote Control
 WebSocket, since this is bulk pixel data). Two kinds of sources:
 
-- **RGBD from a Perception node** -- color + depth, optionally accompanied
-  by detected-object information for that frame when Perception has
-  detections; absent otherwise.
-- **RGB-only from an Engine node's own camera** (e.g. a wrist camera active
-  only during a manipulation action), likewise optionally accompanied by
-  detections.
+- **RGBD from the scene camera (§3.2)** -- color + depth; detected-object
+  information for that frame is pushed separately (§5.2.D), not in-band.
+- **RGB-only from an active Engine node's own camera (§3.3)** -- e.g. a
+  wrist camera, with any interaction mask/overlay the engine wants to
+  show already **rendered into the RGB pixels by the engine itself**
+  (not a separate mask channel). Only present while that engine is
+  active; detections during this time still arrive via §3.1/§5.2.D,
+  exactly as with the scene-camera source -- this stream never itself
+  carries detected-object semantics.
 
 Each source gets its own channel/`stream_id`, tagged with
 `source`/`role`/`group` metadata so UE can route each frame to the right
@@ -414,16 +451,18 @@ already covers the detection *semantics* independent of this.
 
 #### B. System status (robot proprioception)
 
-Arm joints, base status, and similar small/structured/high-frequency
-telemetry -- pushed via Remote Control preset function calls (like Gen1's
-`setJoints`/`UpdateSystemState`), **not** the streaming channel, since this
-is small structured data rather than bulk pixel payloads. Sourced via
-direct **bridge ↔ engine node** subscriptions (§3.3), not through the
-Orchestrator's generic World State -- each engine publishes its own
-telemetry shape (e.g. `/joint_states` for an arm engine, odometry for a
-base engine). **Open/TBD:** no engine in this workspace publishes this
-yet (§3.3), so the concrete topic names/shapes/per-engine config can't be
-pinned down until a real engine exists.
+Arm joints, chair/base speed and status, and similar small/structured/
+high-frequency telemetry -- pushed via Remote Control preset function
+calls (like Gen1's `setJoints`/`UpdateSystemState`), **not** the
+streaming channel, since this is small structured data rather than bulk
+pixel payloads. Sourced via direct **bridge ↔ hardware node**
+subscriptions (§3.4), not through the Orchestrator's generic World State
+and not through any engine -- this telemetry is always-on and
+independent of which engine (if any) is currently active, unlike §3.3's
+per-engine camera. **Open/TBD:** no hardware driver node in this
+workspace publishes this yet (§3.4), so the concrete topic names/shapes
+can't be pinned down until a real hardware driver (e.g. an arm or
+chair/base controller) exists.
 
 
 #### C. `InteractionPanel` -- task/capability prompt (renamed from "information")
@@ -565,22 +604,27 @@ to the task/button-dialog lifecycle.
   (superseding an earlier revision's "bridge subscribes directly to
   Perception" design) -- not yet implemented.
 - **Raw RGB/depth image topics for §5.2.A (camera streams, §3.2's scene
-  camera) and §3.3's engine-telemetry topics for §5.2.B (system status)**
-  are undefined -- no interface package in this workspace publishes
-  camera frames, joint states, or base status today (no camera driver
-  node exists in this workspace at all; see §3.2/§3.3). Camera streaming
-  and system status are *intended* channels of this bridge (unlike in the
-  prior version of this doc), but implementation is blocked on those
-  source topics/engine telemetry existing first. Note this is now purely
+  camera and §3.3's per-engine camera)** are undefined -- no camera
+  driver node, and no engine publishing its own camera, exist in this
+  workspace yet. Camera streaming is an *intended* channel of this bridge
+  (unlike in the prior version of this doc), but implementation is
+  blocked on those source topics existing first. Note this is now purely
   a *pixel-data* gap -- the detected-object semantics (class, instance,
   box) that would otherwise ride along with a frame are already covered
   by the `ObjectRecord` extension above, independent of whether/when a
-  raw camera topic exists.
+  raw camera topic exists, and independent of whether an engine is active
+  (an active engine reports its own detections to the Orchestrator via
+  `update_object_state`, not to the bridge directly -- see §3.3).
+- **System status telemetry for §5.2.B (§3.4 Hardware node)** is
+  undefined -- no hardware driver node in this workspace publishes joint
+  states or chair/base speed and status today. System status is an
+  *intended* channel of this bridge, but implementation is blocked on a
+  real hardware driver node existing first.
 - Joint-state → UE skeleton **mapping logic** (the specific joint-index
   layout the Gen1 prototype's `set_ui_joints` hardcoded for its chair+arm
   robot) does not carry over as-is, since it was specific to that
-  hardware's joint layout -- §5.2.B/§3.3 needs its own mapping once a real
-  engine's joint-state shape is known.
+  hardware's joint layout -- §5.2.B/§3.4 needs its own mapping once a real
+  hardware driver's joint-state shape is known.
 - **Action button labels** (§3.1's `select_object` note) -- `ActionAvailability`
   carries only `action_id`, not the human-readable `ActionSpec.label` the
   Orchestrator already has at registration time. Needs an upstream
