@@ -28,11 +28,31 @@ implementation-language question itself.
 | `connection_publish_period` | double (seconds) | `1.0` | Interval between connection-status publishes |
 | `service_wait_timeout` | double (seconds) | `5.0` | How long to wait for an Orchestrator service/action server to become available before reporting it unavailable |
 
-## 3. Orchestrator-facing interface (ROS2 client side)
+## 3. ROS2-facing interfaces (client side)
+
+This node is a ROS2 **client only** on three separate peers -- it never
+advertises any of the interfaces in this section itself (its own
+server/publisher side is §4). The three peers are kept distinct because
+they're different packages with different lifecycles, not just different
+topics on one node:
+
+- **§3.1 Bridge ↔ Orchestrator** -- the control/state surface: object
+  selection, actions, pause/resume/cancel, world state, and the
+  Orchestrator's own (coarse, world-frame) view of detected objects.
+- **§3.2 Bridge ↔ Perception** -- a *direct* subscription to the
+  perception stack's raw per-frame detections (pixel-space boxes/masks),
+  bypassing the Orchestrator, for data the Orchestrator's `ObjectRecord`
+  doesn't carry.
+- **§3.3 Bridge ↔ Engine node** -- *direct* subscriptions to an
+  individual engine's own telemetry/camera topics (e.g. joint states, a
+  wrist camera), bypassing the Orchestrator, for data that's specific to
+  one engine rather than part of generic World State.
+
+### 3.1 Bridge ↔ Orchestrator
 
 All of the following are defined in `rammp_orchestrator_interfaces`
-(package `rammp-interfaces-ros2`); this node is a **client only** -- it
-never advertises any of these itself.
+(package `rammp-interfaces-ros2`), advertised by `orchestrator_node`
+under `orchestrator_ns` (§2).
 
 | Orchestrator interface | Type | Used for |
 |---|---|---|
@@ -47,7 +67,7 @@ The bridge never calls `register_engine`, `write_world_state`,
 `update_object_state`, or `request_intent` -- those are engine-facing, not
 UI-facing (see `rammp_orchestrator_interfaces` package docs).
 
-### 3.1 Field-level detail per call
+#### 3.1.1 Field-level detail per call
 
 #### `select_object` (`SelectObject.srv`)
 
@@ -198,28 +218,90 @@ reports back which button was tapped (`button_press` + `button_id`). This
 table's "Used for" column describes what the bridge calls once it resolves
 that `button_id`, not a direct UE→Orchestrator pass-through.
 
-**Note on tap-to-select overlays / bounding boxes.** `ObjectRecord` today
-carries `instance_id`/`perception_class`/`last_pose_json` (a world/robot-
-frame pose) /`location`/`opened`/`last_seen` -- no camera-pixel-space
-bounding box. For UE to let a user tap an object directly in the live
-camera-stream video (§5.2.A) and have that resolve to a `select_object`
-call, each detected object needs a 2D bbox in that camera's pixel space,
-tagged with which `stream_id` it overlays.
+**Note on tap-to-select overlays / bounding boxes -- now resolved via §3.2.**
+`ObjectRecord` (this service's response) carries no camera-pixel-space
+bbox -- just `instance_id`/`perception_class`/`last_pose_json` (world/
+robot-frame)/`location`/`opened`/`last_seen`. That data genuinely isn't
+here and was previously tracked as an upstream gap. It turns out the data
+*does* already exist, just not on this service: `rammp_perception_interfaces`
+publishes per-frame pixel-space boxes directly (`DetectedObject.box`,
+keyed by the same `instance_id`). See §3.2 for the resolved design: the
+bridge subscribes to perception's detections topic directly (bypassing
+the Orchestrator) to get that data, and folds it into the same
+detected-objects push (§5.2.D) by matching `instance_id`.
 
-The recommended design (not yet implemented, needs `ObjectRecord`/
-perception changes upstream) is to **extend the existing detected-objects
-push** with an optional `bbox: {x, y, w, h}` + `stream_id` per object,
-reusing the same `instance_id` that `select_object` already consumes --
-rather than routing object/bbox data through `InteractionPanel` (§5.2.C).
-`InteractionPanel` is a one-shot task dialog (title/message/buttons/
-progress) with a different update cadence and payload shape than per-
-frame, per-camera-stream object detections; keeping detected-object data on
-its existing dedicated channel keeps the "tap an object" and "tap a task
-button" interactions on two cleanly separate paths while still sharing one
-`instance_id`/`button_id`-style identifier scheme. This needs upstream
-`ObjectRecord`/perception support before it can be implemented -- not
-blocking this doc, but tracked here as the resolved direction pending
-perception-side bbox availability.
+### 3.2 Bridge ↔ Perception
+
+Defined in `rammp_perception_interfaces` (package `rammp-interfaces-ros2`).
+The bridge is a **subscriber only** here -- it does not call
+`~/detect`/`~/start_tracking`/`~/stop_tracking`/`~/renew_tracking`
+(something else, e.g. a scene-management node or the Orchestrator's own
+setup, owns the tracking session lifecycle; today nothing in this
+workspace calls them either -- `orchestrator_node` only subscribes, same
+as the bridge would).
+
+| Perception interface | Type | Used for |
+|---|---|---|
+| `object_detections_topic` (default `/perception/object_detections`) | `ObjectDetections` (topic) | Subscribed continuously; per-object pixel-space `box`/`mask_id` folded into the detected-objects push (§5.2.D) alongside the Orchestrator's `ObjectRecord` fields |
+
+`ObjectDetections` is `{header, DetectedObject[] objects, sensor_msgs/Image
+label_image}`. Each `DetectedObject` carries: `instance_id` (same scheme
+as `ObjectRecord.instance_id` -- `"<perception_class>_<n>"`, e.g.
+`"microwave_2"`, so the two can be joined directly), `perception_class`,
+`score`, `state` (`STATE_VISIBLE`/`STATE_OCCLUDED`), `box` (`[x_min, y_min,
+x_max, y_max]` in source-image pixels, all-zero when not visible),
+`mask_id` (its value in `label_image`, 0 when absent this frame),
+`has_pose`/`pose`/`size` (3D, when perception can place it).
+
+**This resolves the bbox gap** (formerly tracked in §3.1.1/§7): the bridge
+joins each polled `ObjectRecord` (from §3.1's `get_detected_objects`,
+world-frame/selection metadata) with the latest `DetectedObject` of the
+same `instance_id` (from this topic, pixel-frame/overlay metadata) when
+building the `UpdateDetectedObjects` push (§5.2.D), adding `box` and
+whichever `stream_id` corresponds to that detection's source image. The
+one remaining implementation detail (bridge-side config, not an upstream
+interface gap) is the `image_topic → stream_id` mapping -- i.e. knowing
+which camera stream a given `ObjectDetections.header.frame_id`/source
+image corresponds to, so the box lands on the right video overlay in UE.
+
+`label_image` (a `mono16` per-pixel `mask_id` image) is the actual
+segmentation mask referenced in §5.2.A -- if a mask is streamed to UE, this
+is its ROS2-side source, converted/re-encoded onto the camera-stream
+channel (§5.2.A), not forwarded as-is over Remote Control.
+
+`TrackingStatus` (published at a low fixed rate regardless of an open
+session, with `objects` but no masks) is not currently needed by the
+bridge, since `ObjectDetections` already carries everything the bridge
+uses; it's available as a lighter-weight session-health signal if a future
+need arises (e.g. surfacing "perception is not currently tracking
+anything" in an error panel).
+
+### 3.3 Bridge ↔ Engine node
+
+No shared interface package defines this today -- it's **per-engine, not
+generic**, unlike §3.1/§3.2. The reference engine wiring
+(`rammp_orchestrator.ros.engine_node.EngineNode`) only advertises
+`~/activate`/`~/hibernate`/`~/control`/`~/execute_action` -- all
+Orchestrator-facing, not telemetry a UI would subscribe to -- and no
+mock or real engine in this workspace currently publishes joint states,
+base odometry, or a wrist camera feed.
+
+This category exists in the design because §5.2.A/B's "system status" and
+"engine's own camera" sources are expected to come from **the specific
+engine node that owns that hardware** (e.g. an arm-driver node's
+`/joint_states`, a base driver's odometry, a manipulation engine's wrist
+camera topic) rather than being proxied through the generic
+Orchestrator/World-State surface, which only exposes a free-form JSON
+snapshot (`get_world_state`'s `snapshot_json`) not meant for
+high-frequency structured telemetry. Concretely, once a real engine
+exists: the bridge would take a per-engine topic-name parameter (or a
+small per-engine-id config table, since different engines publish
+different shapes) and subscribe directly, independent of whether that
+engine is currently activated/selected in the Orchestrator.
+
+**Still TBD** (tracked in §7): no concrete engine publishes these topics
+yet, so the exact topic names/message types/per-engine config shape can't
+be pinned down until a real engine (e.g. an arm driver) exists to look at.
 
 ## 4. UI-facing interface (ROS2 server/publisher side)
 
@@ -307,25 +389,31 @@ hint, not a label list). In Gen1, the actual object semantics (e.g.
 Control calls (`UpdateCupInfo`/`UpdateButtonInfo`), correlated with the
 mask stream only by convention, not carried in-band. This bridge should do
 the same: a segmentation mask (if sent) travels on the camera-stream
-channel as pixel data only, while any accompanying detected-object
-semantics (class, instance ID, 2D bounding box, pose) are pushed as data on
-the **existing detected-objects push** (§3's note on tap-to-select
-overlays/bounding boxes), *not* on `InteractionPanel` (§5.2.C), which stays
-reserved for the task/button dialog only. **Open/TBD:** neither perception
-nor engine camera topics are defined in `rammp_orchestrator_interfaces` /
-`rammp_perception_interfaces` yet -- this channel's exact ROS2-side source
-topics (and whether a segmentation mask is even produced) need to be
-defined before implementation.
+channel as pixel data only -- sourced from `ObjectDetections.label_image`
+(§3.2) when perception produces one -- while any accompanying detected-
+object semantics (class, instance ID, 2D bounding box, pose) are pushed as
+data on the **existing detected-objects push** (§5.2.D, now including
+pixel-space `box` data per §3.2), *not* on `InteractionPanel` (§5.2.C),
+which stays reserved for the task/button dialog only. **Open/TBD:** the
+raw RGB/depth image topics themselves (the Perception node's input, and
+an Engine node's wrist-camera output) aren't defined by any interface
+package in this workspace yet -- see §3.3. `ObjectDetections` (§3.2)
+solves the *detections* half of this channel (masks/boxes); the *pixel*
+half (the actual color/depth frames to stream) is still an open ROS2
+source-topic question.
 
 #### B. System status (robot proprioception)
 
 Arm joints, base status, and similar small/structured/high-frequency
 telemetry -- pushed via Remote Control preset function calls (like Gen1's
 `setJoints`/`UpdateSystemState`), **not** the streaming channel, since this
-is small structured data rather than bulk pixel payloads. **Open/TBD:**
-no engine or Orchestrator interface currently publishes joint states or
-base status -- the source topic(s) need to be defined (likely a new
-engine-published topic) before this channel can be implemented.
+is small structured data rather than bulk pixel payloads. Sourced via
+direct **bridge ↔ engine node** subscriptions (§3.3), not through the
+Orchestrator's generic World State -- each engine publishes its own
+telemetry shape (e.g. `/joint_states` for an arm engine, odometry for a
+base engine). **Open/TBD:** no engine in this workspace publishes this
+yet (§3.3), so the concrete topic names/shapes/per-engine config can't be
+pinned down until a real engine exists.
 
 #### C. `InteractionPanel` -- task/capability prompt (renamed from "information")
 
@@ -389,7 +477,7 @@ infrequent JSON payloads rather than bulk pixel data:
 | Function | Parameters | Pushed when |
 |---|---|---|
 | `UpdateWorldState` | `Version` (int), `SnapshotJson` (string, JSON-encoded World State) | `~/get_world_state` poll result's `version` differs from the last pushed value |
-| `UpdateDetectedObjects` | `Objects`: array of `{instance_id, perception_class, last_pose, location, opened, last_seen}` (plus `bbox`/`stream_id` per object once §3's bbox extension lands) | `~/get_detected_objects` poll result's set of `instance_id`s differs from the last pushed set |
+| `UpdateDetectedObjects` | `Objects`: array of `{instance_id, perception_class, last_pose, location, opened, last_seen, box, mask_id, stream_id}` -- the last three joined in from `ObjectDetections` (§3.2) by matching `instance_id` | `~/get_detected_objects` poll result's set of `instance_id`s differs from the last pushed set |
 
 Mechanics:
 
@@ -409,12 +497,34 @@ Mechanics:
    implementation): `instance_id`/`perception_class` as-is;
    `last_pose_json` is JSON-decoded into a nested `last_pose` object
    (`{}` if empty); `location`/`opened`/`last_seen` passed through as-is.
+   `box`/`mask_id`/`stream_id` (from §3.2's perception join) are added if
+   the bridge currently has a matching `ObjectDetections.objects[]` entry
+   for that `instance_id`, omitted otherwise.
 
-This is the channel §3's bounding-box extension (tap-to-select camera
-overlays) and any future per-object metadata should be added to --
-`InteractionPanel` (§5.2.C) is deliberately not used for this data, since
-it's keyed by `instance_id` on its own change-triggered cadence, not tied
-to the task/button-dialog lifecycle.
+**Design note: why `box` stays on this change-triggered push instead of
+going out per-frame.** `box` moves every camera frame (the object or
+camera may move continuously), which would seem to need per-frame
+updates -- but pushing per-frame via Remote Control RPC would defeat the
+"change-triggered, not polled" design and flood UE with calls. Instead:
+the **precise**, per-frame overlay mechanism is pixel hit-testing against
+`label_image` (§3.2), which already streams continuously on the
+camera-stream channel (§5.2.A) -- UE reads the `mask_id` at the tapped
+pixel directly from the frame it's already displaying, and resolves it to
+an `instance_id` via the `mask_id` this push just gave it. `box` itself is
+a **coarser fallback** (e.g. for a perception mode that produces boxes but
+no mask, or a simple "approximately here" highlight overlay) and is
+intentionally allowed to lag slightly behind the live video between
+instance-set changes -- acceptable for a food-prep/kitchen scene where
+objects don't move fast, and not something UE should rely on for
+pixel-exact hit-testing. If this trade-off proves wrong once real
+payloads are measured, `box` can move to its own faster-cadence push
+without changing `mask_id`'s role.
+
+This is the channel §3.2's bounding-box/mask-id data and any future
+per-object metadata should be added to -- `InteractionPanel` (§5.2.C) is
+deliberately not used for this data, since it's keyed by `instance_id` on
+its own change-triggered cadence, not tied to the task/button-dialog
+lifecycle.
 
 ### 5.3 Push semantics
 
@@ -445,21 +555,20 @@ to the task/button-dialog lifecycle.
 
 ## 7. Not yet in scope
 
-- **Exact ROS2 source topics for §5.2.A (camera streams) and §5.2.B
-  (system status)** are undefined -- `rammp_orchestrator_interfaces`/
-  `rammp_perception_interfaces` do not currently publish camera frames or
-  joint/base state. Camera streaming and system status are *intended*
-  channels of this bridge (unlike in the prior version of this doc), but
-  implementation is blocked on those source topics being defined first.
-- **2D bounding boxes for tap-to-select camera overlays** (§3's note) are
-  undefined on the perception side -- `ObjectRecord` has no camera-pixel-
-  space bbox field today. The direction (extend the detected-objects push,
-  not `InteractionPanel`) is decided; the upstream `ObjectRecord`/
-  perception change to actually produce it is not.
+- **Raw RGB/depth image topics for §5.2.A (camera streams) and §3.3's
+  engine-telemetry topics for §5.2.B (system status)** are undefined --
+  no interface package in this workspace publishes camera frames, joint
+  states, or base status today (see §3.3). Camera streaming and system
+  status are *intended* channels of this bridge (unlike in the prior
+  version of this doc), but implementation is blocked on those source
+  topics/engine telemetry existing first. (The *detected-object*
+  half of the camera-stream story -- masks and pixel-space boxes -- is
+  resolved via §3.2's direct `ObjectDetections` subscription; it's only
+  the raw pixel frames and engine-specific telemetry that remain open.)
 - Joint-state → UE skeleton **mapping logic** (the specific joint-index
   layout the Gen1 prototype's `set_ui_joints` hardcoded for its chair+arm
   robot) does not carry over as-is, since it was specific to that
-  hardware's joint layout -- §5.2.B needs its own mapping once a real
+  hardware's joint layout -- §5.2.B/§3.3 needs its own mapping once a real
   engine's joint-state shape is known.
 - **Action button labels** (§3.1's `select_object` note) -- `ActionAvailability`
   carries only `action_id`, not the human-readable `ActionSpec.label` the
@@ -467,4 +576,9 @@ to the task/button-dialog lifecycle.
   `rammp_orchestrator_interfaces`/Orchestrator-core change (recommended:
   add `label`/`style_hint` to `ActionAvailability`) before `InteractionPanel`
   buttons can show real text instead of raw `action_id`s.
+- **`image_topic` → `stream_id` mapping** (§3.2) -- which camera stream a
+  given `ObjectDetections` source image corresponds to is bridge-side
+  config, not an upstream interface gap, but the concrete mapping/config
+  shape isn't defined yet (depends on how many camera streams exist once
+  §5.2.A's source topics are known).
 
