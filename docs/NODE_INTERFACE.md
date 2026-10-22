@@ -47,6 +47,150 @@ The bridge never calls `register_engine`, `write_world_state`,
 `update_object_state`, or `request_intent` -- those are engine-facing, not
 UI-facing (see `rammp_orchestrator_interfaces` package docs).
 
+### 3.1 Field-level detail per call
+
+#### `select_object` (`SelectObject.srv`)
+
+```
+# request
+string instance_id          # from the tapped ObjectRecord (§5.2.D)
+string perception_class     # from the same ObjectRecord
+---
+# response
+bool success
+rammp_orchestrator_interfaces/EngineActivation[] activations
+string message
+```
+
+Each `EngineActivation` is `{engine_id, ActionAvailability[] availability}`
+-- one entry per engine that claims `perception_class` (more than one can,
+e.g. "microwave" claimed by Articulation, Pick-and-Place, and Microwave
+Controls). Each `ActionAvailability` is
+`{action_id, available, reason, suggested_params_json}`.
+
+The bridge flattens every `available=true` entry across all `activations`
+into the button list for the next `InteractionPanel` push (§5.2.C),
+discarding (or optionally surfacing as disabled buttons with `reason` as
+the tooltip/message) the `available=false` ones. `engine_id`+`action_id`
+together become the bridge-internal key the resulting `button_id` maps
+back to (so two engines offering the same `action_id`, e.g. both
+Articulation and Pick-and-Place offering `"open"` on a fridge, resolve to
+two distinct buttons, not one).
+
+**Gap: no human-readable label in the response.** `ActionAvailability`
+carries only the machine `action_id`, not a display string -- the
+human-readable text lives on `ActionSpec.label` (in each engine's
+`CapabilityManifest`, registered at `register_engine` time), which the
+Orchestrator already holds internally but does not currently expose to UI
+clients. Until this is resolved upstream, the bridge cannot build a
+correctly-labelled button purely from `select_object`'s response. Tracked
+as an open item in §7; the two candidate fixes are (a) add
+`label`/`style_hint` fields to `ActionAvailability` itself, populated from
+the matching `ActionSpec` at the point the Orchestrator already builds
+`ActionAvailability` from each `ActionSpec`, or (b) add a dedicated
+UI-facing query service that returns the registered `CapabilityManifest`s
+(and thus every `ActionSpec.label`) so the bridge can cache
+`action_id -> label` per engine. (a) is the smaller change and avoids a
+second round trip, so it's the recommended direction, but needs
+Orchestrator-side confirmation before being implemented.
+
+#### `deselect` (`Deselect.srv`)
+
+```
+# request: (empty)
+---
+# response
+bool success
+string message
+```
+Called with no request fields. On `success`, the Orchestrator has
+hibernated every activated engine and returned to Browse mode; the bridge
+responds by clearing the current `InteractionPanel` (or replacing it with
+whatever default/idle panel state is defined) and forgetting its
+`button_id -> (call, params)` mapping, since none of those buttons are
+valid anymore.
+
+#### `control` (`Control.srv`)
+
+```
+# request
+uint8 command   # PAUSE=0, RESUME=1, CANCEL=2
+---
+# response
+bool accepted
+string message
+```
+Forwarded to whichever engine currently holds execution resources (the
+delegate while in `Delegated` mode, otherwise the primary engine -- this
+routing is internal to the Orchestrator, the bridge does not need to know
+which engine is actually targeted). On `accepted=false`, the bridge should
+surface `message` as an error/toast via `InteractionPanel` (§6) rather
+than silently dropping the tap.
+
+#### `execute_action` (`ExecuteAction.action`)
+
+```
+# goal
+string engine_id
+string action_id
+string params_json     # from ActionAvailability.suggested_params_json, or
+                        # bridge-constructed if the button needed user
+                        # input beyond a one-tap default
+---
+# result
+rammp_orchestrator_interfaces/Result result
+---
+# feedback
+rammp_orchestrator_interfaces/Progress progress
+```
+`engine_id`/`action_id` are exactly the pair the bridge resolved from the
+tapped `button_id` (see the `select_object` note above). Feedback
+(`Progress`: `phase`, `pct`, `message`, `pausable`) streams into the
+`InteractionPanel`'s progress field (§5.2.C) for the lifetime of the goal;
+`Progress.pausable` tells the bridge whether to keep a "Pause" button live
+on the panel for this step. `Result` (`status` one of
+`STATUS_SUCCESS`/`STATUS_FAILED`/`STATUS_CANCELLED`, plus `payload_json`,
+`error_code`, `recoverable`, `suggestions[]`) arrives once and should
+collapse the in-progress panel into a terminal state: a success/failure
+message, and -- per `recoverable`/`suggestions` -- either a retry button
+(re-issuing the same `execute_action` goal) or a dismiss/deselect button.
+
+**Note on the standalone `~/progress` topic.** The Orchestrator node also
+publishes every `Progress` update as a plain topic
+(`<orchestrator_ns>/progress`, type `Progress`) in addition to relaying it
+as this action's feedback -- the same message, published twice. The bridge
+should prefer the action feedback channel (it's scoped to the specific
+goal the bridge itself issued), but the topic is available as a fallback
+if a future design needs progress visibility decoupled from holding an
+active goal handle (e.g. a supervisory/read-only UI).
+
+#### `get_world_state` (`GetWorldState.srv`)
+
+```
+# request: (empty)
+---
+# response
+string snapshot_json
+int64 version
+```
+Polled at `world_state_poll_period`; pushed to UE (`UpdateWorldState`,
+§5.2.D) only when `version` changes from the last *pushed* value.
+
+#### `get_detected_objects` (`GetDetectedObjects.srv`)
+
+```
+# request: (empty)
+---
+# response
+rammp_orchestrator_interfaces/ObjectRecord[] objects
+```
+Each `ObjectRecord`: `instance_id`, `perception_class`, `last_pose_json`,
+`location`, `opened` (tri-state), `last_seen`. Polled at
+`detected_objects_poll_period`; pushed to UE (`UpdateDetectedObjects`,
+§5.2.D) only when the `instance_id` set changes from the last *pushed*
+set. See the bbox note below for the (not yet available) tap-to-select
+overlay data.
+
 **Note: UE itself never sends `deselect`/`control`/`execute_action`
 commands.** See §5.1 -- the bridge turns each available control/action
 option into a button on the current `InteractionPanel`, and UE only ever
@@ -317,4 +461,10 @@ to the task/button-dialog lifecycle.
   robot) does not carry over as-is, since it was specific to that
   hardware's joint layout -- §5.2.B needs its own mapping once a real
   engine's joint-state shape is known.
+- **Action button labels** (§3.1's `select_object` note) -- `ActionAvailability`
+  carries only `action_id`, not the human-readable `ActionSpec.label` the
+  Orchestrator already has at registration time. Needs an upstream
+  `rammp_orchestrator_interfaces`/Orchestrator-core change (recommended:
+  add `label`/`style_hint` to `ActionAvailability`) before `InteractionPanel`
+  buttons can show real text instead of raw `action_id`s.
 
