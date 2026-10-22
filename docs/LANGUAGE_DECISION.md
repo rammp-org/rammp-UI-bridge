@@ -7,13 +7,16 @@ contributors, rather than re-litigated from scratch.
 
 ## TL;DR
 
-For the interface as currently scoped (sparse JSON command dispatch,
-low-frequency polling, ROS2 service/action calls), **C++ is unlikely to
-produce a measurable performance improvement** over Python/`rclpy` --
-the bottleneck in both cases is DDS/network round-trip time and the UE
-WebSocket round-trip, not language execution speed. The clearest case for
-C++ is a future high-rate video/data streaming path, which is explicitly
-**not** part of this node's current scope (see `NODE_INTERFACE.md` §7).
+For the command/state-dispatch portion of this node's interface (JSON
+command dispatch, low-frequency polling, ROS2 service/action calls),
+**C++ is unlikely to produce a measurable performance improvement** over
+Python/`rclpy` -- the bottleneck in both cases is DDS/network round-trip
+time and the UE WebSocket round-trip, not language execution speed. The
+clearest case for C++ is the camera video-streaming channel
+(`docs/NODE_INTERFACE.md` §5.2.A) -- and unlike when this doc was first
+written, that channel is now a **near-term planned feature**, not a
+hypothetical future one, which sharpens rather than removes the
+performance question below.
 
 ## Why language doesn't matter much here, today
 
@@ -36,14 +39,16 @@ C++ is a future high-rate video/data streaming path, which is explicitly
 
 ## Where C++ would actually help
 
-The Gen1 prototype GUI bridge's **camera/depth/segmentation-mask video
-streaming** (30-60 Hz, large frame payloads, per-pixel mask/intrinsics
-math) is genuinely CPU/memory-bandwidth-bound work where Python's overhead
-(object boxing, GIL contention between the streaming thread and ROS2
-callbacks) is a real cost. If/when this bridge grows a video streaming
-path, that specific piece is the one worth writing in C++ (or offloading to
-a GPU-accelerated encode library) -- not the control-plane logic described
-in `NODE_INTERFACE.md`.
+The camera stream channel (`docs/NODE_INTERFACE.md` §5.2.A: RGBD from
+Perception and/or RGB from an engine camera, optionally with detected-
+object overlays, reusing the Gen1 prototype's streaming mechanism) is
+genuinely CPU/memory-bandwidth-bound work -- 30-60 Hz, large frame
+payloads, per-pixel mask/intrinsics math -- where Python's overhead (object
+boxing, GIL contention between the streaming thread and ROS2 callbacks) is
+a real cost. This is now a planned near-term channel of this bridge (not a
+hypothetical future one as earlier drafts of this doc framed it), which
+makes it the most concrete argument for using C++ -- specifically for that
+channel, not necessarily the whole node.
 
 ## Cost side of a full C++ rewrite
 
@@ -61,11 +66,13 @@ in `NODE_INTERFACE.md`.
 
 ## Recommendation
 
-Keep control-plane logic (command dispatch, polling, service/action calls)
-in whichever language the team iterates fastest in -- a Python reference
-implementation already exists in a local workspace folder
-(`rammp-ui-bridge-local`), built directly against this interface spec.
-Revisit C++ specifically when/if a high-rate streaming requirement
-materializes, and consider scoping it to just that subsystem (a
-mixed-language package, or a separate streaming node) rather than rewriting
-the whole bridge.
+Keep control-plane logic (command dispatch, polling, service/action calls,
+the `InteractionPanel` schema) in whichever language the team iterates
+fastest in -- an earlier Python reference implementation exists in a local
+workspace folder (`rammp-ui-bridge-local`), built against an earlier draft
+of this interface. Given the camera-streaming channel is now a concrete
+near-term requirement rather than a hypothetical, it's worth deciding its
+implementation language explicitly and separately from the rest of the
+node -- e.g. a mixed-language package, or a dedicated streaming node/process
+-- rather than letting "should we use C++" become an all-or-nothing
+decision for the whole bridge.

@@ -27,15 +27,16 @@ objects, action progress/results) back to UE for rendering.
    bridge parses it and calls the matching Orchestrator service or action:
    `select_object`, `deselect`, `control` (pause/resume/cancel), and
    `execute_action`.
-3. **Streams Orchestrator state back to UE.** Polls `get_world_state` and
-   `get_detected_objects`, pushing updates to UE only when something
-   actually changed (by World State version / detected-instance-ID set);
-   streams `ExecuteAction` progress feedback and the final result back to
-   UE as they arrive.
+3. **Pushes state back to UE over three channels**: a camera video stream
+   (RGBD from Perception and/or RGB from an engine's own camera, each
+   optionally carrying detected-object info), system status (arm
+   joints/base status), and a single dynamic `InteractionPanel` JSON
+   schema (title/message/buttons/progress) that lets UE build whatever
+   popup/dialog the current task calls for without hardcoding layouts per
+   action. See `docs/NODE_INTERFACE.md` §5.2 for the full schema -- several
+   pieces of this are still open design questions, not finalized.
 4. **Reports bridge health.** Publishes a connection-status topic so other
-   ROS2 nodes/operators can see whether a UE instance is currently attached,
-   and reports a structured error back to UE if a command can't be
-   serviced (bad JSON, unknown command, Orchestrator service unavailable).
+   ROS2 nodes/operators can see whether a UE instance is currently attached.
 
 This node is intentionally "dumb": it owns no business logic of its own
 (no capability/engine knowledge, no world-state rules) -- all of that lives
@@ -52,21 +53,23 @@ Python-vs-C++ implementation-language discussion.
 ## Status
 
 This repository currently contains interface/design documentation only; no
-implementation has been committed here yet. A Python prototype exists in a
-local, uncommitted workspace folder (`rammp-ui-bridge-local`) implementing
-the interface described in `docs/NODE_INTERFACE.md` against
-`rammp_orchestrator_interfaces`, available as a reference once implementation
-work on this repo begins.
+implementation has been committed here yet. An earlier Python prototype
+exists in a local, uncommitted workspace folder (`rammp-ui-bridge-local`),
+built against an earlier draft of `docs/NODE_INTERFACE.md` (pre-dating the
+three-channel Bridge→UE design below) -- useful as a reference for the
+command/service-call plumbing, but not yet updated for the camera stream/
+system status/`InteractionPanel` channels.
 
 ## Relationship to the Gen1 prototype GUI bridge
 
 An earlier, hardware-specific GUI bridge (`rammp_prototype_gui.Gui_bridge`)
-existed for the Gen1 chair+arm prototype. It additionally streamed camera
+existed for the Gen1 chair+arm prototype. It streamed camera
 color/depth/segmentation-mask frames to UE and mapped real robot joint
-states into a UE skeleton, neither of which has a counterpart in the
-current Orchestrator/mock-engine system (no camera topics or joint-state
-publishers exist yet). This repo intentionally starts from the
-Orchestrator's actual current interface rather than porting that
-hardware-specific code; see `docs/NODE_INTERFACE.md`'s "Not yet in scope"
-section.
+states into a UE skeleton. This bridge intends to reuse that same streaming
+mechanism (see `docs/NODE_INTERFACE.md` §5.2.A/B), but the ROS2-side source
+topics (camera frames, joint/base state) aren't defined yet in
+`rammp_orchestrator_interfaces`/`rammp_perception_interfaces` -- see
+`docs/NODE_INTERFACE.md`'s "Not yet in scope" section for what's blocked on
+that.
+
 

@@ -64,9 +64,18 @@ every connect (including reconnects after a dropped connection).
 
 ### 5.1 UE → bridge: `UserInput` command schema
 
-The bridge watches the preset's `UserInput` string property for changes
-(delivered as a `ChangedFields` WebSocket event) and parses each new value
-as one JSON object:
+**Status: placeholder, to be refined.** The bridge watches the preset's
+`UserInput` string property for changes (delivered as a `ChangedFields`
+WebSocket event) and parses each new value as one JSON object. The command
+set below (`select_object`/`deselect`/`control`/`execute_action`) is a
+first draft and will be revised once the §5.2.C `InteractionPanel` schema
+is finalized -- in particular, a button tap must be reportable as a
+**button press referencing the `button_id` from the most recently pushed
+`InteractionPanel`**, so the bridge can resolve "which button" without UE
+needing any domain knowledge of what that button does. Exact field name/
+shape for that (`{"cmd": "button_press", "button_id": "..."}` or folded
+into the existing commands) is still open -- do not treat this subsection
+as final.
 
 | `cmd` | Fields | Orchestrator call triggered |
 |---|---|---|
@@ -77,56 +86,110 @@ as one JSON object:
 
 Unknown `cmd` values, and values that don't parse as JSON at all, are
 logged and must **not** be forwarded to the Orchestrator; the bridge
-reports them back to UE via `UpdateBridgeError` (below) rather than
+reports them back to UE via an error report (see §5.2.C) rather than
 silently dropping them, so a UI/Blueprint bug is visible during
 development.
 
-Examples:
-```json
-{"cmd": "select_object", "instance_id": "fridge_1", "perception_class": "refrigerator"}
-{"cmd": "execute_action", "engine_id": "pick_place", "action_id": "place", "params": {"target": "counter_1"}}
-{"cmd": "control", "command": "CANCEL"}
-{"cmd": "deselect"}
-```
+### 5.2 bridge → UE: three channels
 
-### 5.2 bridge → UE: Remote Control functions called
+Bridge → UE traffic is organized into three channels with different
+transports and update rates, rather than one undifferentiated stream of
+Remote Control function calls:
 
-The bridge calls these as UE preset functions
-(`PUT /remote/preset/<preset>/function/<FunctionName>`); UE's preset must
-expose a matching function for each one it needs to react to.
+#### A. Camera stream (video data plane)
 
-| Function | Parameters | Trigger |
-|---|---|---|
-| `UpdateWorldState` | `Version` (int), `SnapshotJson` (string, JSON-encoded World State) | `get_world_state` poll, only when `Version` changed since the last push |
-| `UpdateDetectedObjects` | `Objects`: array of `{instance_id, perception_class, last_pose, location, opened, last_seen}` | `get_detected_objects` poll, only when the set of visible instance IDs changed |
-| `UpdateSelection` | `Success` (bool), `Message` (string), `Activations`: array of `{engine_id, availability: [{action_id, available, reason, suggested_params}]}` | response to a `select_object` command |
-| `UpdateDeselect` | `Success` (bool), `Message` (string) | response to a `deselect` command |
-| `UpdateControlAck` | `Command` (string), `Accepted` (bool), `Message` (string) | response to a `control` command |
-| `UpdateProgress` | `EngineId`, `ActionId`, `Phase` (string), `Pct` (float, 0-1), `Message` (string), `Pausable` (bool) | `ExecuteAction` feedback, streamed while an action runs |
-| `UpdateActionResult` | `EngineId`, `ActionId`, `Status` (0=SUCCESS/1=FAILED/2=CANCELLED, or absent/null if the goal was rejected before starting), `Payload`, `ErrorCode`, `Recoverable`, `Suggestions` | `ExecuteAction` result, once the goal finishes (or is rejected) |
-| `UpdateBridgeError` | `Cmd` (string), `Message` (string) | any `UserInput` command the bridge couldn't service (bad JSON, unknown `cmd`, Orchestrator service/action server unavailable, or a handler exception) |
+Reuses the Gen1 prototype's TCP streaming mechanism unchanged
+(`streaming/sender.py` + `protocol.py` + `client.py` -- per-channel
+`send_image`/`send_depth`/`send_mask` framing, not the Remote Control
+WebSocket, since this is bulk pixel data). Two kinds of sources:
 
-`WorldState`/`ObjectRecord` JSON shapes are whatever
-`rammp_orchestrator.core.world_state`/`interfaces` currently serialize --
-intentionally not duplicated here since the bridge passes them through
-verbatim; see that package's own docs for the authoritative shape.
+- **RGBD from a Perception node** -- color + depth, optionally accompanied
+  by detected-object information for that frame (e.g. a segmentation mask
+  and/or bounding-box list, following the Gen1 `send_mask`/metadata
+  pattern) when Perception has detections for the frame; absent otherwise.
+- **RGB-only from an Engine node's own camera** (e.g. a wrist camera active
+  only during a manipulation action), likewise optionally accompanied by
+  detections.
+
+Each source gets its own channel/`stream_id`, tagged with
+`source`/`role`/`group` metadata so UE can route each frame to the right
+material/viewport -- same conventions as Gen1's per-camera channel
+numbering (see that bridge's `image_channel`/`depth_channel`/`mask_channel`
+parameters for precedent). **Open/TBD:** neither perception nor engine
+camera topics are defined in `rammp_orchestrator_interfaces` /
+`rammp_perception_interfaces` yet -- this channel's exact ROS2-side source
+topics need to be defined before implementation.
+
+#### B. System status (robot proprioception)
+
+Arm joints, base status, and similar small/structured/high-frequency
+telemetry -- pushed via Remote Control preset function calls (like Gen1's
+`setJoints`/`UpdateSystemState`), **not** the streaming channel, since this
+is small structured data rather than bulk pixel payloads. **Open/TBD:**
+no engine or Orchestrator interface currently publishes joint states or
+base status -- the source topic(s) need to be defined (likely a new
+engine-published topic) before this channel can be implemented.
+
+#### C. `InteractionPanel` -- task/capability prompt (renamed from "information")
+
+A single JSON schema describing whatever dialog/popup UE should render for
+the current task/capability context, letting UE build it dynamically
+instead of hardcoding dialog layouts per action. Content:
+
+- `title` (string)
+- `message` (string) -- free-text status/instruction to show the user
+- `buttons`: array of `{button_id, label, style}`, where `style` is one of
+  `normal` / `warning` / `error`, and `button_id` is an opaque identifier
+  the bridge assigns and later resolves when UE reports a button press
+  (see §5.1)
+- `progress` (optional): `{phase, pct, message, pausable}` -- the same
+  shape as `ExecuteAction` feedback, folded into the panel instead of a
+  separate function call
+
+This is deliberately a superset that can express what §5.2 previously
+modeled as four separate functions (`UpdateSelection` i.e. available
+actions as buttons, `UpdateProgress`, `UpdateActionResult`, and
+`UpdateBridgeError` i.e. an error-styled panel) -- those are superseded by
+pushing an appropriately-populated `InteractionPanel` instead. A single
+unified, versionable JSON schema is easier for UE to parse generically
+(build N buttons from an array) and to extend later (new optional fields)
+than a growing set of bespoke RPC function signatures.
+
+**Open/TBD:**
+- Transport: either a Remote Control function call (e.g.
+  `UpdatePanel({"PanelJson": "..."})`) or the streaming channel --
+  undecided; likely driven by size/frequency once real payloads are
+  measured (Remote Control calls are simpler for small/sporadic panels;
+  the streaming channel may be preferable if panels become large/frequent).
+- Exact JSON field names/casing and whether `world_state`/
+  `detected_objects` pushes (`UpdateWorldState`/`UpdateDetectedObjects`)
+  also fold into this scheme or remain separate -- for now, treat those two
+  as still-separate raw-data pushes, distinct from the dialog/prompt
+  `InteractionPanel` describes.
+- The name itself -- `InteractionPanel` was chosen over `ActionPanel`/
+  `UiPanel`/the placeholder `information`; open to revision.
 
 ### 5.3 Push semantics
 
-- `UpdateWorldState`/`UpdateDetectedObjects` are **change-triggered, not
+- World-state/detected-objects pushes remain **change-triggered, not
   every-poll** -- the bridge must track the last-pushed World State
   `version` and the last-pushed set of detected `instance_id`s, and only
-  call the UE function when either actually changed. This bounds UE-side
-  traffic to actual state changes regardless of poll frequency.
-- `UpdateProgress`/`UpdateActionResult` are **event-triggered** -- one push
-  per feedback message / one push on terminal result, no polling involved
-  (these ride the `ExecuteAction` action's own feedback/result channel).
+  push when either actually changed. This bounds UE-side traffic to actual
+  state changes regardless of poll frequency.
+- `InteractionPanel` pushes are **event-triggered** -- one push whenever
+  the available actions, progress, or an error condition changes (e.g. on
+  `select_object` response, on each `ExecuteAction` feedback message, on
+  terminal result, or on a reportable bridge error), no polling involved.
+- Camera stream and system-status pushes are inherently continuous/
+  event-driven at whatever rate their ROS2 sources publish, once those
+  sources are defined (see §5.2.A/B "Open/TBD").
 
 ## 6. Error handling requirements
 
 - If an Orchestrator service/action server is not available within
   `service_wait_timeout`, the bridge must not block indefinitely waiting
-  for it -- report `UpdateBridgeError` and return.
+  for it -- report it to UE via an error-styled `InteractionPanel` (§5.2.C)
+  and return.
 - A single malformed/invalid UE command must not crash the node or stop
   subsequent commands from being processed (isolate failures per-command).
 - The UE WebSocket connection must reconnect automatically on drop
@@ -135,10 +198,15 @@ verbatim; see that package's own docs for the authoritative shape.
 
 ## 7. Not yet in scope
 
-Camera/depth/segmentation-mask video streaming and joint-state → UE
-skeleton mapping (both present in the Gen1 prototype's
-`rammp_prototype_gui.Gui_bridge`) are **not** part of this interface, since
-the current Orchestrator/mock-engine system publishes neither camera frames
-nor joint states. Add a `docs/NODE_INTERFACE.md` section for these if/when
-a perception node or engine starts publishing that data and a real
-streaming need exists -- don't speculatively implement them beforehand.
+- **Exact ROS2 source topics for §5.2.A (camera streams) and §5.2.B
+  (system status)** are undefined -- `rammp_orchestrator_interfaces`/
+  `rammp_perception_interfaces` do not currently publish camera frames or
+  joint/base state. Camera streaming and system status are *intended*
+  channels of this bridge (unlike in the prior version of this doc), but
+  implementation is blocked on those source topics being defined first.
+- Joint-state → UE skeleton **mapping logic** (the specific joint-index
+  layout the Gen1 prototype's `set_ui_joints` hardcoded for its chair+arm
+  robot) does not carry over as-is, since it was specific to that
+  hardware's joint layout -- §5.2.B needs its own mapping once a real
+  engine's joint-state shape is known.
+
