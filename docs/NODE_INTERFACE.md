@@ -276,6 +276,39 @@ uses; it's available as a lighter-weight session-health signal if a future
 need arises (e.g. surfacing "perception is not currently tracking
 anything" in an error panel).
 
+**Design decision: why this isn't instead "add `box` to `ObjectRecord`
+and drop this section".** It's tempting to route `box` through the
+Orchestrator too (it already subscribes to this same topic internally to
+build `ObjectRecord`), so the bridge would only ever talk to one upstream
+service. That gets rid of this subsection's *bbox* half, but not the rest
+of it:
+
+- `label_image` (the segmentation mask) is bulk per-frame pixel data --
+  a `sensor_msgs/Image`, not something that fits `ObjectRecord`'s
+  text/JSON shape or `get_detected_objects`' request/response polling
+  pattern. It has to come from Perception directly regardless (it's what
+  the camera-stream channel, §5.2.A, actually re-encodes and sends). So
+  even with `box` added to `ObjectRecord`, the bridge would still need a
+  direct `rammp_perception_interfaces` dependency for the mask -- this
+  section wouldn't actually go away, just shrink to "subscribe for
+  `label_image` only, ignore `DetectedObject.box`".
+- Adding pixel-space geometry (`box`, and implicitly a camera-topology
+  concept like `stream_id`) to `ObjectRecord` would couple the
+  Orchestrator's core world-state model -- deliberately generic/
+  perception-and-UI-agnostic, the same way `CapabilityManifest` is
+  engine-agnostic -- to vision-specific concerns that are only meaningful
+  to this one UI-bridge client. A future second UI client, or a non-visual
+  consumer of World State, would have no use for it.
+
+Given the mask dependency can't be removed either way, keeping both
+`box` and `label_image` sourced from the same direct Perception
+subscription (this section) is simpler overall than splitting one value
+onto the Orchestrator and the other onto Perception, and keeps the
+Orchestrator's interface unchanged. **This is the adopted direction** --
+revisit only if a concrete future need removes the mask/pixel-hit-test
+requirement entirely (see §5.2.D's design note), at which point `box`
+alone moving to `ObjectRecord` would become a clean simplification.
+
 ### 3.3 Bridge ↔ Engine node
 
 No shared interface package defines this today -- it's **per-engine, not
