@@ -38,14 +38,21 @@ never advertises any of these itself.
 |---|---|---|
 | `<orchestrator_ns>/get_world_state` | `GetWorldState.srv` | Polled; result pushed to UE on version change |
 | `<orchestrator_ns>/get_detected_objects` | `GetDetectedObjects.srv` | Polled; result pushed to UE on instance-set change (see note below re: bounding boxes) |
-| `<orchestrator_ns>/select_object` | `SelectObject.srv` | Called when UE sends a `select_object` command |
-| `<orchestrator_ns>/deselect` | `Deselect.srv` | Called when UE sends a `deselect` command |
-| `<orchestrator_ns>/control` | `Control.srv` | Called when UE sends a `control` command (pause/resume/cancel) |
-| `<orchestrator_ns>/execute_action` | `ExecuteAction.action` | Called when UE sends an `execute_action` command; feedback and result both relayed to UE |
+| `<orchestrator_ns>/select_object` | `SelectObject.srv` | Called when UE sends a `select_object` command (user tapped an object) |
+| `<orchestrator_ns>/deselect` | `Deselect.srv` | Called when the bridge resolves a `button_press` whose panel button represented "deselect"/"back" (§5.1) |
+| `<orchestrator_ns>/control` | `Control.srv` | Called when the bridge resolves a `button_press` whose panel button represented a pause/resume/cancel control (§5.1) |
+| `<orchestrator_ns>/execute_action` | `ExecuteAction.action` | Called when the bridge resolves a `button_press` whose panel button represented a specific action (§5.1); feedback and result both relayed to UE |
 
 The bridge never calls `register_engine`, `write_world_state`,
 `update_object_state`, or `request_intent` -- those are engine-facing, not
 UI-facing (see `rammp_orchestrator_interfaces` package docs).
+
+**Note: UE itself never sends `deselect`/`control`/`execute_action`
+commands.** See §5.1 -- the bridge turns each available control/action
+option into a button on the current `InteractionPanel`, and UE only ever
+reports back which button was tapped (`button_press` + `button_id`). This
+table's "Used for" column describes what the bridge calls once it resolves
+that `button_id`, not a direct UE→Orchestrator pass-through.
 
 **Note on tap-to-select overlays / bounding boxes.** `ObjectRecord` today
 carries `instance_id`/`perception_class`/`last_pose_json` (a world/robot-
@@ -91,31 +98,28 @@ The bridge watches the preset's `UserInput` string property for changes
 (delivered as a `ChangedFields` WebSocket event) and parses each new value
 as one JSON object.
 
-**Governing principle: UE is domain-agnostic and only echoes back opaque
-IDs the bridge most recently assigned it.** UE never needs to know what an
-object or button *means* -- it just reports which `instance_id` the user
-tapped (from the last `UpdateDetectedObjects` push, §5.2.D) or which
-`button_id` the user tapped (from the last `InteractionPanel` push,
-§5.2.C). The bridge is the only side that knows what each ID actually maps
-to (an Orchestrator object, an action to execute, a dismiss/retry/cancel
-behavior, etc.) and resolves that internally when the command arrives.
+**Governing principle: UE only ever reports a tap -- it never sends a
+domain command directly.** UE has exactly two things a user can tap: an
+object (in the camera view or a world-state list) or a button (on the
+current `InteractionPanel`, §5.2.C). There is no UE-facing `deselect`,
+`control`, or `execute_action` command -- those are Orchestrator-facing
+concepts the bridge itself decides to expose, by rendering each available
+action/control option as a panel button. UE just echoes back whichever
+opaque ID (`instance_id` or `button_id`) the bridge most recently assigned
+it; the bridge is the only side that knows what that ID actually means and
+resolves it internally.
 
-| `cmd` | Fields | Orchestrator call triggered |
+| `cmd` | Fields | Bridge behavior |
 |---|---|---|
-| `select_object` | `instance_id` (string) -- echoed from `UpdateDetectedObjects`; `perception_class` (string) | `select_object` |
-| `deselect` | *(none)* | `deselect` |
-| `control` | `command`: one of `"PAUSE"`, `"RESUME"`, `"CANCEL"` | `control` |
-| `execute_action` | `engine_id` (string), `action_id` (string), `params` (object, optional) | `execute_action` |
-| `button_press` | `button_id` (string) -- echoed from the most recently pushed `InteractionPanel` (§5.2.C) | resolved by the bridge: it looks up what `button_id` meant when that panel was built (e.g. a specific `execute_action` call, a `control` command, or purely dismissing the panel client-side) and performs that |
+| `select_object` | `instance_id` (string) -- echoed from the last `UpdateDetectedObjects` push (§5.2.D) | Calls Orchestrator `select_object`, then rebuilds and pushes an updated `InteractionPanel` reflecting the newly available actions/controls for that object (as buttons) |
+| `button_press` | `button_id` (string) -- echoed from the last `InteractionPanel` push (§5.2.C) | The bridge looks up what `button_id` meant when it built that panel, and performs the corresponding Orchestrator call: `execute_action` (a specific action button), `control` (a pause/resume/cancel button), `deselect` (a "deselect"/"back" button), or no Orchestrator call at all (e.g. a purely client-side "dismiss this panel" button) |
 
-The bridge is responsible for maintaining the `button_id → action` mapping
-for whatever panel it most recently pushed; a stale/unknown `button_id`
-(e.g. from a panel that has since been replaced) must be treated like any
+The bridge owns the `button_id → (Orchestrator call + params)` mapping for
+whatever panel it most recently pushed; this mapping is internal bridge
+state, never sent to or interpreted by UE. A stale/unknown `button_id`
+(e.g. from a panel that's since been replaced) must be treated like any
 other unresolvable command (see error handling below), not forwarded
-blindly. `select_object`'s `perception_class` field is likely redundant
-with `instance_id` alone (the Orchestrator can look up the class from the
-instance) -- kept for now since it was already part of the Gen1-derived
-first draft; may be dropped once §5.1 is next revisited.
+blindly.
 
 Unknown `cmd` values, and values that don't parse as JSON at all, are
 logged and must **not** be forwarded to the Orchestrator; the bridge
@@ -183,7 +187,8 @@ engine-published topic) before this channel can be implemented.
 
 A single JSON schema describing whatever dialog/popup UE should render for
 the current task/capability context, letting UE build it dynamically
-instead of hardcoding dialog layouts per action. Content:
+instead of hardcoding dialog layouts per action. Content (**as sent to
+UE**):
 
 - `title` (string)
 - `message` (string) -- free-text status/instruction to show the user
@@ -194,6 +199,17 @@ instead of hardcoding dialog layouts per action. Content:
 - `progress` (optional): `{phase, pct, message, pausable}` -- the same
   shape as `ExecuteAction` feedback, folded into the panel instead of a
   separate function call
+
+Per §5.1, every button the bridge puts in `buttons` corresponds to exactly
+one of: an available action (from `ActionAvailability`, resolved on tap as
+an `execute_action` call with its `engine_id`/`action_id`/pre-filled
+`params`), a control option (pause/resume/cancel, resolved as a `control`
+call), a deselect/back option (resolved as a `deselect` call), or a purely
+client-side dismiss with no Orchestrator call. **The bridge-internal
+mapping that records which of these each `button_id` represents (plus
+whatever call parameters it needs) is never part of the JSON sent to
+UE** -- it's bridge-side state keyed by `button_id`, rebuilt every time a
+new panel is pushed.
 
 This is deliberately a superset that can express what §5.2 previously
 modeled as four separate functions (`UpdateSelection` i.e. available
