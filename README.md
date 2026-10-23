@@ -69,6 +69,12 @@ actions/topics consumed or published, and the UE↔bridge JSON protocol), and
 [`docs/LANGUAGE_DECISION.md`](docs/LANGUAGE_DECISION.md) for the
 Python-vs-C++ implementation-language discussion.
 
+**Writing a new engine?** See
+[`docs/ENGINE_UI_INTEGRATION_GUIDE.md`](docs/ENGINE_UI_INTEGRATION_GUIDE.md)
+for how to let the user pick which action to run (the Orchestrator's job)
+versus how your engine asks the bridge directly, mid-action, for a target/
+parameter choice (`RequestUserInput`, bypassing the Orchestrator).
+
 ## Status
 
 The `rammp_ui_bridge` ament_python package in this repo is the current,
