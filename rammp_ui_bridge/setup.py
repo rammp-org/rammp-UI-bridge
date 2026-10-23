@@ -12,7 +12,11 @@ setup(
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', ['launch/ui_bridge.launch.py']),
     ],
-    install_requires=['setuptools', 'websockets'],
+    install_requires=[
+        'setuptools',
+        'websockets',
+        'ramms-tools @ git+https://github.com/rammp-org/ramms-tools.git',
+    ],
     zip_safe=True,
     maintainer='Liyun Guo',
     maintainer_email='guo@assistivetech.dev',

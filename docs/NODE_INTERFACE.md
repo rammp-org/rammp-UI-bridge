@@ -552,13 +552,13 @@ Remote Control function calls:
 
 #### A. Camera stream (video data plane)
 
-Uses the RMSS binary TCP streaming protocol from
-[rammp-org/ramms-tools](https://github.com/rammp-org/ramms-tools) (MIT
-licensed), vendored unchanged into `rammp_ui_bridge/streaming/`
-(`protocol.py`, `sender.py`, `client.py`, `compression.py` -- the full
-`ramms_tools.streaming` subpackage, with only its internal imports made
-package-relative; the bridge only uses `StreamSender`, since it never
-receives) -- `StreamSender.send_image`/`send_depth_uint16` framing, not
+Uses the RMSS binary TCP streaming protocol from the
+[`ramms-tools`](https://github.com/rammp-org/ramms-tools) dependency
+(MIT licensed; install with
+`pip install git+https://github.com/rammp-org/ramms-tools.git` -- see
+README.md's "Prerequisites"), imported as `ramms_tools.streaming` rather
+than vendored -- the bridge only uses `StreamSender`, since it never
+receives -- `StreamSender.send_image`/`send_depth_uint16` framing, not
 the Remote Control WebSocket, since this is bulk pixel data. Two layers,
 not two interchangeable sources:
 

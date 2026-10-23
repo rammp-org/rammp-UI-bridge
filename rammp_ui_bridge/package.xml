@@ -23,6 +23,12 @@
   <exec_depend>python3-websockets</exec_depend>
   <exec_depend>launch</exec_depend>
   <exec_depend>launch_ros</exec_depend>
+  <!--
+    ramms_tools (for rammp_ui_bridge.streaming -> ramms_tools.streaming,
+    the RMSS camera-stream client, see README.md "Prerequisites") has no
+    rosdep key; install manually:
+      pip install git+https://github.com/rammp-org/ramms-tools.git
+  -->
 
   <test_depend>python3-pytest</test_depend>
 

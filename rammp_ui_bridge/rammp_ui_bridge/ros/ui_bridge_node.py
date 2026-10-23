@@ -37,11 +37,11 @@ joint states/chair speed) still has no ROS2-side source. The scene camera
 (§3.2) now does -- this node subscribes directly to its raw color/depth
 topics (see ``_on_scene_camera_color``/``_on_scene_camera_depth``) and
 forwards every frame to UE as the §5.2.A base layer, over the RMSS
-streaming protocol (``rammp_ui_bridge.streaming.StreamSender``, vendored
-unchanged from https://github.com/rammp-org/ramms-tools's
-``ramms_tools.streaming`` -- a TCP client of UE's streaming server,
-separate from the Remote Control WebSocket, since this is bulk pixel
-data).
+streaming protocol (``ramms_tools.streaming.StreamSender`` -- a TCP client
+of UE's streaming server, separate from the Remote Control WebSocket,
+since this is bulk pixel data). ``ramms_tools`` is a dependency, installed
+via ``pip install git+https://github.com/rammp-org/ramms-tools.git`` (see
+README.md), not vendored into this repo.
 """
 
 from __future__ import annotations
@@ -70,7 +70,7 @@ from rammp_orchestrator_interfaces.srv import (
 )
 from rammp_ui_bridge_interfaces.action import RequestUserInput
 
-from ..streaming import StreamSender
+from ramms_tools.streaming import StreamSender
 from ..unreal_remote_websocket import UnrealRemoteWebsocket
 
 _CONTROL_COMMANDS = {

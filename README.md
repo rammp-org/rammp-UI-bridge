@@ -16,6 +16,18 @@ objects, action progress/results) back to UE for rendering.
  └──────────────┘                        └────────────────┘                    └───────────────┘
 ```
 
+## Prerequisites
+
+Besides the usual ROS2 (Humble) + `rammp_orchestrator_interfaces`/
+`rammp_ui_bridge_interfaces` colcon workspace setup, this node depends on
+[`ramms-tools`](https://github.com/rammp-org/ramms-tools) (MIT licensed)
+for its RMSS camera-streaming client, which is not on PyPI/rosdep -- install
+it manually into the same Python environment colcon builds against:
+
+```bash
+pip install git+https://github.com/rammp-org/ramms-tools.git
+```
+
 ## What this node does
 
 1. **Connects to UE** over its Remote Control WebSocket API (a preset-based
@@ -67,11 +79,11 @@ call), the two-command UE→bridge dispatch (`select_object`/`button_press`
 with stale-ID error reporting), the `~/request_user_input` action
 server for direct engine↔bridge interaction, and the camera base-layer
 stream (§5.2.A) -- subscribes to the scene camera's raw color/depth topics
-(§3.2) and forwards every frame to UE over the vendored RMSS streaming
-protocol (`rammp_ui_bridge/streaming/`, from
-[rammp-org/ramms-tools](https://github.com/rammp-org/ramms-tools)). The
-camera *overlay* layer (an engine's own wrist camera, §3.3) and the
-system-status channel (§5.2.B) are not yet implementable -- no real
+(§3.2) and forwards every frame to UE over the RMSS streaming protocol
+from the [`ramms-tools`](https://github.com/rammp-org/ramms-tools)
+dependency (`ramms_tools.streaming.StreamSender`, see "Prerequisites"
+above). The camera *overlay* layer (an engine's own wrist camera, §3.3)
+and the system-status channel (§5.2.B) are not yet implementable -- no real
 engine publishes a wrist-camera topic, and no hardware driver node
 exists yet in the workspace to source joint/chair state from (see "Not
 yet in scope" in `docs/NODE_INTERFACE.md`).
@@ -90,11 +102,10 @@ color/depth/segmentation-mask frames to UE and mapped real robot joint
 states into a UE skeleton, using the same RMSS binary streaming protocol
 that [rammp-org/ramms-tools](https://github.com/rammp-org/ramms-tools)
 packages as a reusable client SDK (`ramms_tools.streaming`). This bridge
-vendors that SDK unchanged into `rammp_ui_bridge/streaming/` (only its
-internal imports made package-relative -- see `docs/NODE_INTERFACE.md`
-§5.2.A) for the camera base layer, now wired up to the scene camera's
-real topics (§3.2). The joint/base-state side (§5.2.B) still has no
-ROS2-side source -- see `docs/NODE_INTERFACE.md`'s "Not yet in scope"
+depends on that same SDK (see "Prerequisites" above) for the camera base
+layer -- see `docs/NODE_INTERFACE.md` §5.2.A -- now wired up to the scene
+camera's real topics (§3.2). The joint/base-state side (§5.2.B) still has
+no ROS2-side source -- see `docs/NODE_INTERFACE.md`'s "Not yet in scope"
 section for what's blocked on that.
 
 
