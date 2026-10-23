@@ -10,7 +10,10 @@
     control, execute_action) and pushes world-state/detected-object/
     InteractionPanel updates back to UE over its Remote Control WebSocket API.
     Also serves rammp_ui_bridge_interfaces/RequestUserInput, letting an active
-    engine ask the user for input directly, bypassing the Orchestrator.
+    engine ask the user for input directly, bypassing the Orchestrator, and
+    runs its own rammp_common_interfaces arbitration server (AcquireControl/
+    ReleaseControl/ControlStatus) gating the shared engine-overlay-camera
+    topic so only the currently-active engine's frames reach UE.
   </description>
   <maintainer email="guo@assistivetech.dev">Liyun Guo</maintainer>
   <license>Proprietary</license>
@@ -18,6 +21,7 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>rammp_common_interfaces</exec_depend>
   <exec_depend>rammp_orchestrator_interfaces</exec_depend>
   <exec_depend>rammp_ui_bridge_interfaces</exec_depend>
   <exec_depend>python3-websockets</exec_depend>

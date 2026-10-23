@@ -42,11 +42,23 @@ of UE's streaming server, separate from the Remote Control WebSocket,
 since this is bulk pixel data). ``ramms_tools`` is a dependency, installed
 via ``pip install git+https://github.com/rammp-org/ramms-tools.git`` (see
 README.md), not vendored into this repo.
+
+**Overlay-camera arbitration (§3.3.1).** Every engine with its own camera
+publishes to the *same* topic (``engine_overlay_topic``), so this node
+also hosts a small ``rammp_common_interfaces`` arbitration server for that
+resource: an engine calls ``~/overlay_control/acquire_control`` to get a
+token, stamps every ``EngineOverlayImage`` it publishes with it, and this
+node only forwards frames whose token matches the one it most recently
+granted (see ``_on_overlay_acquire_control``/``_on_engine_overlay_frame``).
+This is the same token-gating convention ``rammp_arm_interfaces``/
+``rammp_base_interfaces`` use for hardware, just for a bridge-owned
+resource instead.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from typing import Any
@@ -56,10 +68,12 @@ from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalRespons
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 
+from rammp_common_interfaces.msg import ControlStatus
+from rammp_common_interfaces.srv import AcquireControl, ReleaseControl
 from rammp_orchestrator_interfaces.action import ExecuteAction
 from rammp_orchestrator_interfaces.srv import (
     Control,
@@ -69,6 +83,7 @@ from rammp_orchestrator_interfaces.srv import (
     SelectObject,
 )
 from rammp_ui_bridge_interfaces.action import RequestUserInput
+from rammp_ui_bridge_interfaces.msg import EngineOverlayImage
 
 from ramms_tools.streaming import StreamSender
 from ..unreal_remote_websocket import UnrealRemoteWebsocket
@@ -272,12 +287,10 @@ class UiBridgeNode(Node):
         # table. Only one engine can ever be *active* at a time (the
         # Orchestrator's resource-locking already guarantees this, see
         # core/orchestrator.py's resource acquisition on activate/execute),
-        # so there is never more than one real publisher on this topic at
-        # once in practice; the bridge itself has no notion of "which
-        # engine" and doesn't need one -- it just forwards whatever arrives
-        # here as the overlay layer, tagged with a fixed stream_id/group
-        # (see _OVERLAY_COLOR_STREAM_ID) so UE always routes it to the same
-        # overlay material regardless of which engine is actually sending.
+        # but a stale/crashed engine could still have a publisher open, so
+        # frames also carry an arbitration token (EngineOverlayImage.token)
+        # this node grants/checks itself -- see the overlay_control_*
+        # services below and _on_engine_overlay_frame.
         self.declare_parameter("engine_overlay_topic", "/engine_overlay/image_raw")
         # §5.2.A base layer: UE's RMSS streaming server port (separate TCP
         # socket from the Remote Control WebSocket above).
@@ -324,6 +337,24 @@ class UiBridgeNode(Node):
         # executor threads.
         self._latest_engine_overlay: Image | None = None
         self._engine_overlay_frame_count = 0
+
+        # -- overlay-control arbitration state (§3.3.1) ------------------------
+        # This node is the arbitration *server* for the overlay-camera
+        # resource (rammp_common_interfaces' AcquireControl/ReleaseControl/
+        # ControlStatus protocol -- same one rammp_arm_interfaces/
+        # rammp_base_interfaces use for hardware, see that repo's README).
+        # Guarded by _overlay_control_lock since the service callbacks and
+        # the overlay subscription callback can run on different executor
+        # threads. `_overlay_token` is all-zero bytes when nobody holds it;
+        # AcquireControl.Request.token/ReleaseControl.Request.token are
+        # uint8[16], so this stays a 16-byte value throughout. `rejected_count`
+        # mirrors ControlStatus's own field: frames/release-calls refused
+        # because their token didn't match the current grant.
+        self._overlay_control_lock = threading.Lock()
+        self._overlay_owner_id: str = ""
+        self._overlay_token: bytes = bytes(16)
+        self._overlay_generation = 0
+        self._overlay_rejected_count = 0
 
         # §5.2.A: TCP client of UE's RMSS streaming server. Connection is
         # managed by a dedicated reconnect-loop thread (_stream_reconnect_loop)
@@ -373,6 +404,34 @@ class UiBridgeNode(Node):
             callback_group=self._cb_group,
         )
 
+        # §3.3.1 overlay-control arbitration server: any engine calls these
+        # before/after publishing to engine_overlay_topic. Latched
+        # (transient_local) ControlStatus publisher so a late-starting
+        # engine learns the current grant immediately, same convention as
+        # rammp_common_interfaces' own ControlStatus doc comment.
+        self._overlay_acquire_control_server = self.create_service(
+            AcquireControl,
+            "~/overlay_control/acquire_control",
+            self._on_overlay_acquire_control,
+            callback_group=self._cb_group,
+        )
+        self._overlay_release_control_server = self.create_service(
+            ReleaseControl,
+            "~/overlay_control/release_control",
+            self._on_overlay_release_control,
+            callback_group=self._cb_group,
+        )
+        self._overlay_control_status_publisher = self.create_publisher(
+            ControlStatus,
+            "~/overlay_control/status",
+            QoSProfile(
+                depth=1,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                history=HistoryPolicy.KEEP_LAST,
+            ),
+        )
+        self._publish_overlay_control_status()
+
         self._connection_publisher = self.create_publisher(Bool, "~/ue_connection", 10)
         self.create_timer(
             self.get_parameter("connection_publish_period").value,
@@ -411,9 +470,9 @@ class UiBridgeNode(Node):
             callback_group=self._cb_group,
         )
         self._engine_overlay_sub = self.create_subscription(
-            Image,
+            EngineOverlayImage,
             self.get_parameter("engine_overlay_topic").value,
-            self._on_engine_overlay_color,
+            self._on_engine_overlay_frame,
             qos_profile_sensor_data,
             callback_group=self._cb_group,
         )
@@ -521,25 +580,89 @@ class UiBridgeNode(Node):
     #
     # Every engine publishes its own camera (if it has one) to the same
     # well-known topic (engine_overlay_topic) rather than each getting a
-    # distinct topic name/parameter -- this is safe because only one engine
-    # can ever hold execution resources (and so be the one actually
-    # sending frames) at a time; see the declare_parameter comment above
-    # for why. The bridge has no notion of "which engine" here and doesn't
-    # need one: it just forwards whatever arrives to UE's overlay layer,
-    # exactly like the scene camera forwarding above, tagged with a fixed
-    # stream_id/group so UE always routes it to the same overlay material.
+    # distinct topic name/parameter. The Orchestrator's resource-locking
+    # already means only one engine can ever hold execution resources at a
+    # time, but a crashed/slow-to-release engine could still have a stale
+    # publisher open, so every frame also carries an arbitration token
+    # (EngineOverlayImage.token) -- the bridge is the arbitration *server*
+    # for this resource (see the overlay_control_* services below) and only
+    # forwards frames whose token matches the one it most recently granted.
     # ------------------------------------------------------------------
-    def _on_engine_overlay_color(self, msg: Image) -> None:
+    def _on_overlay_acquire_control(
+        self, request: AcquireControl.Request, response: AcquireControl.Response
+    ) -> AcquireControl.Response:
+        with self._overlay_control_lock:
+            self._overlay_token = os.urandom(16)
+            self._overlay_owner_id = request.owner_id
+            self._overlay_generation += 1
+            response.accepted = True
+            response.token = list(self._overlay_token)
+            response.generation = self._overlay_generation
+            response.message = f"granted to '{request.owner_id}'"
+        self.get_logger().info(
+            f"overlay control acquired by '{request.owner_id}' "
+            f"(generation {self._overlay_generation})"
+        )
+        self._publish_overlay_control_status()
+        return response
+
+    def _on_overlay_release_control(
+        self, request: ReleaseControl.Request, response: ReleaseControl.Response
+    ) -> ReleaseControl.Response:
+        with self._overlay_control_lock:
+            if bytes(request.token) == self._overlay_token and self._overlay_owner_id:
+                owner = self._overlay_owner_id
+                self._overlay_owner_id = ""
+                self._overlay_token = bytes(16)
+                response.released = True
+                response.message = ""
+            else:
+                owner = None
+                self._overlay_rejected_count += 1
+                response.released = False
+                response.message = "token mismatch or already released"
+        if owner is not None:
+            self.get_logger().info(f"overlay control released by '{owner}'")
+            self._publish_overlay_control_status()
+        return response
+
+    def _publish_overlay_control_status(self) -> None:
+        with self._overlay_control_lock:
+            msg = ControlStatus()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.arbitration_enabled = True
+            msg.estopped = False
+            msg.owned = bool(self._overlay_owner_id)
+            msg.owner_id = self._overlay_owner_id
+            msg.generation = self._overlay_generation
+            msg.rejected_count = self._overlay_rejected_count
+        self._overlay_control_status_publisher.publish(msg)
+
+    def _on_engine_overlay_frame(self, msg: EngineOverlayImage) -> None:
+        with self._overlay_control_lock:
+            granted = bool(self._overlay_owner_id) and bytes(msg.token) == self._overlay_token
+            if not granted:
+                self._overlay_rejected_count += 1
+                rejected = self._overlay_rejected_count
+        if not granted:
+            if rejected == 1 or rejected % 100 == 0:
+                self.get_logger().warning(
+                    f"engine overlay frame dropped: token doesn't match the current "
+                    f"overlay_control grant (rejected #{rejected})"
+                )
+            return
+
+        image = msg.image
         with self._camera_lock:
-            self._latest_engine_overlay = msg
+            self._latest_engine_overlay = image
             self._engine_overlay_frame_count += 1
             count = self._engine_overlay_frame_count
         if count == 1 or count % 100 == 0:
             self.get_logger().info(
-                f"engine overlay camera: frame #{count} ({msg.width}x{msg.height}, "
-                f"encoding={msg.encoding})"
+                f"engine overlay camera: frame #{count} ({image.width}x{image.height}, "
+                f"encoding={image.encoding})"
             )
-        self._forward_engine_overlay_color(msg)
+        self._forward_engine_overlay_color(image)
 
     def _forward_engine_overlay_color(self, msg: Image) -> None:
         if not self._stream_sender.is_connected():

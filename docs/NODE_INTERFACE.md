@@ -369,30 +369,66 @@ long as some engine is actually sending frames.
 
 **Design decision: one fixed topic name (`engine_overlay_topic`, default
 `/engine_overlay/image_raw`), the bridge is its only subscriber, and
-every engine that has an overlay camera publishes `sensor_msgs/Image` to
-that same name** -- not a per-engine topic-name parameter/config table.
-This is safe because the Orchestrator's resource-locking already
+every engine that has an overlay camera publishes
+`rammp_ui_bridge_interfaces/EngineOverlayImage` to that same name** --
+not a per-engine topic-name parameter/config table. This is safe in the
+common case because the Orchestrator's resource-locking already
 guarantees **only one engine can hold execution resources (and so be
 doing anything worth showing an overlay for) at a time** -- see
-`core/orchestrator.py`'s resource acquisition on activate/execute -- so
-there is never more than one real publisher on this topic at once in
-practice, even though ROS2 itself would allow multiple. The bridge has
-no notion of "which engine" here and doesn't need one: `_on_engine_overlay_color`/
-`_forward_engine_overlay_color` just forward whatever arrives to UE,
-unconditionally, on fixed channel 2, `group="overlay"`,
-`stream_id="engine/overlay"` -- exactly the same shape as the base
-layer's forwarding, just one channel number up. An engine that wants to
-show an overlay simply starts publishing to this topic while it's
-active and stops (or is torn down) when it's done; UE's own
-receive-timeout handles falling back to the base-layer-only view (see
-§5.2.A) -- the bridge does not track "is an engine still sending" itself
-beyond the existing per-frame log/forward.
+`core/orchestrator.py`'s resource acquisition on activate/execute -- but
+a crashed or slow-to-release engine could still leave a stale publisher
+open, so the bridge doesn't just trust "whatever arrives." Instead:
 
-**Still open:** no real engine in this workspace publishes to this topic
-yet, so this path has only been exercised with synthetic `ros2 topic
-pub`/test-image traffic, not a real wrist camera. The exact image
-shape/encoding a real manipulation engine's wrist camera would publish
-is still unconfirmed.
+**Token-gated arbitration.** The bridge is the arbitration *server* for
+this resource (the "overlay control" resource), reusing the same
+AcquireControl/ReleaseControl/ControlStatus protocol that
+`rammp_arm_interfaces`/`rammp_base_interfaces` already use for hardware
+arbitration (see `rammp_common_interfaces`). The bridge hosts three
+endpoints:
+
+- `~/overlay_control/acquire_control` (`rammp_common_interfaces/AcquireControl`) --
+  an engine calls this (with its own `owner_id`) when it's about to start
+  publishing overlay frames. Like the hardware-arbitration precedent,
+  this call **seizes**: it always succeeds and always returns a fresh
+  16-byte token, even if another owner currently holds it -- by
+  operational contract this is only ever called by the engine the
+  Orchestrator just activated, so there should never be a real
+  conflict in practice, but the "seize" semantics mean a stuck/crashed
+  owner can never permanently block a correctly-behaving new owner.
+- `~/overlay_control/release_control` (`rammp_common_interfaces/ReleaseControl`) --
+  called by the current owner (with its token) when it's done, e.g. from
+  its own `hibernate`. Refused (token mismatch) if called by anyone else.
+- `~/overlay_control/status` (`rammp_common_interfaces/ControlStatus`, published
+  latched/transient-local) -- current `owner_id`/`generation`/`owned`/
+  `rejected_count`, for anyone who wants to observe arbitration state
+  without racing to acquire it themselves.
+
+Every `EngineOverlayImage` frame an engine publishes carries the token it
+was granted (`EngineOverlayImage.token`). `_on_engine_overlay_frame`
+compares the incoming token against the one most recently granted
+(`self._overlay_token`) and **silently drops** (incrementing
+`rejected_count`, with a throttled warning log) any frame whose token
+doesn't match -- including frames from a stale/already-released owner.
+Only frames with a matching token are forwarded
+(`_forward_engine_overlay_color`) to UE, unconditionally, on fixed
+channel 2, `group="overlay"`, `stream_id="engine/overlay"` -- exactly the
+same shape as the base layer's forwarding, just one channel number up.
+An engine's expected lifecycle is: call `acquire_control` once it starts
+(e.g. on `activate`), publish `EngineOverlayImage` frames stamped with
+that token while active, and call `release_control` when done (e.g. on
+`hibernate`). UE's own receive-timeout still handles falling back to the
+base-layer-only view if nothing is forwarded for a while (see §5.2.A).
+
+**Not yet decided:** whether this resource also needs a `RevokeControl`
+(operator-override, no-token) path for a hard crash-recovery case -- not
+implemented yet, deferred until a concrete need shows up.
+
+**Still open:** no real engine in this workspace calls
+`acquire_control`/publishes to this topic yet, so this path has only been
+exercised with synthetic test traffic (acquire → publish-with-good-token →
+publish-with-wrong-token → release → publish-with-stale-token), not a
+real wrist camera + engine. The exact image shape/encoding a real
+manipulation engine's wrist camera would publish is still unconfirmed.
 
 #### 3.3.2 User-input request (bridge is server) -- **proposed, not yet implemented**
 
@@ -835,11 +871,16 @@ to the task/button-dialog lifecycle.
   that decision, and the exact conditions under which it stops
   Perception, still needs to be confirmed before this behavior can be
   relied on.
-- **Shared overlay-camera topic (§3.3.1, §5.2.A) is now implemented**,
-  but unexercised against a real engine -- `engine_overlay_topic` (default
-  `/engine_overlay/image_raw`) is subscribed to and forwarded exactly
-  like the base layer, just no real engine publishes to it yet, so only
-  synthetic test traffic has verified the path. The scene camera side
+- **Shared, token-gated overlay-camera topic (§3.3.1, §5.2.A) is now
+  implemented**, but unexercised against a real engine --
+  `engine_overlay_topic` (default `/engine_overlay/image_raw`,
+  `rammp_ui_bridge_interfaces/EngineOverlayImage`) is subscribed to and
+  forwarded exactly like the base layer once its token is verified
+  against the bridge's `~/overlay_control/{acquire_control,
+  release_control,status}` arbitration endpoints; no real engine calls
+  `acquire_control`/publishes to it yet, so only synthetic test traffic
+  (acquire → good-token publish → wrong-token publish → release →
+  stale-token publish) has verified the path. The scene camera side
   (§3.2, base layer) is resolved and implemented too: real topics
   subscribed to, frames forwarded to UE over the `ramms_tools` RMSS
   streaming protocol (a pip dependency, see README's Prerequisites
