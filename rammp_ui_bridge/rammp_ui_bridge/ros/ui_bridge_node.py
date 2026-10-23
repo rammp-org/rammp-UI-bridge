@@ -32,9 +32,12 @@ a thin transport layer over the framework-agnostic ``core/orchestrator.py``.
 
 Note: the Gen1 prototype GUI bridge (``rammp_prototype_gui.Gui_bridge``)
 also streamed camera images/depth/masks to UE and mapped real robot joint
-states into a UE skeleton (§5.2.A/B here). Neither has a ROS2-side source
-yet (no camera driver node, no hardware driver node -- see §7 "Not yet in
-scope"), so that functionality isn't implemented here yet either.
+states into a UE skeleton (§5.2.A/B here). The hardware node side (§5.2.B,
+joint states/chair speed) still has no ROS2-side source. The scene camera
+(§3.2) now does -- this node subscribes directly to its raw color/depth
+topics (see ``_on_scene_camera_color``/``_on_scene_camera_depth``) -- but
+forwarding those frames to UE over the Gen1 streaming protocol (§5.2.A) is
+still not implemented here yet.
 """
 
 from __future__ import annotations
@@ -49,6 +52,8 @@ from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalRespons
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
 from std_msgs.msg import Bool
 
 from rammp_orchestrator_interfaces.action import ExecuteAction
@@ -228,6 +233,15 @@ class UiBridgeNode(Node):
         self.declare_parameter("detected_objects_poll_period", 0.5)
         self.declare_parameter("connection_publish_period", 1.0)
         self.declare_parameter("service_wait_timeout", 5.0)
+        # §3.2 Bridge <-> Camera: the scene camera's raw color/depth topics.
+        # Depth's topic name depends on which scene_camera alternative a
+        # given robot profile selects (see rammp-deployments'
+        # sheppy-manifest.yaml) -- the Orbbec Gemini 336L publishes
+        # "depth/image_raw", the OAK-D Pro W publishes
+        # "depth/image_rect_raw" (the current flatbot profile default
+        # below). Override per-robot via a launch/params-file argument.
+        self.declare_parameter("scene_camera_color_topic", "/scene_camera/color/image_raw")
+        self.declare_parameter("scene_camera_depth_topic", "/scene_camera/depth/image_rect_raw")
 
         self._ns = self.get_parameter("orchestrator_ns").value
         self._service_wait_timeout = (
@@ -249,6 +263,17 @@ class UiBridgeNode(Node):
         # _on_request_user_input_execute. None when no engine is waiting on
         # user input right now.
         self._active_input_goal: dict[str, Any] | None = None
+
+        # -- scene camera state (§3.2) ----------------------------------------
+        # Latest frame from each topic, for whatever eventually forwards this
+        # to UE as the §5.2.A base layer -- not forwarded yet, see module
+        # docstring. Guarded by a lock since subscription callbacks run on
+        # the (multi-threaded) executor, not necessarily the same thread.
+        self._camera_lock = threading.Lock()
+        self._latest_scene_color: Image | None = None
+        self._latest_scene_depth: Image | None = None
+        self._scene_color_frame_count = 0
+        self._scene_depth_frame_count = 0
 
         self._get_world_state_client = self.create_client(
             GetWorldState, f"{self._ns}/get_world_state", callback_group=self._cb_group
@@ -304,12 +329,59 @@ class UiBridgeNode(Node):
             user_input_callback=self._on_ue_user_input,
         )
 
+        self._scene_color_sub = self.create_subscription(
+            Image,
+            self.get_parameter("scene_camera_color_topic").value,
+            self._on_scene_camera_color,
+            qos_profile_sensor_data,
+            callback_group=self._cb_group,
+        )
+        self._scene_depth_sub = self.create_subscription(
+            Image,
+            self.get_parameter("scene_camera_depth_topic").value,
+            self._on_scene_camera_depth,
+            qos_profile_sensor_data,
+            callback_group=self._cb_group,
+        )
+
         self._push_idle_panel()
 
         self.get_logger().info(
             f"rammp_ui_bridge ready; bridging UE at "
-            f"{self.get_parameter('ue_host').value} <-> Orchestrator at '{self._ns}'"
+            f"{self.get_parameter('ue_host').value} <-> Orchestrator at '{self._ns}'; "
+            f"scene camera color='{self.get_parameter('scene_camera_color_topic').value}' "
+            f"depth='{self.get_parameter('scene_camera_depth_topic').value}'"
         )
+
+    # ------------------------------------------------------------------
+    # Bridge <-> Camera (§3.2): raw scene-camera frames.
+    #
+    # Just lands the latest color/depth frame for now (plus a log line on
+    # the first frame and then one every 100, to confirm wiring without
+    # spamming) -- forwarding these to UE as the §5.2.A base layer over the
+    # Gen1 streaming protocol is a separate, not-yet-implemented piece.
+    # ------------------------------------------------------------------
+    def _on_scene_camera_color(self, msg: Image) -> None:
+        with self._camera_lock:
+            self._latest_scene_color = msg
+            self._scene_color_frame_count += 1
+            count = self._scene_color_frame_count
+        if count == 1 or count % 100 == 0:
+            self.get_logger().info(
+                f"scene camera color: frame #{count} ({msg.width}x{msg.height}, "
+                f"encoding={msg.encoding})"
+            )
+
+    def _on_scene_camera_depth(self, msg: Image) -> None:
+        with self._camera_lock:
+            self._latest_scene_depth = msg
+            self._scene_depth_frame_count += 1
+            count = self._scene_depth_frame_count
+        if count == 1 or count % 100 == 0:
+            self.get_logger().info(
+                f"scene camera depth: frame #{count} ({msg.width}x{msg.height}, "
+                f"encoding={msg.encoding})"
+            )
 
     # ------------------------------------------------------------------
     # UE -> Orchestrator / UE -> active engine: dispatch user-input commands

@@ -303,13 +303,18 @@ layer.
 
 ### 3.2 Bridge ↔ Camera
 
-No shared interface package defines this today, and nothing in this
-workspace publishes it yet -- the camera driver (e.g. a RealSense ROS2
-node) that would own this feed isn't part of this workspace either. The
-bridge would subscribe directly to its raw `sensor_msgs/Image` color/
-depth topics (color + aligned depth, likely with `sensor_msgs/CameraInfo`
-alongside for intrinsics) to get the actual pixel data for the "RGBD"
-source in §5.2.A's camera stream.
+No shared interface package defines this today -- the camera driver
+(the fleet's `rammp-suite-software` Gemini/OAK containers, per
+`rammp-deployments/december_2026/sheppy-manifest.yaml`'s `scene_camera`
+node) lives outside this workspace, not inside it. The bridge subscribes
+directly to its raw `sensor_msgs/Image` color/depth topics (`color/
+image_raw` + a depth topic, see below -- no `sensor_msgs/CameraInfo`
+subscription yet, intrinsics aren't needed for anything implemented so
+far) to get the actual pixel data for the "RGBD" source in §5.2.A's
+camera stream. Implemented in `ui_bridge_node.py`'s
+`_on_scene_camera_color`/`_on_scene_camera_depth` (params
+`scene_camera_color_topic`/`scene_camera_depth_topic`); only the latest
+frame is landed so far, forwarding to UE (§5.2.A) is still open.
 
 This is deliberately its own peer, not folded into §3.1 (Orchestrator,
 which never touches pixel data) or §3.3 (Engine node, which owns
@@ -321,9 +326,18 @@ engine or task, and Perception (§3.1's `get_detected_objects`/
 than publishing one) -- so the bridge reading the camera directly is
 peer to Perception reading it, not a dependency on Perception.
 
-**Still TBD** (tracked in §7): no camera driver node/topic exists in this
-workspace yet, so the exact topic name(s)/encoding/whether there's one
-scene camera or several can't be pinned down until one does.
+**Topic names (resolved):** `/scene_camera/color/image_raw` for color,
+always. Depth's topic name is **not** uniform across the `scene_camera`
+alternatives a robot profile can select (per the sheppy manifest): the
+Orbbec Gemini 336L (`gemini336l_docker`) publishes
+`/scene_camera/depth/image_raw` (registered to the color frame), while
+the OAK-D Pro W (`oak_d_pro_w_docker`, the current `flatbot` profile's
+selection) publishes `/scene_camera/depth/image_rect_raw` instead -- the
+bridge's `scene_camera_depth_topic` param defaults to the latter and
+must be overridden per-robot if a different alternative is selected. The
+`scene_camera_mock` alternative (used for dev/testing) only publishes
+color, no depth, so depth-dependent code paths can't be exercised
+against it yet.
 
 ### 3.3 Bridge ↔ Engine node
 
@@ -580,15 +594,15 @@ the same: both layers carry pixel data only, while all detected-object
 semantics (class, instance ID, 2D bounding box) are pushed as data on the
 **existing detected-objects push** (§5.2.D, §3.1's `ObjectRecord.box`),
 *not* on `InteractionPanel` (§5.2.C), which stays reserved for the
-task/button dialog only. **Open/TBD:** the raw RGB/depth image topics
-themselves (the scene camera's output, §3.2, and an Engine node's
-wrist-camera output, §3.3) aren't defined by any interface package in
-this workspace yet -- both the camera driver node and any real engine's
-wrist-camera topic remain to be defined before this channel can be
-implemented, and the exact UE-side blur/composite mechanics (how strong,
-whether it's a material parameter on the base layer or a UE post-process)
-are also still open; §3.1's `ObjectRecord.box` extension already covers
-the detection *semantics* independent of either.
+task/button dialog only. **Open/TBD:** the scene camera's raw color/depth
+topics (§3.2) are now defined and subscribed to directly by the bridge,
+but an Engine node's wrist-camera output (§3.3) still isn't published by
+any real engine yet, and forwarding either layer to UE over the Gen1
+streaming protocol isn't implemented here yet either -- as is the exact
+UE-side blur/composite mechanics (how strong, whether it's a material
+parameter on the base layer or a UE post-process); §3.1's
+`ObjectRecord.box` extension already covers the detection *semantics*
+independent of either.
 
 #### B. System status (robot proprioception)
 

@@ -37,6 +37,21 @@ def generate_launch_description():
                 default_value="0.5",
                 description="Seconds between ~/get_detected_objects polls",
             ),
+            DeclareLaunchArgument(
+                "scene_camera_color_topic",
+                default_value="/scene_camera/color/image_raw",
+                description="Scene camera's raw color image topic (§3.2)",
+            ),
+            DeclareLaunchArgument(
+                "scene_camera_depth_topic",
+                default_value="/scene_camera/depth/image_rect_raw",
+                description=(
+                    "Scene camera's raw depth image topic (§3.2) -- depends on the "
+                    "scene_camera alternative selected in the robot's sheppy profile "
+                    "(e.g. Orbbec Gemini 336L: depth/image_raw; OAK-D Pro W: "
+                    "depth/image_rect_raw)"
+                ),
+            ),
             Node(
                 package="rammp_ui_bridge",
                 executable="ui_bridge_node",
@@ -55,6 +70,12 @@ def generate_launch_description():
                         ),
                         "detected_objects_poll_period": LaunchConfiguration(
                             "detected_objects_poll_period"
+                        ),
+                        "scene_camera_color_topic": LaunchConfiguration(
+                            "scene_camera_color_topic"
+                        ),
+                        "scene_camera_depth_topic": LaunchConfiguration(
+                            "scene_camera_depth_topic"
                         ),
                     }
                 ],
