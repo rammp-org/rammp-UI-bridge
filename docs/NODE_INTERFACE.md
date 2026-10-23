@@ -346,11 +346,13 @@ distinct parts, one in each direction:
 
 #### 3.3.1 Camera subscription (bridge is client)
 
-It's **per-engine, not generic**, unlike §3.1/§3.2. The reference engine
+**Implemented.** It's a **single shared topic, not per-engine**, unlike
+an earlier revision of this section proposed. The reference engine
 wiring (`rammp_orchestrator.ros.engine_node.EngineNode`) only advertises
 `~/activate`/`~/hibernate`/`~/control`/`~/execute_action` -- all
-Orchestrator-facing, not a camera topic a UI would subscribe to -- and
-no mock or real engine in this workspace currently publishes one.
+Orchestrator-facing, not a camera topic a UI would subscribe to -- so no
+engine-identity information is available to the bridge via that path
+either way.
 
 While an engine is active and working a task, it may have its own camera
 (e.g. a wrist cam) that's more useful to the user than the scene camera
@@ -363,17 +365,34 @@ surface on its own (see §3.3.2 for how tap-to-select works against it).
 **It never replaces the scene camera** -- §3.2's feed keeps
 subscribing/streaming continuously regardless, and this engine stream is
 additive on top of it (UE composites the two, per §5.2.A) only for as
-long as the engine is actually sending frames. Concretely, once a real
-engine exists: the bridge would take a per-engine topic-name parameter
-(or a small per-engine-id config table, since different engines may
-publish different image shapes/encodings) and subscribe directly only
-while that engine is activated/selected in the Orchestrator, feeding the
-§5.2.A overlay layer for as long as that subscription has frames.
+long as some engine is actually sending frames.
 
-**Still TBD** (tracked in §7): no concrete engine publishes this camera
-topic yet, so the exact topic name/message type/per-engine config shape
-can't be pinned down until a real engine (e.g. a manipulation engine with
-a wrist camera) exists to look at.
+**Design decision: one fixed topic name (`engine_overlay_topic`, default
+`/engine_overlay/image_raw`), the bridge is its only subscriber, and
+every engine that has an overlay camera publishes `sensor_msgs/Image` to
+that same name** -- not a per-engine topic-name parameter/config table.
+This is safe because the Orchestrator's resource-locking already
+guarantees **only one engine can hold execution resources (and so be
+doing anything worth showing an overlay for) at a time** -- see
+`core/orchestrator.py`'s resource acquisition on activate/execute -- so
+there is never more than one real publisher on this topic at once in
+practice, even though ROS2 itself would allow multiple. The bridge has
+no notion of "which engine" here and doesn't need one: `_on_engine_overlay_color`/
+`_forward_engine_overlay_color` just forward whatever arrives to UE,
+unconditionally, on fixed channel 2, `group="overlay"`,
+`stream_id="engine/overlay"` -- exactly the same shape as the base
+layer's forwarding, just one channel number up. An engine that wants to
+show an overlay simply starts publishing to this topic while it's
+active and stops (or is torn down) when it's done; UE's own
+receive-timeout handles falling back to the base-layer-only view (see
+§5.2.A) -- the bridge does not track "is an engine still sending" itself
+beyond the existing per-frame log/forward.
+
+**Still open:** no real engine in this workspace publishes to this topic
+yet, so this path has only been exercised with synthetic `ros2 topic
+pub`/test-image traffic, not a real wrist camera. The exact image
+shape/encoding a real manipulation engine's wrist camera would publish
+is still unconfirmed.
 
 #### 3.3.2 User-input request (bridge is server) -- **proposed, not yet implemented**
 
@@ -587,8 +606,12 @@ not two interchangeable sources:
   stream's RGB pixels by the engine itself** (not a separate mask
   channel); detections during this time still arrive via §3.1/§5.2.D,
   exactly as with the base layer -- neither layer itself carries
-  detected-object semantics. **Not implemented yet** -- no real engine
-  publishes a wrist-camera topic to subscribe to.
+  detected-object semantics. **Implemented**: `_on_engine_overlay_color`/
+  `_forward_engine_overlay_color` subscribe to the single shared
+  `engine_overlay_topic` (§3.3.1) and push every frame through to UE on
+  channel 2, `group="overlay"`, `stream_id="engine/overlay"` -- but no
+  real engine publishes to it yet, so this has only been exercised with
+  synthetic test traffic, not a real wrist camera.
 
 Each layer gets its own channel/`stream_id`, tagged with
 `source`/`role`/`group` metadata so UE can route each frame to the right
@@ -613,13 +636,14 @@ the same: both layers carry pixel data only, while all detected-object
 semantics (class, instance ID, 2D bounding box) are pushed as data on the
 **existing detected-objects push** (§5.2.D, §3.1's `ObjectRecord.box`),
 *not* on `InteractionPanel` (§5.2.C), which stays reserved for the
-task/button dialog only. **Open/TBD:** the overlay layer (an Engine
-node's wrist-camera output, §3.3) still isn't published by any real
-engine yet, so that forwarding path is untested; the exact UE-side
-blur/composite mechanics (how strong, whether it's a material
-parameter on the base layer or a UE post-process); §3.1's
-`ObjectRecord.box` extension already covers the detection *semantics*
-independent of either.
+task/button dialog only. **Open/TBD:** the overlay layer's forwarding
+code (§3.3.1) is implemented but still unexercised against a real
+engine's wrist-camera output, since no real engine publishes to
+`engine_overlay_topic` yet; the exact UE-side blur/composite mechanics
+(how strong, whether it's a material parameter on the base layer or a
+UE post-process) are also still undecided. §3.1's `ObjectRecord.box`
+extension already covers the detection *semantics* independent of
+either.
 
 #### B. System status (robot proprioception)
 
@@ -811,15 +835,18 @@ to the task/button-dialog lifecycle.
   that decision, and the exact conditions under which it stops
   Perception, still needs to be confirmed before this behavior can be
   relied on.
-- **Raw RGB image topic for §3.3.1's per-engine camera (overlay layer,
-  §5.2.A)** is still undefined -- no engine publishes its own camera yet.
-  The scene camera side (§3.2, base layer) is resolved and implemented:
-  real topics subscribed to, frames forwarded to UE over the vendored
-  Gen1 RMSS streaming protocol. The overlay layer's detected-object
-  semantics (class, instance, box) are already covered by §3.3.2's
-  `ObjectCandidate` independent of whether/when a real wrist-camera topic
-  exists; the base layer's equivalent is the `ObjectRecord` extension
-  above.
+- **Shared overlay-camera topic (§3.3.1, §5.2.A) is now implemented**,
+  but unexercised against a real engine -- `engine_overlay_topic` (default
+  `/engine_overlay/image_raw`) is subscribed to and forwarded exactly
+  like the base layer, just no real engine publishes to it yet, so only
+  synthetic test traffic has verified the path. The scene camera side
+  (§3.2, base layer) is resolved and implemented too: real topics
+  subscribed to, frames forwarded to UE over the `ramms_tools` RMSS
+  streaming protocol (a pip dependency, see README's Prerequisites
+  section). The overlay layer's detected-object semantics (class,
+  instance, box) are already covered by §3.3.2's `ObjectCandidate`
+  independent of whether/when a real wrist-camera publishes; the base
+  layer's equivalent is the `ObjectRecord` extension above.
 - **§3.3.2's `RequestUserInput` interface is newly proposed and entirely
   unimplemented.** No `rammp_ui_bridge_interfaces` (or equivalent)
   package exists yet to define the action/message; no engine calls it;

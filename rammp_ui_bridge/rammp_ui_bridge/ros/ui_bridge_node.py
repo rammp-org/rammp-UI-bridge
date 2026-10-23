@@ -94,6 +94,13 @@ _SCENE_COLOR_STREAM_ID = "scene/color"
 _SCENE_DEPTH_STREAM_ID = "scene/depth"
 _SCENE_STREAM_GROUP = "scene"
 
+# §5.2.A overlay layer (§3.3.1): a single shared RMSS channel/stream_id for
+# whichever engine is currently active's own camera -- see
+# engine_overlay_topic below for why this is one topic, not per-engine.
+_OVERLAY_COLOR_CHANNEL = 2
+_OVERLAY_COLOR_STREAM_ID = "engine/overlay"
+_OVERLAY_STREAM_GROUP = "overlay"
+
 # ROS sensor_msgs/Image depth encodings this bridge knows how to forward
 # as-is (uint16 mm, no conversion) -- see StreamSender.send_depth_uint16.
 _UINT16_DEPTH_ENCODINGS = frozenset({"16UC1", "mono16"})
@@ -260,6 +267,18 @@ class UiBridgeNode(Node):
         # below). Override per-robot via a launch/params-file argument.
         self.declare_parameter("scene_camera_color_topic", "/scene_camera/color/image_raw")
         self.declare_parameter("scene_camera_depth_topic", "/scene_camera/depth/image_rect_raw")
+        # §3.3.1/§5.2.A overlay layer: one fixed, shared topic every engine
+        # publishes its own camera to -- not a per-engine topic/parameter
+        # table. Only one engine can ever be *active* at a time (the
+        # Orchestrator's resource-locking already guarantees this, see
+        # core/orchestrator.py's resource acquisition on activate/execute),
+        # so there is never more than one real publisher on this topic at
+        # once in practice; the bridge itself has no notion of "which
+        # engine" and doesn't need one -- it just forwards whatever arrives
+        # here as the overlay layer, tagged with a fixed stream_id/group
+        # (see _OVERLAY_COLOR_STREAM_ID) so UE always routes it to the same
+        # overlay material regardless of which engine is actually sending.
+        self.declare_parameter("engine_overlay_topic", "/engine_overlay/image_raw")
         # §5.2.A base layer: UE's RMSS streaming server port (separate TCP
         # socket from the Remote Control WebSocket above).
         self.declare_parameter("ue_stream_port", 30030)
@@ -296,6 +315,15 @@ class UiBridgeNode(Node):
         self._latest_scene_depth: Image | None = None
         self._scene_color_frame_count = 0
         self._scene_depth_frame_count = 0
+
+        # -- engine overlay camera state (§3.3.1) -----------------------------
+        # Latest frame from the single shared overlay topic (see
+        # engine_overlay_topic above), forwarded to UE as the §5.2.A overlay
+        # layer (see _forward_engine_overlay_color). Same lock as the scene
+        # camera state above -- all three subscriptions can run on different
+        # executor threads.
+        self._latest_engine_overlay: Image | None = None
+        self._engine_overlay_frame_count = 0
 
         # §5.2.A: TCP client of UE's RMSS streaming server. Connection is
         # managed by a dedicated reconnect-loop thread (_stream_reconnect_loop)
@@ -382,6 +410,13 @@ class UiBridgeNode(Node):
             qos_profile_sensor_data,
             callback_group=self._cb_group,
         )
+        self._engine_overlay_sub = self.create_subscription(
+            Image,
+            self.get_parameter("engine_overlay_topic").value,
+            self._on_engine_overlay_color,
+            qos_profile_sensor_data,
+            callback_group=self._cb_group,
+        )
 
         self._push_idle_panel()
 
@@ -389,7 +424,8 @@ class UiBridgeNode(Node):
             f"rammp_ui_bridge ready; bridging UE at "
             f"{self.get_parameter('ue_host').value} <-> Orchestrator at '{self._ns}'; "
             f"scene camera color='{self.get_parameter('scene_camera_color_topic').value}' "
-            f"depth='{self.get_parameter('scene_camera_depth_topic').value}' -> "
+            f"depth='{self.get_parameter('scene_camera_depth_topic').value}' "
+            f"engine overlay='{self.get_parameter('engine_overlay_topic').value}' -> "
             f"UE stream port {self.get_parameter('ue_stream_port').value}"
         )
 
@@ -479,6 +515,49 @@ class UiBridgeNode(Node):
                 )
         except (RuntimeError, OSError) as exc:
             self.get_logger().warning(f"failed to forward scene camera depth frame to UE: {exc}")
+
+    # ------------------------------------------------------------------
+    # Bridge <-> Engine node (§3.3.1): a single shared overlay-camera topic.
+    #
+    # Every engine publishes its own camera (if it has one) to the same
+    # well-known topic (engine_overlay_topic) rather than each getting a
+    # distinct topic name/parameter -- this is safe because only one engine
+    # can ever hold execution resources (and so be the one actually
+    # sending frames) at a time; see the declare_parameter comment above
+    # for why. The bridge has no notion of "which engine" here and doesn't
+    # need one: it just forwards whatever arrives to UE's overlay layer,
+    # exactly like the scene camera forwarding above, tagged with a fixed
+    # stream_id/group so UE always routes it to the same overlay material.
+    # ------------------------------------------------------------------
+    def _on_engine_overlay_color(self, msg: Image) -> None:
+        with self._camera_lock:
+            self._latest_engine_overlay = msg
+            self._engine_overlay_frame_count += 1
+            count = self._engine_overlay_frame_count
+        if count == 1 or count % 100 == 0:
+            self.get_logger().info(
+                f"engine overlay camera: frame #{count} ({msg.width}x{msg.height}, "
+                f"encoding={msg.encoding})"
+            )
+        self._forward_engine_overlay_color(msg)
+
+    def _forward_engine_overlay_color(self, msg: Image) -> None:
+        if not self._stream_sender.is_connected():
+            return
+        try:
+            self._stream_sender.send_image(
+                _OVERLAY_COLOR_CHANNEL,
+                bytes(msg.data),
+                msg.width,
+                msg.height,
+                fmt=msg.encoding,
+                group=_OVERLAY_STREAM_GROUP,
+                role="color",
+                stream_id=_OVERLAY_COLOR_STREAM_ID,
+                name="Engine overlay camera",
+            )
+        except (RuntimeError, OSError) as exc:
+            self.get_logger().warning(f"failed to forward engine overlay frame to UE: {exc}")
 
     def _stream_reconnect_loop(self) -> None:
         """Background thread: keeps ``self._stream_sender`` connected to

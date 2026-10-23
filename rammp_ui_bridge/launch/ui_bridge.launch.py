@@ -57,6 +57,15 @@ def generate_launch_description():
                     "depth/image_rect_raw)"
                 ),
             ),
+            DeclareLaunchArgument(
+                "engine_overlay_topic",
+                default_value="/engine_overlay/image_raw",
+                description=(
+                    "Single shared topic every engine publishes its own camera to "
+                    "(§3.3.1 overlay layer) -- not per-engine, since only one engine "
+                    "can hold execution resources at a time"
+                ),
+            ),
             Node(
                 package="rammp_ui_bridge",
                 executable="ui_bridge_node",
@@ -82,6 +91,9 @@ def generate_launch_description():
                         ),
                         "scene_camera_depth_topic": LaunchConfiguration(
                             "scene_camera_depth_topic"
+                        ),
+                        "engine_overlay_topic": LaunchConfiguration(
+                            "engine_overlay_topic"
                         ),
                     }
                 ],

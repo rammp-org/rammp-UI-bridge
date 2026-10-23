@@ -82,11 +82,16 @@ stream (§5.2.A) -- subscribes to the scene camera's raw color/depth topics
 (§3.2) and forwards every frame to UE over the RMSS streaming protocol
 from the [`ramms-tools`](https://github.com/rammp-org/ramms-tools)
 dependency (`ramms_tools.streaming.StreamSender`, see "Prerequisites"
-above). The camera *overlay* layer (an engine's own wrist camera, §3.3)
-and the system-status channel (§5.2.B) are not yet implementable -- no real
-engine publishes a wrist-camera topic, and no hardware driver node
-exists yet in the workspace to source joint/chair state from (see "Not
-yet in scope" in `docs/NODE_INTERFACE.md`).
+above), as well as the camera *overlay* layer (§3.3.1/§5.2.A) --
+subscribes to a single shared topic (`engine_overlay_topic`, default
+`/engine_overlay/image_raw`) every engine publishes its own camera to
+(not per-engine, since only one engine can hold execution resources at
+a time) and forwards those frames to UE the same way, on a separate
+channel/`stream_id`. No real engine publishes to that topic yet, so
+this path has only been exercised with synthetic test traffic. The
+system-status channel (§5.2.B) is not yet implementable -- no hardware
+driver node exists yet in the workspace to source joint/chair state
+from (see "Not yet in scope" in `docs/NODE_INTERFACE.md`).
 
 An earlier Python prototype that predates this package (built against an
 outdated draft of `docs/NODE_INTERFACE.md`, before the `InteractionPanel`
