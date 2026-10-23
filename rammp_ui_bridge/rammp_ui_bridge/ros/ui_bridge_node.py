@@ -698,7 +698,18 @@ class UiBridgeNode(Node):
         self, request: AcquireControl.Request, response: AcquireControl.Response
     ) -> AcquireControl.Response:
         with self._ui_control_lock:
-            self._ui_token = os.urandom(16)
+            # AcquireControl.srv's "pre-generated key" field: a non-all-zero
+            # request.token means the caller (by contract, the Orchestrator)
+            # supplied its own session token to be shared across several
+            # resources rather than asking this one to mint its own -- grant
+            # exactly that token instead. All-zero (the default, and what
+            # any pre-this-field caller always sends) keeps today's
+            # behaviour: mint a fresh one.
+            requested_token = bytes(request.token)
+            if requested_token != bytes(16):
+                self._ui_token = requested_token
+            else:
+                self._ui_token = os.urandom(16)
             self._ui_owner_id = request.owner_id
             self._ui_generation += 1
             response.accepted = True
