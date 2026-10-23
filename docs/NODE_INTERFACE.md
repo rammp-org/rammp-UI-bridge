@@ -313,8 +313,8 @@ subscription yet, intrinsics aren't needed for anything implemented so
 far) to get the actual pixel data for the "RGBD" source in §5.2.A's
 camera stream. Implemented in `ui_bridge_node.py`'s
 `_on_scene_camera_color`/`_on_scene_camera_depth` (params
-`scene_camera_color_topic`/`scene_camera_depth_topic`); only the latest
-frame is landed so far, forwarding to UE (§5.2.A) is still open.
+`scene_camera_color_topic`/`scene_camera_depth_topic`); every frame is
+landed and forwarded to UE as the §5.2.A base layer.
 
 This is deliberately its own peer, not folded into §3.1 (Orchestrator,
 which never touches pixel data) or §3.3 (Engine node, which owns
@@ -552,16 +552,24 @@ Remote Control function calls:
 
 #### A. Camera stream (video data plane)
 
-Reuses the Gen1 prototype's TCP streaming mechanism unchanged
-(`streaming/sender.py` + `protocol.py` + `client.py` -- per-channel
-`send_image`/`send_depth`/`send_mask` framing, not the Remote Control
-WebSocket, since this is bulk pixel data). Two layers, not two
-interchangeable sources:
+Reuses the Gen1 prototype's TCP streaming mechanism, vendored unchanged
+into `rammp_ui_bridge/streaming/` (`protocol.py` + `sender.py`, `client.py`
+not needed -- the bridge only ever sends) -- `StreamSender.send_image`/
+`send_depth_uint16` framing, not the Remote Control WebSocket, since this
+is bulk pixel data. Two layers, not two interchangeable sources:
 
 - **Base layer -- RGBD from the scene camera (§3.2), always streaming.**
   Color + depth, continuously, regardless of whether any engine is
   active. Detected-object information for a given frame is pushed
-  separately (§5.2.D), not in-band.
+  separately (§5.2.D), not in-band. **Implemented**:
+  `_forward_scene_camera_color`/`_forward_scene_camera_depth` push every
+  frame landed by §3.2's subscriptions straight through to UE, on fixed
+  channels 0 (color)/1 (depth), `group="scene"`, `stream_id="scene/color"`/
+  `"scene/depth"`. Depth is sent via `send_depth_uint16` for `16UC1`/
+  `mono16` encodings (native camera mm depth, no conversion); any other
+  depth encoding (e.g. `32FC1`) falls back to generic `send_image` with
+  `fmt` set to the ROS encoding string, pending a real depth source to
+  confirm which encodings actually show up.
 - **Overlay layer -- RGB from an active Engine node's own camera (§3.3),
   optional and additional.** An engine only opens this second stream
   when it has something detailed to show the user (e.g. a wrist-camera
@@ -575,13 +583,20 @@ interchangeable sources:
   stream's RGB pixels by the engine itself** (not a separate mask
   channel); detections during this time still arrive via §3.1/§5.2.D,
   exactly as with the base layer -- neither layer itself carries
-  detected-object semantics.
+  detected-object semantics. **Not implemented yet** -- no real engine
+  publishes a wrist-camera topic to subscribe to.
 
 Each layer gets its own channel/`stream_id`, tagged with
 `source`/`role`/`group` metadata so UE can route each frame to the right
 material/viewport (base vs. overlay) -- same conventions as Gen1's
 per-camera channel numbering (see that bridge's
 `image_channel`/`depth_channel`/`mask_channel` parameters for precedent).
+The bridge is a TCP **client** of UE's RMSS streaming server (param
+`ue_stream_port`, default `30030`, same host as `ue_host`); connection is
+kept alive by a dedicated reconnect-loop thread
+(`_stream_reconnect_loop`), independent of the Remote Control WebSocket's
+own reconnection -- frames are simply dropped (not queued) while
+disconnected, since only the newest frame matters for a live feed.
 
 **Important correction re: "detected objects" transport.** The Gen1
 streaming protocol itself (`StreamHeader`/`StreamMessage`) carries **no
@@ -594,12 +609,10 @@ the same: both layers carry pixel data only, while all detected-object
 semantics (class, instance ID, 2D bounding box) are pushed as data on the
 **existing detected-objects push** (§5.2.D, §3.1's `ObjectRecord.box`),
 *not* on `InteractionPanel` (§5.2.C), which stays reserved for the
-task/button dialog only. **Open/TBD:** the scene camera's raw color/depth
-topics (§3.2) are now defined and subscribed to directly by the bridge,
-but an Engine node's wrist-camera output (§3.3) still isn't published by
-any real engine yet, and forwarding either layer to UE over the Gen1
-streaming protocol isn't implemented here yet either -- as is the exact
-UE-side blur/composite mechanics (how strong, whether it's a material
+task/button dialog only. **Open/TBD:** the overlay layer (an Engine
+node's wrist-camera output, §3.3) still isn't published by any real
+engine yet, so that forwarding path is untested; the exact UE-side
+blur/composite mechanics (how strong, whether it's a material
 parameter on the base layer or a UE post-process); §3.1's
 `ObjectRecord.box` extension already covers the detection *semantics*
 independent of either.
@@ -794,17 +807,15 @@ to the task/button-dialog lifecycle.
   that decision, and the exact conditions under which it stops
   Perception, still needs to be confirmed before this behavior can be
   relied on.
-- **Raw RGB/depth image topics for §5.2.A (camera streams, §3.2's scene
-  camera and §3.3.1's per-engine camera)** are undefined -- no camera
-  driver node, and no engine publishing its own camera, exist in this
-  workspace yet. Camera streaming is an *intended* channel of this bridge
-  (unlike in the prior version of this doc), but implementation is
-  blocked on those source topics existing first. Note this is now purely
-  a *pixel-data* gap -- the detected-object semantics (class, instance,
-  box) that would otherwise ride along with a frame are already covered
-  by the `ObjectRecord` extension above (base layer) and §3.3.2's
-  `ObjectCandidate` (overlay layer during an active engine's input
-  request), independent of whether/when a raw camera topic exists.
+- **Raw RGB image topic for §3.3.1's per-engine camera (overlay layer,
+  §5.2.A)** is still undefined -- no engine publishes its own camera yet.
+  The scene camera side (§3.2, base layer) is resolved and implemented:
+  real topics subscribed to, frames forwarded to UE over the vendored
+  Gen1 RMSS streaming protocol. The overlay layer's detected-object
+  semantics (class, instance, box) are already covered by §3.3.2's
+  `ObjectCandidate` independent of whether/when a real wrist-camera topic
+  exists; the base layer's equivalent is the `ObjectRecord` extension
+  above.
 - **§3.3.2's `RequestUserInput` interface is newly proposed and entirely
   unimplemented.** No `rammp_ui_bridge_interfaces` (or equivalent)
   package exists yet to define the action/message; no engine calls it;

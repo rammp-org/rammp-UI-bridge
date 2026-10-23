@@ -18,6 +18,11 @@ def generate_launch_description():
                 description="UE Remote Control WebSocket API port",
             ),
             DeclareLaunchArgument(
+                "ue_stream_port",
+                default_value="30030",
+                description="UE RMSS streaming server port (§5.2.A camera base layer)",
+            ),
+            DeclareLaunchArgument(
                 "ue_preset",
                 default_value="RAMMP",
                 description="UE Remote Control preset name to register against",
@@ -63,6 +68,7 @@ def generate_launch_description():
                     {
                         "ue_host": LaunchConfiguration("ue_host"),
                         "ue_ws_port": LaunchConfiguration("ue_ws_port"),
+                        "ue_stream_port": LaunchConfiguration("ue_stream_port"),
                         "ue_preset": LaunchConfiguration("ue_preset"),
                         "orchestrator_ns": LaunchConfiguration("orchestrator_ns"),
                         "world_state_poll_period": LaunchConfiguration(

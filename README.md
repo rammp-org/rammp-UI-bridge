@@ -64,11 +64,16 @@ maintained implementation, matching the interface spec below: Orchestrator
 world-state/detected-objects polling and push, the unified
 `InteractionPanel` scheme (built from a single `UpdatePanel` Remote Control
 call), the two-command UE→bridge dispatch (`select_object`/`button_press`
-with stale-ID error reporting), and the `~/request_user_input` action
-server for direct engine↔bridge interaction. The camera-stream and
-system-status channels (§5.2.A/B) are not yet implementable -- no camera or
-hardware driver node exists yet in the workspace to source them from (see
-"Not yet in scope" in `docs/NODE_INTERFACE.md`).
+with stale-ID error reporting), the `~/request_user_input` action
+server for direct engine↔bridge interaction, and the camera base-layer
+stream (§5.2.A) -- subscribes to the scene camera's raw color/depth topics
+(§3.2) and forwards every frame to UE over the vendored Gen1 RMSS
+streaming protocol (`rammp_ui_bridge/streaming/`). The camera *overlay*
+layer (an engine's own wrist camera, §3.3) and the system-status channel
+(§5.2.B) are not yet implementable -- no real engine publishes a
+wrist-camera topic, and no hardware driver node exists yet in the
+workspace to source joint/chair state from (see "Not yet in scope" in
+`docs/NODE_INTERFACE.md`).
 
 An earlier Python prototype that predates this package (built against an
 outdated draft of `docs/NODE_INTERFACE.md`, before the `InteractionPanel`
@@ -81,11 +86,12 @@ transport were ported forward into this package, and it is now superseded.
 An earlier, hardware-specific GUI bridge (`rammp_prototype_gui.Gui_bridge`)
 existed for the Gen1 chair+arm prototype. It streamed camera
 color/depth/segmentation-mask frames to UE and mapped real robot joint
-states into a UE skeleton. This bridge intends to reuse that same streaming
-mechanism (see `docs/NODE_INTERFACE.md` §5.2.A/B), but the ROS2-side source
-topics (camera frames, joint/base state) aren't defined yet in
-`rammp_orchestrator_interfaces`/`rammp_perception_interfaces` -- see
-`docs/NODE_INTERFACE.md`'s "Not yet in scope" section for what's blocked on
-that.
+states into a UE skeleton. This bridge reuses that same streaming
+mechanism for the camera base layer (`rammp_ui_bridge/streaming/`,
+vendored from `rammp_prototype_gui.streaming`'s `protocol.py`/`sender.py`
+unchanged -- see `docs/NODE_INTERFACE.md` §5.2.A), now wired up to the
+scene camera's real topics (§3.2). The joint/base-state side (§5.2.B)
+still has no ROS2-side source -- see `docs/NODE_INTERFACE.md`'s
+"Not yet in scope" section for what's blocked on that.
 
 

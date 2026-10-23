@@ -35,9 +35,11 @@ also streamed camera images/depth/masks to UE and mapped real robot joint
 states into a UE skeleton (§5.2.A/B here). The hardware node side (§5.2.B,
 joint states/chair speed) still has no ROS2-side source. The scene camera
 (§3.2) now does -- this node subscribes directly to its raw color/depth
-topics (see ``_on_scene_camera_color``/``_on_scene_camera_depth``) -- but
-forwarding those frames to UE over the Gen1 streaming protocol (§5.2.A) is
-still not implemented here yet.
+topics (see ``_on_scene_camera_color``/``_on_scene_camera_depth``) and
+forwards every frame to UE as the §5.2.A base layer, over the vendored
+Gen1 RMSS streaming protocol (``rammp_ui_bridge.streaming.StreamSender``,
+a TCP client of UE's streaming server -- separate from the Remote Control
+WebSocket, since this is bulk pixel data).
 """
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ from rammp_orchestrator_interfaces.srv import (
 )
 from rammp_ui_bridge_interfaces.action import RequestUserInput
 
+from ..streaming import StreamSender
 from ..unreal_remote_websocket import UnrealRemoteWebsocket
 
 _CONTROL_COMMANDS = {
@@ -79,6 +82,19 @@ _DISMISS_BUTTON_ID = "dismiss"
 _PAUSE_BUTTON_ID = "control:pause"
 _RESUME_BUTTON_ID = "control:resume"
 _CANCEL_BUTTON_ID = "control:cancel"
+
+# §5.2.A base-layer camera stream: fixed RMSS channel numbers + stream IDs for
+# the scene camera's two layers (one bridge, one scene camera -- no per-robot
+# channel negotiation needed yet).
+_SCENE_COLOR_CHANNEL = 0
+_SCENE_DEPTH_CHANNEL = 1
+_SCENE_COLOR_STREAM_ID = "scene/color"
+_SCENE_DEPTH_STREAM_ID = "scene/depth"
+_SCENE_STREAM_GROUP = "scene"
+
+# ROS sensor_msgs/Image depth encodings this bridge knows how to forward
+# as-is (uint16 mm, no conversion) -- see StreamSender.send_depth_uint16.
+_UINT16_DEPTH_ENCODINGS = frozenset({"16UC1", "mono16"})
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +258,10 @@ class UiBridgeNode(Node):
         # below). Override per-robot via a launch/params-file argument.
         self.declare_parameter("scene_camera_color_topic", "/scene_camera/color/image_raw")
         self.declare_parameter("scene_camera_depth_topic", "/scene_camera/depth/image_rect_raw")
+        # §5.2.A base layer: UE's RMSS streaming server port (separate TCP
+        # socket from the Remote Control WebSocket above).
+        self.declare_parameter("ue_stream_port", 30030)
+        self.declare_parameter("ue_stream_reconnect_period", 3.0)
 
         self._ns = self.get_parameter("orchestrator_ns").value
         self._service_wait_timeout = (
@@ -265,15 +285,32 @@ class UiBridgeNode(Node):
         self._active_input_goal: dict[str, Any] | None = None
 
         # -- scene camera state (§3.2) ----------------------------------------
-        # Latest frame from each topic, for whatever eventually forwards this
-        # to UE as the §5.2.A base layer -- not forwarded yet, see module
-        # docstring. Guarded by a lock since subscription callbacks run on
-        # the (multi-threaded) executor, not necessarily the same thread.
+        # Latest frame from each topic, forwarded to UE as the §5.2.A base
+        # layer (see _forward_scene_camera_frame). Guarded by a lock since
+        # subscription callbacks run on the (multi-threaded) executor, not
+        # necessarily the same thread.
         self._camera_lock = threading.Lock()
         self._latest_scene_color: Image | None = None
         self._latest_scene_depth: Image | None = None
         self._scene_color_frame_count = 0
         self._scene_depth_frame_count = 0
+
+        # §5.2.A: TCP client of UE's RMSS streaming server. Connection is
+        # managed by a dedicated reconnect-loop thread (_stream_reconnect_loop)
+        # since StreamSender itself has no built-in retry -- mirrors how
+        # UnrealRemoteWebsocket manages its own WebSocket reconnection.
+        self._stream_sender = StreamSender(
+            host=self.get_parameter("ue_host").value,
+            port=self.get_parameter("ue_stream_port").get_parameter_value().integer_value,
+        )
+        self._stream_reconnect_period = (
+            self.get_parameter("ue_stream_reconnect_period").get_parameter_value().double_value
+        )
+        self._stream_shutdown = threading.Event()
+        self._stream_reconnect_thread = threading.Thread(
+            target=self._stream_reconnect_loop, name="ui_bridge-stream-reconnect", daemon=True
+        )
+        self._stream_reconnect_thread.start()
 
         self._get_world_state_client = self.create_client(
             GetWorldState, f"{self._ns}/get_world_state", callback_group=self._cb_group
@@ -350,16 +387,20 @@ class UiBridgeNode(Node):
             f"rammp_ui_bridge ready; bridging UE at "
             f"{self.get_parameter('ue_host').value} <-> Orchestrator at '{self._ns}'; "
             f"scene camera color='{self.get_parameter('scene_camera_color_topic').value}' "
-            f"depth='{self.get_parameter('scene_camera_depth_topic').value}'"
+            f"depth='{self.get_parameter('scene_camera_depth_topic').value}' -> "
+            f"UE stream port {self.get_parameter('ue_stream_port').value}"
         )
 
     # ------------------------------------------------------------------
-    # Bridge <-> Camera (§3.2): raw scene-camera frames.
+    # Bridge <-> Camera (§3.2): raw scene-camera frames, forwarded to UE as
+    # the §5.2.A base layer over the RMSS streaming protocol.
     #
-    # Just lands the latest color/depth frame for now (plus a log line on
-    # the first frame and then one every 100, to confirm wiring without
-    # spamming) -- forwarding these to UE as the §5.2.A base layer over the
-    # Gen1 streaming protocol is a separate, not-yet-implemented piece.
+    # Lands the latest frame (plus a log line on the first frame and then
+    # one every 100, to confirm wiring without spamming), then forwards it
+    # to UE if currently connected -- silently skipped (frame dropped, not
+    # queued) while disconnected, since only the newest frame matters for a
+    # live camera feed and _stream_reconnect_loop is already working on
+    # reconnecting.
     # ------------------------------------------------------------------
     def _on_scene_camera_color(self, msg: Image) -> None:
         with self._camera_lock:
@@ -371,6 +412,7 @@ class UiBridgeNode(Node):
                 f"scene camera color: frame #{count} ({msg.width}x{msg.height}, "
                 f"encoding={msg.encoding})"
             )
+        self._forward_scene_camera_color(msg)
 
     def _on_scene_camera_depth(self, msg: Image) -> None:
         with self._camera_lock:
@@ -382,6 +424,75 @@ class UiBridgeNode(Node):
                 f"scene camera depth: frame #{count} ({msg.width}x{msg.height}, "
                 f"encoding={msg.encoding})"
             )
+        self._forward_scene_camera_depth(msg)
+
+    def _forward_scene_camera_color(self, msg: Image) -> None:
+        if not self._stream_sender.is_connected():
+            return
+        try:
+            self._stream_sender.send_image(
+                _SCENE_COLOR_CHANNEL,
+                bytes(msg.data),
+                msg.width,
+                msg.height,
+                fmt=msg.encoding,
+                group=_SCENE_STREAM_GROUP,
+                role="color",
+                stream_id=_SCENE_COLOR_STREAM_ID,
+                name="Scene camera",
+            )
+        except (RuntimeError, OSError) as exc:
+            self.get_logger().warning(f"failed to forward scene camera color frame to UE: {exc}")
+
+    def _forward_scene_camera_depth(self, msg: Image) -> None:
+        if not self._stream_sender.is_connected():
+            return
+        try:
+            if msg.encoding in _UINT16_DEPTH_ENCODINGS:
+                self._stream_sender.send_depth_uint16(
+                    _SCENE_DEPTH_CHANNEL,
+                    bytes(msg.data),
+                    msg.width,
+                    msg.height,
+                    group=_SCENE_STREAM_GROUP,
+                    role="depth",
+                    stream_id=_SCENE_DEPTH_STREAM_ID,
+                    name="Scene camera depth",
+                )
+            else:
+                # 32FC1 (metres) and anything else not explicitly a uint16 mm
+                # encoding: pass through as generic image data, let UE/§7
+                # sort out interpretation once a real depth source confirms
+                # which encodings actually show up in practice.
+                self._stream_sender.send_image(
+                    _SCENE_DEPTH_CHANNEL,
+                    bytes(msg.data),
+                    msg.width,
+                    msg.height,
+                    fmt=msg.encoding,
+                    group=_SCENE_STREAM_GROUP,
+                    role="depth",
+                    stream_id=_SCENE_DEPTH_STREAM_ID,
+                    name="Scene camera depth",
+                )
+        except (RuntimeError, OSError) as exc:
+            self.get_logger().warning(f"failed to forward scene camera depth frame to UE: {exc}")
+
+    def _stream_reconnect_loop(self) -> None:
+        """Background thread: keeps ``self._stream_sender`` connected to
+        UE's RMSS streaming server, independent of the camera subscription
+        callbacks above -- mirrors ``UnrealRemoteWebsocket``'s own
+        reconnect loop for the Remote Control WebSocket, just thread-based
+        instead of asyncio-based since ``StreamSender`` is a plain blocking
+        TCP client."""
+        while not self._stream_shutdown.is_set():
+            if not self._stream_sender.is_connected():
+                try:
+                    self._stream_sender.connect()
+                    self.get_logger().info("connected to UE streaming server")
+                except OSError as exc:
+                    self.get_logger().debug(f"UE streaming server connect failed: {exc}")
+            self._stream_shutdown.wait(self._stream_reconnect_period)
 
     # ------------------------------------------------------------------
     # UE -> Orchestrator / UE -> active engine: dispatch user-input commands
@@ -742,6 +853,10 @@ class UiBridgeNode(Node):
 
     # ------------------------------------------------------------------
     def destroy_node(self) -> None:
+        self._stream_shutdown.set()
+        self._stream_reconnect_thread.join(timeout=5.0)
+        if self._stream_sender.is_connected():
+            self._stream_sender.disconnect()
         self.ue.shutdown()
         ue_loop = getattr(self.ue, "loop", None)
         if ue_loop is not None:
