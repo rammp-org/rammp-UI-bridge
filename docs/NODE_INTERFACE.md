@@ -380,25 +380,28 @@ a crashed or slow-to-release engine could still leave a stale publisher
 open, so the bridge doesn't just trust "whatever arrives." Instead:
 
 **Token-gated arbitration.** The bridge is the arbitration *server* for
-this resource (the "overlay control" resource), reusing the same
+this resource (the "UI control" resource -- it also gates §3.3.2's
+`RequestUserInput`, since both represent the one currently-active
+engine's exclusive right to talk to the UI), reusing the same
 AcquireControl/ReleaseControl/ControlStatus protocol that
 `rammp_arm_interfaces`/`rammp_base_interfaces` already use for hardware
 arbitration (see `rammp_common_interfaces`). The bridge hosts three
 endpoints:
 
-- `~/overlay_control/acquire_control` (`rammp_common_interfaces/AcquireControl`) --
+- `~/ui_control/acquire_control` (`rammp_common_interfaces/AcquireControl`) --
   an engine calls this (with its own `owner_id`) when it's about to start
-  publishing overlay frames. Like the hardware-arbitration precedent,
-  this call **seizes**: it always succeeds and always returns a fresh
-  16-byte token, even if another owner currently holds it -- by
-  operational contract this is only ever called by the engine the
-  Orchestrator just activated, so there should never be a real
-  conflict in practice, but the "seize" semantics mean a stuck/crashed
-  owner can never permanently block a correctly-behaving new owner.
-- `~/overlay_control/release_control` (`rammp_common_interfaces/ReleaseControl`) --
+  publishing overlay frames and/or calling `~/request_user_input`. Like
+  the hardware-arbitration precedent, this call **seizes**: it always
+  succeeds and always returns a fresh 16-byte token, even if another
+  owner currently holds it -- by operational contract this is only ever
+  called by the engine the Orchestrator just activated, so there should
+  never be a real conflict in practice, but the "seize" semantics mean a
+  stuck/crashed owner can never permanently block a correctly-behaving
+  new owner.
+- `~/ui_control/release_control` (`rammp_common_interfaces/ReleaseControl`) --
   called by the current owner (with its token) when it's done, e.g. from
   its own `hibernate`. Refused (token mismatch) if called by anyone else.
-- `~/overlay_control/status` (`rammp_common_interfaces/ControlStatus`, published
+- `~/ui_control/status` (`rammp_common_interfaces/ControlStatus`, published
   latched/transient-local) -- current `owner_id`/`generation`/`owned`/
   `rejected_count`, for anyone who wants to observe arbitration state
   without racing to acquire it themselves.
@@ -406,18 +409,19 @@ endpoints:
 Every `EngineOverlayImage` frame an engine publishes carries the token it
 was granted (`EngineOverlayImage.token`). `_on_engine_overlay_frame`
 compares the incoming token against the one most recently granted
-(`self._overlay_token`) and **silently drops** (incrementing
-`rejected_count`, with a throttled warning log) any frame whose token
-doesn't match -- including frames from a stale/already-released owner.
-Only frames with a matching token are forwarded
-(`_forward_engine_overlay_color`) to UE, unconditionally, on fixed
-channel 2, `group="overlay"`, `stream_id="engine/overlay"` -- exactly the
-same shape as the base layer's forwarding, just one channel number up.
-An engine's expected lifecycle is: call `acquire_control` once it starts
-(e.g. on `activate`), publish `EngineOverlayImage` frames stamped with
-that token while active, and call `release_control` when done (e.g. on
-`hibernate`). UE's own receive-timeout still handles falling back to the
-base-layer-only view if nothing is forwarded for a while (see §5.2.A).
+(`self._ui_token`) and **silently drops** (incrementing `rejected_count`,
+with a throttled warning log) any frame whose token doesn't match --
+including frames from a stale/already-released owner. Only frames with a
+matching token are forwarded (`_forward_engine_overlay_color`) to UE,
+unconditionally, on fixed channel 2, `group="overlay"`,
+`stream_id="engine/overlay"` -- exactly the same shape as the base
+layer's forwarding, just one channel number up. An engine's expected
+lifecycle is: call `acquire_control` once it starts (e.g. on `activate`),
+publish `EngineOverlayImage` frames (and/or call `~/request_user_input`,
+§3.3.2) stamped with that token while active, and call `release_control`
+when done (e.g. on `hibernate`). UE's own receive-timeout still handles
+falling back to the base-layer-only view if nothing is forwarded for a
+while (see §5.2.A).
 
 **Not yet decided:** whether this resource also needs a `RevokeControl`
 (operator-override, no-token) path for a hard crash-recovery case -- not
@@ -430,7 +434,7 @@ publish-with-wrong-token → release → publish-with-stale-token), not a
 real wrist camera + engine. The exact image shape/encoding a real
 manipulation engine's wrist camera would publish is still unconfirmed.
 
-#### 3.3.2 User-input request (bridge is server) -- **proposed, not yet implemented**
+#### 3.3.2 User-input request (bridge is server) -- **implemented**
 
 **Design decision: an active engine asks the bridge for user input
 directly, with the Orchestrator never involved.** An earlier revision of
@@ -445,13 +449,17 @@ the existing division of responsibility better: the Orchestrator owns
 bridge owns *everything UE-facing* -- and "ask the user something" is
 squarely UE-facing.
 
-Proposed shape (a new interfaces package, e.g. `rammp_ui_bridge_interfaces`,
-since this is bridge-specific, not a generic Orchestrator concept):
+Lives in `rammp_ui_bridge_interfaces` (bridge-specific, not a generic
+Orchestrator concept):
 
 ```
-# RequestUserInput.action (proposed)
+# RequestUserInput.action
 
 # goal
+string engine_id                                # calling engine's own CapabilityManifest.engine_id
+uint8[16] token                                  # must match the current ~/ui_control grant (see
+                                                 # §3.3.1 -- the same arbitration resource gates
+                                                 # both the overlay camera and this action)
 string panel_json                              # optional: InteractionPanel-shaped JSON
                                                  # (title/message/buttons, §5.2.C) the engine
                                                  # wants shown; empty if this request is
@@ -459,20 +467,43 @@ string panel_json                              # optional: InteractionPanel-shap
 ObjectCandidate[] objects                       # optional: candidate objects the user can tap
                                                  # on this engine's own overlay stream (§3.3.1);
                                                  # empty if this request is panel-only
+string selected_instance_id                     # optional: one of objects' instance_id to show
+                                                 # as already highlighted when the goal starts
 # (at least one of panel_json / objects must be non-empty)
 ---
 # result
-uint8 STATUS_BUTTON = 0      # user tapped one of panel_json's buttons
-uint8 STATUS_OBJECT = 1      # user tapped one of objects
-uint8 STATUS_CANCELLED = 2   # engine cancelled the goal before either happened
+uint8 STATUS_BUTTON = 0      # user pressed one of panel_json's buttons
+uint8 STATUS_CANCELLED = 1   # engine cancelled the goal before that happened
 uint8 status
 string button_id             # set iff status == STATUS_BUTTON
-string instance_id           # set iff status == STATUS_OBJECT
 ---
-# feedback: (none needed -- this is a single wait-for-one-tap request, not
-# a long-running operation with intermediate progress)
+# feedback -- sent once per object tap while the goal is still active,
+# never after the result above is sent. An object tap does NOT complete
+# the goal by itself (see point 3 below).
+uint8 EVENT_OBJECT_TAPPED = 0
+uint8 event_type
+string instance_id            # set iff event_type == EVENT_OBJECT_TAPPED
 ```
-`ObjectCandidate` (new, small, UI-facing -- not `ObjectRecord`, which is
+
+```
+# UpdateUserInputPanel.srv -- called any number of times while a
+# RequestUserInput goal is active, to change what's displayed without
+# completing or restarting it (e.g. after an EVENT_OBJECT_TAPPED
+# feedback, to update the message and highlight the new selection).
+
+uint8[16] token
+bool update_panel
+string panel_json              # replaces the current panel entirely; set iff update_panel
+bool update_objects
+ObjectCandidate[] objects      # replaces the current candidate list entirely; set iff update_objects
+bool update_selected
+string selected_instance_id    # highlight this instance_id ("" clears); set iff update_selected
+---
+bool accepted
+string message
+```
+
+`ObjectCandidate` (small, UI-facing -- not `ObjectRecord`, which is
 an Orchestrator/world-state concept): just `{instance_id, perception_class,
 box}`, the minimum UE needs to render and hit-test a tappable box. No
 `stream_id` field is needed per-object since every object in one goal
@@ -486,34 +517,52 @@ Bridge behavior while a goal is active:
    otherwise be shown there (e.g. `ExecuteAction` progress, §3.1.1),
    reverting to the prior content once the goal ends.
 2. If `objects` is non-empty, push them to UE's `UpdateDetectedObjects`
-   channel (§5.2.D) tagged with the engine's own overlay `stream_id`,
+   channel (§5.2.D) tagged with the engine's own overlay `stream_id` and
+   `selected_instance_id` (initially `goal.selected_instance_id`),
    exactly like any other detected-objects push -- tappable the same way
    base-layer objects are.
-3. Whichever happens first -- UE reports a `button_press` matching one of
-   `panel_json`'s `button_id`s, or a `select_object` matching one of
-   `objects`' `instance_id`s -- the bridge completes the goal with the
-   corresponding result/status. There's only ever one result per goal.
+3. **An object tap does not complete the goal.** The user may tap
+   several different candidates in a row while deciding; each tap is
+   reported to the engine as an `EVENT_OBJECT_TAPPED` feedback message
+   instead, and the bridge's own notion of "currently highlighted"
+   updates to match. The engine decides what to do about each tap --
+   typically calling `UpdateUserInputPanel` to change the displayed
+   message and/or `update_selected` to reflect the new choice back to
+   the user -- without the goal ending. The goal only completes when UE
+   reports a `button_press` matching one of the current panel's
+   `button_id`s (`STATUS_BUTTON`); by then the engine already knows
+   (from the feedback stream) which object, if any, is selected, and the
+   pressed `button_id` tells it what to do with that selection.
 4. The engine can cancel the goal at any time (e.g. it no longer needs
    the answer); the bridge then withdraws whatever panel/objects it had
    pushed on the engine's behalf and reports `STATUS_CANCELLED`.
 5. Only one engine can have a goal active at a time, matching the
    Orchestrator's own one-engine-executing-at-a-time invariant -- a
-   second concurrent goal should be rejected by the bridge.
+   second concurrent goal is rejected by the bridge, as is any goal whose
+   `token` doesn't match the current `~/ui_control` grant (§3.3.1).
 
 **Bridge-side dispatch priority (§5.1):** a UE `select_object`/
 `button_press` is resolved against an active `RequestUserInput` goal
 *first*, if one exists and the tapped ID matches something it's
-currently offering -- completing that goal rather than calling into the
-Orchestrator at all. Only if there's no active goal, or the ID doesn't
-match what it's offering, does the bridge fall back to the normal
-Orchestrator dispatch (§3.1's `select_object`/`deselect`/`control`/
-`execute_action`), unchanged from before this section existed.
+currently offering. A matching `select_object` is consumed as feedback
+(point 3 above, goal stays active); a matching `button_press` completes
+the goal. Only if there's no active goal, or the ID doesn't match what
+it's offering, does the bridge fall back to the normal Orchestrator
+dispatch (§3.1's `select_object`/`deselect`/`control`/`execute_action`),
+unchanged from before this section existed.
 
-**Still TBD** (tracked in §7): this entire interface is newly proposed --
-the interfaces package it should live in, exact message/field names, and
-how an engine discovers the bridge's own service/action namespace (a
-fixed, well-known name is enough since there's exactly one bridge per
-§1, but this still needs to be pinned down) are all undecided.
+**Verified:** live smoke test (in-process, no real UE) exercising the
+full lifecycle -- acquire `~/ui_control` token, send a goal with two
+candidate objects, simulate two alternating object taps (each produces
+exactly one feedback message, goal stays active), call
+`UpdateUserInputPanel` with the right token (accepted) and a wrong token
+(rejected), simulate a `button_press` (completes the goal with
+`STATUS_BUTTON`), and confirm a second goal with a stale/wrong token is
+rejected outright.
+
+**Still open:** no real engine in this workspace calls
+`~/request_user_input`/`~/request_user_input/update` yet, so only this
+synthetic traffic has verified the path.
 
 ### 3.4 Bridge ↔ Hardware node
 
@@ -876,7 +925,7 @@ to the task/button-dialog lifecycle.
   `engine_overlay_topic` (default `/engine_overlay/image_raw`,
   `rammp_ui_bridge_interfaces/EngineOverlayImage`) is subscribed to and
   forwarded exactly like the base layer once its token is verified
-  against the bridge's `~/overlay_control/{acquire_control,
+  against the bridge's `~/ui_control/{acquire_control,
   release_control,status}` arbitration endpoints; no real engine calls
   `acquire_control`/publishes to it yet, so only synthetic test traffic
   (acquire → good-token publish → wrong-token publish → release →
@@ -888,14 +937,15 @@ to the task/button-dialog lifecycle.
   instance, box) are already covered by §3.3.2's `ObjectCandidate`
   independent of whether/when a real wrist-camera publishes; the base
   layer's equivalent is the `ObjectRecord` extension above.
-- **§3.3.2's `RequestUserInput` interface is newly proposed and entirely
-  unimplemented.** No `rammp_ui_bridge_interfaces` (or equivalent)
-  package exists yet to define the action/message; no engine calls it;
-  the bridge doesn't serve it. Open questions: the interfaces package's
-  name/location, exact field names, and how an engine resolves the
-  bridge's fixed, well-known action name (presumably no discovery needed,
-  since there's exactly one bridge per §1, but this hasn't been
-  confirmed against how engine nodes are typically configured/launched).
+- **§3.3.2's `RequestUserInput`/`UpdateUserInputPanel` are now
+  implemented**, gated by the same `~/ui_control` grant as the overlay
+  camera, but unexercised against a real engine -- no real engine calls
+  `~/request_user_input`/`~/request_user_input/update` yet, so only
+  synthetic test traffic (acquire token → goal with two candidate
+  objects → two alternating object taps, each producing exactly one
+  feedback message → `UpdateUserInputPanel` with a matching and then a
+  mismatched token → a `button_press` completing the goal → a
+  second goal rejected on a stale token) has verified the path.
 - **System status telemetry for §5.2.B (§3.4 Hardware node)** is
   undefined -- no hardware driver node in this workspace publishes joint
   states or chair/base speed and status today. System status is an

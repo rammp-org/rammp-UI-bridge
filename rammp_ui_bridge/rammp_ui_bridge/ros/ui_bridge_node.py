@@ -20,9 +20,17 @@ every time a new panel is pushed (see ``_panel_buttons``).
 **Engine-driven user input (§3.3.2).** This node also serves
 ``~/request_user_input`` (``rammp_ui_bridge_interfaces/RequestUserInput``),
 called directly by an active engine node, bypassing the Orchestrator
-entirely. A ``select_object``/``button_press`` tap is resolved against an
-active goal *first*, if the tapped id matches what that goal is offering;
-only otherwise does the normal Orchestrator-call dispatch below apply.
+entirely, and gated by the same ``ui_control`` arbitration grant as the
+overlay camera below (a goal's ``token`` must match). A ``select_object``/
+``button_press`` tap is resolved against an active goal *first*, if the
+tapped id matches what that goal is offering; only otherwise does the
+normal Orchestrator-call dispatch below apply. Tapping an object never
+completes the goal by itself -- it's reported to the engine as feedback,
+and the engine may call ``~/request_user_input/update``
+(``rammp_ui_bridge_interfaces/UpdateUserInputPanel``) any number of times
+while its goal is active to change the displayed panel/candidate
+list/highlighted selection in response. Only a button press (or the
+engine's own cancel) ends the goal.
 
 By design this node never talks to engines about anything but this one
 direct request/response exchange, and never duplicates Orchestrator logic --
@@ -43,16 +51,19 @@ since this is bulk pixel data). ``ramms_tools`` is a dependency, installed
 via ``pip install git+https://github.com/rammp-org/ramms-tools.git`` (see
 README.md), not vendored into this repo.
 
-**Overlay-camera arbitration (§3.3.1).** Every engine with its own camera
-publishes to the *same* topic (``engine_overlay_topic``), so this node
-also hosts a small ``rammp_common_interfaces`` arbitration server for that
-resource: an engine calls ``~/overlay_control/acquire_control`` to get a
-token, stamps every ``EngineOverlayImage`` it publishes with it, and this
-node only forwards frames whose token matches the one it most recently
-granted (see ``_on_overlay_acquire_control``/``_on_engine_overlay_frame``).
-This is the same token-gating convention ``rammp_arm_interfaces``/
-``rammp_base_interfaces`` use for hardware, just for a bridge-owned
-resource instead.
+**Overlay-camera & user-input arbitration (§3.3.1/§3.3.2).** Every engine
+with its own camera publishes to the *same* topic (``engine_overlay_topic``),
+and any engine may call ``~/request_user_input`` directly -- so this node
+also hosts a small ``rammp_common_interfaces`` arbitration server for one
+shared "ui_control" resource covering both: an engine calls
+``~/ui_control/acquire_control`` to get a token, stamps every
+``EngineOverlayImage`` it publishes with it and includes it in its
+``RequestUserInput`` goal, and this node only forwards overlay frames (or
+accepts a user-input goal) whose token matches the one it most recently
+granted (see ``_on_ui_acquire_control``/``_on_engine_overlay_frame``/
+``_on_request_user_input_goal``). This is the same token-gating convention
+``rammp_arm_interfaces``/``rammp_base_interfaces`` use for hardware, just
+for a bridge-owned resource instead.
 """
 
 from __future__ import annotations
@@ -84,6 +95,7 @@ from rammp_orchestrator_interfaces.srv import (
 )
 from rammp_ui_bridge_interfaces.action import RequestUserInput
 from rammp_ui_bridge_interfaces.msg import EngineOverlayImage
+from rammp_ui_bridge_interfaces.srv import UpdateUserInputPanel
 
 from ramms_tools.streaming import StreamSender
 from ..unreal_remote_websocket import UnrealRemoteWebsocket
@@ -289,8 +301,8 @@ class UiBridgeNode(Node):
         # core/orchestrator.py's resource acquisition on activate/execute),
         # but a stale/crashed engine could still have a publisher open, so
         # frames also carry an arbitration token (EngineOverlayImage.token)
-        # this node grants/checks itself -- see the overlay_control_*
-        # services below and _on_engine_overlay_frame.
+        # this node grants/checks itself -- see the ui_control_* services
+        # below and _on_engine_overlay_frame.
         self.declare_parameter("engine_overlay_topic", "/engine_overlay/image_raw")
         # §5.2.A base layer: UE's RMSS streaming server port (separate TCP
         # socket from the Remote Control WebSocket above).
@@ -315,7 +327,12 @@ class UiBridgeNode(Node):
         self._selected_activations: list = []
         # Set while a RequestUserInput goal from an engine is active; see
         # _on_request_user_input_execute. None when no engine is waiting on
-        # user input right now.
+        # user input right now. Guarded by _active_input_lock since it's
+        # mutated from the UE-callback thread (object taps/button presses,
+        # see _try_resolve_active_input_goal), the ~/request_user_input/update
+        # service thread (_on_update_user_input_panel), and read from the
+        # action's own execute-callback thread.
+        self._active_input_lock = threading.Lock()
         self._active_input_goal: dict[str, Any] | None = None
 
         # -- scene camera state (§3.2) ----------------------------------------
@@ -338,23 +355,28 @@ class UiBridgeNode(Node):
         self._latest_engine_overlay: Image | None = None
         self._engine_overlay_frame_count = 0
 
-        # -- overlay-control arbitration state (§3.3.1) ------------------------
-        # This node is the arbitration *server* for the overlay-camera
-        # resource (rammp_common_interfaces' AcquireControl/ReleaseControl/
+        # -- ui-control arbitration state (§3.3.1/§3.3.2) ----------------------
+        # This node is the arbitration *server* for the "UI control"
+        # resource -- whichever engine currently holds it is the one
+        # allowed to (a) have its EngineOverlayImage frames forwarded to UE
+        # and (b) hold an active RequestUserInput goal; both are facets of
+        # "this engine is the one currently talking to the UI", so they
+        # share one grant rather than two independent ones. Uses
+        # rammp_common_interfaces' AcquireControl/ReleaseControl/
         # ControlStatus protocol -- same one rammp_arm_interfaces/
-        # rammp_base_interfaces use for hardware, see that repo's README).
-        # Guarded by _overlay_control_lock since the service callbacks and
-        # the overlay subscription callback can run on different executor
-        # threads. `_overlay_token` is all-zero bytes when nobody holds it;
+        # rammp_base_interfaces use for hardware, see that repo's README.
+        # Guarded by _ui_control_lock since the service callbacks and the
+        # overlay subscription callback can run on different executor
+        # threads. `_ui_token` is all-zero bytes when nobody holds it;
         # AcquireControl.Request.token/ReleaseControl.Request.token are
         # uint8[16], so this stays a 16-byte value throughout. `rejected_count`
-        # mirrors ControlStatus's own field: frames/release-calls refused
-        # because their token didn't match the current grant.
-        self._overlay_control_lock = threading.Lock()
-        self._overlay_owner_id: str = ""
-        self._overlay_token: bytes = bytes(16)
-        self._overlay_generation = 0
-        self._overlay_rejected_count = 0
+        # mirrors ControlStatus's own field: frames/calls refused because
+        # their token didn't match the current grant.
+        self._ui_control_lock = threading.Lock()
+        self._ui_owner_id: str = ""
+        self._ui_token: bytes = bytes(16)
+        self._ui_generation = 0
+        self._ui_rejected_count = 0
 
         # §5.2.A: TCP client of UE's RMSS streaming server. Connection is
         # managed by a dedicated reconnect-loop thread (_stream_reconnect_loop)
@@ -403,34 +425,41 @@ class UiBridgeNode(Node):
             cancel_callback=lambda goal_handle: CancelResponse.ACCEPT,
             callback_group=self._cb_group,
         )
+        self._update_user_input_panel_server = self.create_service(
+            UpdateUserInputPanel,
+            "~/request_user_input/update",
+            self._on_update_user_input_panel,
+            callback_group=self._cb_group,
+        )
 
-        # §3.3.1 overlay-control arbitration server: any engine calls these
-        # before/after publishing to engine_overlay_topic. Latched
-        # (transient_local) ControlStatus publisher so a late-starting
-        # engine learns the current grant immediately, same convention as
-        # rammp_common_interfaces' own ControlStatus doc comment.
-        self._overlay_acquire_control_server = self.create_service(
+        # §3.3.1/§3.3.2 ui-control arbitration server: any engine calls these
+        # before/after publishing to engine_overlay_topic and/or holding a
+        # RequestUserInput goal. Latched (transient_local) ControlStatus
+        # publisher so a late-starting engine learns the current grant
+        # immediately, same convention as rammp_common_interfaces' own
+        # ControlStatus doc comment.
+        self._ui_acquire_control_server = self.create_service(
             AcquireControl,
-            "~/overlay_control/acquire_control",
-            self._on_overlay_acquire_control,
+            "~/ui_control/acquire_control",
+            self._on_ui_acquire_control,
             callback_group=self._cb_group,
         )
-        self._overlay_release_control_server = self.create_service(
+        self._ui_release_control_server = self.create_service(
             ReleaseControl,
-            "~/overlay_control/release_control",
-            self._on_overlay_release_control,
+            "~/ui_control/release_control",
+            self._on_ui_release_control,
             callback_group=self._cb_group,
         )
-        self._overlay_control_status_publisher = self.create_publisher(
+        self._ui_control_status_publisher = self.create_publisher(
             ControlStatus,
-            "~/overlay_control/status",
+            "~/ui_control/status",
             QoSProfile(
                 depth=1,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
                 history=HistoryPolicy.KEEP_LAST,
             ),
         )
-        self._publish_overlay_control_status()
+        self._publish_ui_control_status()
 
         self._connection_publisher = self.create_publisher(Bool, "~/ue_connection", 10)
         self.create_timer(
@@ -576,7 +605,9 @@ class UiBridgeNode(Node):
             self.get_logger().warning(f"failed to forward scene camera depth frame to UE: {exc}")
 
     # ------------------------------------------------------------------
-    # Bridge <-> Engine node (§3.3.1): a single shared overlay-camera topic.
+    # Bridge <-> Engine node (§3.3.1): a single shared overlay-camera topic,
+    # and (§3.3.2 below) direct engine<->bridge user-input requests -- both
+    # gated by the same "ui_control" arbitration grant.
     #
     # Every engine publishes its own camera (if it has one) to the same
     # well-known topic (engine_overlay_topic) rather than each getting a
@@ -585,70 +616,70 @@ class UiBridgeNode(Node):
     # time, but a crashed/slow-to-release engine could still have a stale
     # publisher open, so every frame also carries an arbitration token
     # (EngineOverlayImage.token) -- the bridge is the arbitration *server*
-    # for this resource (see the overlay_control_* services below) and only
+    # for this resource (see the ui_control_* services below) and only
     # forwards frames whose token matches the one it most recently granted.
     # ------------------------------------------------------------------
-    def _on_overlay_acquire_control(
+    def _on_ui_acquire_control(
         self, request: AcquireControl.Request, response: AcquireControl.Response
     ) -> AcquireControl.Response:
-        with self._overlay_control_lock:
-            self._overlay_token = os.urandom(16)
-            self._overlay_owner_id = request.owner_id
-            self._overlay_generation += 1
+        with self._ui_control_lock:
+            self._ui_token = os.urandom(16)
+            self._ui_owner_id = request.owner_id
+            self._ui_generation += 1
             response.accepted = True
-            response.token = list(self._overlay_token)
-            response.generation = self._overlay_generation
+            response.token = list(self._ui_token)
+            response.generation = self._ui_generation
             response.message = f"granted to '{request.owner_id}'"
         self.get_logger().info(
-            f"overlay control acquired by '{request.owner_id}' "
-            f"(generation {self._overlay_generation})"
+            f"ui control acquired by '{request.owner_id}' "
+            f"(generation {self._ui_generation})"
         )
-        self._publish_overlay_control_status()
+        self._publish_ui_control_status()
         return response
 
-    def _on_overlay_release_control(
+    def _on_ui_release_control(
         self, request: ReleaseControl.Request, response: ReleaseControl.Response
     ) -> ReleaseControl.Response:
-        with self._overlay_control_lock:
-            if bytes(request.token) == self._overlay_token and self._overlay_owner_id:
-                owner = self._overlay_owner_id
-                self._overlay_owner_id = ""
-                self._overlay_token = bytes(16)
+        with self._ui_control_lock:
+            if bytes(request.token) == self._ui_token and self._ui_owner_id:
+                owner = self._ui_owner_id
+                self._ui_owner_id = ""
+                self._ui_token = bytes(16)
                 response.released = True
                 response.message = ""
             else:
                 owner = None
-                self._overlay_rejected_count += 1
+                self._ui_rejected_count += 1
                 response.released = False
                 response.message = "token mismatch or already released"
         if owner is not None:
-            self.get_logger().info(f"overlay control released by '{owner}'")
-            self._publish_overlay_control_status()
+            self.get_logger().info(f"ui control released by '{owner}'")
+            self._publish_ui_control_status()
         return response
 
-    def _publish_overlay_control_status(self) -> None:
-        with self._overlay_control_lock:
+    def _publish_ui_control_status(self) -> None:
+        with self._ui_control_lock:
             msg = ControlStatus()
             msg.header.stamp = self.get_clock().now().to_msg()
             msg.arbitration_enabled = True
             msg.estopped = False
-            msg.owned = bool(self._overlay_owner_id)
-            msg.owner_id = self._overlay_owner_id
-            msg.generation = self._overlay_generation
-            msg.rejected_count = self._overlay_rejected_count
-        self._overlay_control_status_publisher.publish(msg)
+            msg.owned = bool(self._ui_owner_id)
+            msg.owner_id = self._ui_owner_id
+            msg.generation = self._ui_generation
+            msg.rejected_count = self._ui_rejected_count
+        self._ui_control_status_publisher.publish(msg)
 
     def _on_engine_overlay_frame(self, msg: EngineOverlayImage) -> None:
-        with self._overlay_control_lock:
-            granted = bool(self._overlay_owner_id) and bytes(msg.token) == self._overlay_token
+        with self._ui_control_lock:
+            granted = bool(self._ui_owner_id) and bytes(msg.token) == self._ui_token
             if not granted:
-                self._overlay_rejected_count += 1
-                rejected = self._overlay_rejected_count
+                self._ui_rejected_count += 1
+                rejected = self._ui_rejected_count
         if not granted:
             if rejected == 1 or rejected % 100 == 0:
                 self.get_logger().warning(
                     f"engine overlay frame dropped: token doesn't match the current "
-                    f"overlay_control grant (rejected #{rejected})"
+                    f"ui_control grant (rejected #{rejected})"
                 )
             return
 
@@ -740,25 +771,39 @@ class UiBridgeNode(Node):
     def _try_resolve_active_input_goal(self, cmd: str, command: dict[str, Any]) -> bool:
         """Returns True if the tap matched the active ``RequestUserInput``
         goal and was consumed by it (the normal dispatch table must not
-        also run for it)."""
-        goal_state = self._active_input_goal
-        if goal_state is None:
-            return False
-        if cmd == "select_object":
-            instance_id = command.get("instance_id", "")
-            if instance_id in goal_state["object_ids"]:
-                goal_state["result"]["status"] = RequestUserInput.Result.STATUS_OBJECT
-                goal_state["result"]["instance_id"] = instance_id
-                goal_state["event"].set()
-                return True
-        elif cmd == "button_press":
-            button_id = command.get("button_id", "")
-            if button_id in goal_state["button_ids"]:
+        also run for it). A matched ``select_object`` does NOT end the
+        goal -- the user may tap several different objects in a row while
+        deciding -- it's reported to the engine as feedback instead
+        (``RequestUserInput.Feedback.EVENT_OBJECT_TAPPED``), and
+        ``_active_input_goal``'s own ``selected_instance_id`` is updated so
+        a freshly-pushed panel/objects (e.g. from
+        ``_on_update_user_input_panel``) reflects it. Only a matched
+        ``button_press`` ends the goal."""
+        with self._active_input_lock:
+            goal_state = self._active_input_goal
+            if goal_state is None:
+                return False
+            if cmd == "select_object":
+                instance_id = command.get("instance_id", "")
+                if instance_id not in goal_state["object_ids"]:
+                    return False
+                goal_state["selected_instance_id"] = instance_id
+                goal_handle = goal_state["goal_handle"]
+            elif cmd == "button_press":
+                button_id = command.get("button_id", "")
+                if button_id not in goal_state["button_ids"]:
+                    return False
                 goal_state["result"]["status"] = RequestUserInput.Result.STATUS_BUTTON
                 goal_state["result"]["button_id"] = button_id
                 goal_state["event"].set()
                 return True
-        return False
+            else:
+                return False
+        feedback = RequestUserInput.Feedback()
+        feedback.event_type = RequestUserInput.Feedback.EVENT_OBJECT_TAPPED
+        feedback.instance_id = instance_id
+        goal_handle.publish_feedback(feedback)
+        return True
 
     def _handle_select_object(self, command: dict[str, Any]) -> None:
         instance_id = command.get("instance_id", "")
@@ -938,6 +983,14 @@ class UiBridgeNode(Node):
     # §3.3.2: engine-initiated, Orchestrator-bypassing user input requests
     # ------------------------------------------------------------------
     def _on_request_user_input_goal(self, goal_request) -> GoalResponse:
+        with self._ui_control_lock:
+            granted = bool(self._ui_owner_id) and bytes(goal_request.token) == self._ui_token
+        if not granted:
+            self.get_logger().warning(
+                f"rejecting RequestUserInput from '{goal_request.engine_id}': "
+                "token doesn't match the current ui_control grant"
+            )
+            return GoalResponse.REJECT
         if self._active_input_goal is not None:
             self.get_logger().warning(
                 f"rejecting RequestUserInput from '{goal_request.engine_id}': "
@@ -952,40 +1005,54 @@ class UiBridgeNode(Node):
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
+    def _push_engine_objects(
+        self, engine_id: str, objects, selected_instance_id: str
+    ) -> None:
+        """Pushes an engine's ``RequestUserInput`` candidate objects to UE's
+        ``UpdateDetectedObjects`` channel, tagged with that engine's own
+        overlay ``stream_id`` and the currently-highlighted selection (if
+        any) -- shared by the goal's initial push and every subsequent
+        ``_on_update_user_input_panel`` call."""
+        self.ue.call_function(
+            "UpdateDetectedObjects",
+            {
+                "Objects": [
+                    {
+                        "instance_id": o.instance_id,
+                        "perception_class": o.perception_class,
+                        "box": list(o.box),
+                        "stream_id": engine_id,
+                    }
+                    for o in objects
+                ],
+                "SelectedInstanceId": selected_instance_id,
+            },
+        )
+
     def _on_request_user_input_execute(self, goal_handle):
         goal = goal_handle.request
         button_ids = panel_button_ids(goal.panel_json)
         object_ids = frozenset(o.instance_id for o in goal.objects)
         done_event = threading.Event()
-        self._active_input_goal = {
-            "engine_id": goal.engine_id,
-            "button_ids": button_ids,
-            "object_ids": object_ids,
-            "event": done_event,
-            "result": {
-                "status": RequestUserInput.Result.STATUS_CANCELLED,
-                "button_id": "",
-                "instance_id": "",
-            },
-        }
+        with self._active_input_lock:
+            self._active_input_goal = {
+                "engine_id": goal.engine_id,
+                "goal_handle": goal_handle,
+                "button_ids": button_ids,
+                "object_ids": object_ids,
+                "objects": list(goal.objects),
+                "selected_instance_id": goal.selected_instance_id,
+                "event": done_event,
+                "result": {
+                    "status": RequestUserInput.Result.STATUS_CANCELLED,
+                    "button_id": "",
+                },
+            }
 
         if goal.panel_json:
             self.ue.call_function("UpdatePanel", {"PanelJson": goal.panel_json})
         if goal.objects:
-            self.ue.call_function(
-                "UpdateDetectedObjects",
-                {
-                    "Objects": [
-                        {
-                            "instance_id": o.instance_id,
-                            "perception_class": o.perception_class,
-                            "box": list(o.box),
-                            "stream_id": goal.engine_id,
-                        }
-                        for o in goal.objects
-                    ]
-                },
-            )
+            self._push_engine_objects(goal.engine_id, goal.objects, goal.selected_instance_id)
 
         try:
             while not done_event.is_set():
@@ -997,18 +1064,60 @@ class UiBridgeNode(Node):
                 time.sleep(0.02)
 
             goal_handle.succeed()
-            state = self._active_input_goal["result"]
-            result = RequestUserInput.Result()
-            result.status = state["status"]
-            result.button_id = state["button_id"]
-            result.instance_id = state["instance_id"]
+            with self._active_input_lock:
+                state = self._active_input_goal["result"]
+                result = RequestUserInput.Result()
+                result.status = state["status"]
+                result.button_id = state["button_id"]
             return result
         finally:
-            self._active_input_goal = None
+            with self._active_input_lock:
+                self._active_input_goal = None
             # Whatever panel/objects this goal pushed on the engine's
             # behalf is now stale -- revert to the normal Orchestrator-
             # driven state (§5.2.C's "Engine-driven override" note).
             self._rebuild_idle_or_selected_panel()
+
+    def _on_update_user_input_panel(
+        self, request: UpdateUserInputPanel.Request, response: UpdateUserInputPanel.Response
+    ) -> UpdateUserInputPanel.Response:
+        """Lets the engine currently holding an active ``RequestUserInput``
+        goal change what's displayed (new panel/objects/highlighted
+        selection) without completing or restarting the goal -- e.g. after
+        a ``EVENT_OBJECT_TAPPED`` feedback, to say "<object> selected" and
+        highlight it."""
+        with self._ui_control_lock:
+            granted = bool(self._ui_owner_id) and bytes(request.token) == self._ui_token
+        if not granted:
+            response.accepted = False
+            response.message = "token doesn't match the current ui_control grant"
+            return response
+
+        with self._active_input_lock:
+            state = self._active_input_goal
+            if state is None:
+                response.accepted = False
+                response.message = "no active RequestUserInput goal"
+                return response
+            if request.update_panel:
+                state["button_ids"] = panel_button_ids(request.panel_json)
+            if request.update_objects:
+                state["objects"] = list(request.objects)
+                state["object_ids"] = frozenset(o.instance_id for o in request.objects)
+            if request.update_selected:
+                state["selected_instance_id"] = request.selected_instance_id
+            engine_id = state["engine_id"]
+            objects = state["objects"]
+            selected_instance_id = state["selected_instance_id"]
+
+        if request.update_panel:
+            self.ue.call_function("UpdatePanel", {"PanelJson": request.panel_json})
+        if request.update_objects or request.update_selected:
+            self._push_engine_objects(engine_id, objects, selected_instance_id)
+
+        response.accepted = True
+        response.message = ""
+        return response
 
     # ------------------------------------------------------------------
     # Orchestrator -> UE: polled push of world state / detected objects

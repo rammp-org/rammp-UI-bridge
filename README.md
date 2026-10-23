@@ -76,9 +76,13 @@ maintained implementation, matching the interface spec below: Orchestrator
 world-state/detected-objects polling and push, the unified
 `InteractionPanel` scheme (built from a single `UpdatePanel` Remote Control
 call), the two-command UE→bridge dispatch (`select_object`/`button_press`
-with stale-ID error reporting), the `~/request_user_input` action
-server for direct engine↔bridge interaction, and the camera base-layer
-stream (§5.2.A) -- subscribes to the scene camera's raw color/depth topics
+with stale-ID error reporting), the token-gated `~/request_user_input`
+action server + `~/request_user_input/update` service for direct
+engine↔bridge interaction (§3.3.2 -- an object tap is reported to the
+engine as feedback rather than completing the goal, so the engine can
+react to repeated/alternating taps via `UpdateUserInputPanel` before the
+user finally presses a button), and the camera base-layer stream
+(§5.2.A) -- subscribes to the scene camera's raw color/depth topics
 (§3.2) and forwards every frame to UE over the RMSS streaming protocol
 from the [`ramms-tools`](https://github.com/rammp-org/ramms-tools)
 dependency (`ramms_tools.streaming.StreamSender`, see "Prerequisites"
@@ -89,12 +93,14 @@ every engine publishes its own camera to (not per-engine, since only one
 engine can hold execution resources at a time), and forwards those
 frames to UE the same way on a separate channel/`stream_id` -- but only
 once the frame's token is verified against the bridge's own
-`~/overlay_control/{acquire_control,release_control,status}` arbitration
+`~/ui_control/{acquire_control,release_control,status}` arbitration
 endpoints (reusing `rammp_common_interfaces`' AcquireControl/
-ReleaseControl/ControlStatus protocol), so a stale/crashed publisher
+ReleaseControl/ControlStatus protocol -- the same grant also gates
+`~/request_user_input`, since both represent the one currently-active
+engine's exclusive right to talk to the UI), so a stale/crashed publisher
 can't leak frames to UE. No real engine calls `acquire_control`/publishes
-to that topic yet, so this path has only been exercised with synthetic
-test traffic. The
+to that topic or calls `~/request_user_input` yet, so these paths have
+only been exercised with synthetic test traffic. The
 system-status channel (§5.2.B) is not yet implementable -- no hardware
 driver node exists yet in the workspace to source joint/chair state
 from (see "Not yet in scope" in `docs/NODE_INTERFACE.md`).
