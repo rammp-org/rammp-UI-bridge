@@ -103,14 +103,24 @@ callbacks while `execute()` is blocked waiting for them. A
 Both `RequestUserInput` and the overlay-camera topic (`EngineOverlayImage`,
 `docs/NODE_INTERFACE.md` §3.3.1) share one arbitration resource,
 `~/ui_control` on the bridge node (full name: `/ui_bridge_node/ui_control/*`
-at defaults). Acquire it **before** sending a `RequestUserInput` goal, even
-if you're not publishing any overlay frames this time -- the bridge checks
-the token on every goal regardless:
+at defaults). The bridge still mints and owns the token, but
+`AcquireControl.srv`'s own docstring states this service is **"called by
+the task orchestrator and nothing else"** -- so don't call the bridge
+directly. Instead call the Orchestrator's proxy services
+(`~/acquire_ui_control`/`~/release_ui_control`, default node name
+`rammp_orchestrator`), which relay to the bridge on your behalf. This keeps
+the Orchestrator as the single node that links an activated engine to every
+resource it's granted (arm/gripper/base locks work the same way), even
+though it never sees the `RequestUserInput` goal/feedback content itself.
+
+Acquire it **before** sending a `RequestUserInput` goal, even if you're not
+publishing any overlay frames this time -- the bridge checks the token on
+every goal regardless:
 
 ```python
 from rammp_common_interfaces.srv import AcquireControl, ReleaseControl
 
-client = node.create_client(AcquireControl, "/ui_bridge_node/ui_control/acquire_control")
+client = node.create_client(AcquireControl, "/rammp_orchestrator/acquire_ui_control")
 req = AcquireControl.Request(owner_id="drink_dispenser")
 resp = client.call(req)          # resp.accepted, resp.token (uint8[16]), resp.generation
 token = resp.token                # keep this -- stamp every subsequent call with it
@@ -119,7 +129,9 @@ token = resp.token                # keep this -- stamp every subsequent call wit
 This call **seizes**: if another engine (or a stale goal) currently holds
 `ui_control`, you get it anyway and their outstanding goal/overlay frames
 are invalidated. Only acquire it when you're actually about to ask for
-input -- don't hold it for your whole action.
+input -- don't hold it for your whole action. Release it the same way, via
+`/rammp_orchestrator/release_ui_control` (`ReleaseControl.srv`), not the
+bridge's own release service.
 
 ### 2.2 Decide: are the targets tappable objects, plain buttons, or both?
 
@@ -245,7 +257,7 @@ Once you're done with this input step, release the token so another engine
 (or the base scene camera) can use `ui_control` again:
 
 ```python
-release_client.call(ReleaseControl.Request(token=token))
+release_client.call(ReleaseControl.Request(token=token))  # against /rammp_orchestrator/release_ui_control
 ```
 
 The bridge automatically reverts the UE panel to whatever the
