@@ -40,9 +40,19 @@ a thin transport layer over the framework-agnostic ``core/orchestrator.py``.
 
 Note: the Gen1 prototype GUI bridge (``rammp_prototype_gui.Gui_bridge``)
 also streamed camera images/depth/masks to UE and mapped real robot joint
-states into a UE skeleton (§5.2.A/B here). The hardware node side (§5.2.B,
-joint states/chair speed) still has no ROS2-side source. The scene camera
-(§3.2) now does -- this node subscribes directly to its raw color/depth
+states into a UE skeleton (§5.2.A/B here), via a hardcoded 53-element
+float array keyed by fixed skeleton-bone indices for its specific
+chair+arm hardware (``set_ui_joints``). This node does **not** carry that
+scheme forward -- §3.4/§5.2.B instead forwards every ``sensor_msgs/msg/
+JointState`` arriving on ``arm_joint_states_topic`` (default
+``/joint_states``) through **by name**, not by a hardcoded index layout
+(see ``_on_arm_joint_states``/``_forward_arm_joint_states``), so it needs
+no bridge-side knowledge of which joints exist or in what order -- UE's
+own blueprint maps each joint name to its skeleton bone. This is the only
+mock/real hardware node this bridge has wired up for §3.4 so far (one
+topic, all of the arm's joints); chair/base telemetry (also part of
+§5.2.B) still has no ROS2-side source. The scene camera (§3.2) also has
+a real source -- this node subscribes directly to its raw color/depth
 topics (see ``_on_scene_camera_color``/``_on_scene_camera_depth``) and
 forwards every frame to UE as the §5.2.A base layer, over the RMSS
 streaming protocol (``ramms_tools.streaming.StreamSender`` -- a TCP client
@@ -69,6 +79,7 @@ for a bridge-owned resource instead.
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 import time
@@ -80,7 +91,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, qos_profile_sensor_data
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Bool
 
 from rammp_common_interfaces.msg import ControlStatus
@@ -308,6 +319,16 @@ class UiBridgeNode(Node):
         # socket from the Remote Control WebSocket above).
         self.declare_parameter("ue_stream_port", 30030)
         self.declare_parameter("ue_stream_reconnect_period", 3.0)
+        # §3.4 Bridge <-> Hardware node / §5.2.B system status: the arm
+        # driver's (or its mock's) sensor_msgs/msg/JointState topic, covering
+        # every arm joint -- see sheppy's `arm` node (rammp-deployments'
+        # december_2026/sheppy-manifest.yaml), whose mock alternative
+        # (arm_mock) publishes this same topic name with empty name/position
+        # arrays for wiring, and whose real alternative (kinova_gen3_driver)
+        # publishes the Kinova Gen3's 7 arm joints plus the 2F-85 gripper's
+        # own joint. Forwarded to UE by name (_on_arm_joint_states), not a
+        # hardcoded index layout -- see the module docstring.
+        self.declare_parameter("arm_joint_states_topic", "/joint_states")
 
         self._ns = self.get_parameter("orchestrator_ns").value
         self._service_wait_timeout = (
@@ -354,6 +375,14 @@ class UiBridgeNode(Node):
         # executor threads.
         self._latest_engine_overlay: Image | None = None
         self._engine_overlay_frame_count = 0
+
+        # -- arm joint-state telemetry (§3.4/§5.2.B) --------------------------
+        # No "latest frame" buffer/lock needed like the cameras above -- each
+        # JointState is forwarded to UE immediately as a single Remote
+        # Control call (small structured data, not a streamed frame), so
+        # there's nothing to hold between messages except the frame counter
+        # used for throttled logging.
+        self._arm_joint_states_frame_count = 0
 
         # -- ui-control arbitration state (§3.3.1/§3.3.2) ----------------------
         # This node is the arbitration *server* for the "UI control"
@@ -505,6 +534,13 @@ class UiBridgeNode(Node):
             qos_profile_sensor_data,
             callback_group=self._cb_group,
         )
+        self._arm_joint_states_sub = self.create_subscription(
+            JointState,
+            self.get_parameter("arm_joint_states_topic").value,
+            self._on_arm_joint_states,
+            qos_profile_sensor_data,
+            callback_group=self._cb_group,
+        )
 
         self._push_idle_panel()
 
@@ -513,7 +549,8 @@ class UiBridgeNode(Node):
             f"{self.get_parameter('ue_host').value} <-> Orchestrator at '{self._ns}'; "
             f"scene camera color='{self.get_parameter('scene_camera_color_topic').value}' "
             f"depth='{self.get_parameter('scene_camera_depth_topic').value}' "
-            f"engine overlay='{self.get_parameter('engine_overlay_topic').value}' -> "
+            f"engine overlay='{self.get_parameter('engine_overlay_topic').value}' "
+            f"arm joint states='{self.get_parameter('arm_joint_states_topic').value}' -> "
             f"UE stream port {self.get_parameter('ue_stream_port').value}"
         )
 
@@ -603,6 +640,44 @@ class UiBridgeNode(Node):
                 )
         except (RuntimeError, OSError) as exc:
             self.get_logger().warning(f"failed to forward scene camera depth frame to UE: {exc}")
+
+    # ------------------------------------------------------------------
+    # Bridge <-> Hardware node (§3.4): arm joint-state telemetry, forwarded
+    # to UE as the §5.2.B system-status channel.
+    #
+    # Always-on and independent of engine selection (unlike §3.3's
+    # per-engine overlay camera) -- the arm driver (or its sheppy mock,
+    # arm_mock) publishes sensor_msgs/msg/JointState on a single fixed
+    # topic covering every arm joint, no per-robot topic table needed.
+    # Forwarded by name, not a hardcoded skeleton-bone index array like the
+    # Gen1 prototype's set_ui_joints -- UE's own blueprint resolves each
+    # joint name to its bone. Positions are converted radians -> degrees,
+    # matching Gen1's convention (UE skeletons author joint angles in
+    # degrees). An empty JointState (name=[], position=[]) -- e.g. from
+    # arm_mock, which exists only to keep this topic wired up on a
+    # workstation profile -- forwards as empty arrays; UE is expected to
+    # simply leave the skeleton unchanged when it receives no joints.
+    # ------------------------------------------------------------------
+    def _on_arm_joint_states(self, msg: JointState) -> None:
+        self._arm_joint_states_frame_count += 1
+        count = self._arm_joint_states_frame_count
+        if count == 1 or count % 100 == 0:
+            self.get_logger().info(
+                f"arm joint states: frame #{count} ({len(msg.name)} joint(s))"
+            )
+        self._forward_arm_joint_states(msg)
+
+    def _forward_arm_joint_states(self, msg: JointState) -> None:
+        if not self.ue.is_connected():
+            return
+        try:
+            positions_deg = [p * 180.0 / math.pi for p in msg.position]
+            self.ue.call_function(
+                "UpdateArmJointStates",
+                {"Names": list(msg.name), "PositionsDeg": positions_deg},
+            )
+        except (RuntimeError, OSError) as exc:
+            self.get_logger().warning(f"failed to forward arm joint states to UE: {exc}")
 
     # ------------------------------------------------------------------
     # Bridge <-> Engine node (§3.3.1): a single shared overlay-camera topic,

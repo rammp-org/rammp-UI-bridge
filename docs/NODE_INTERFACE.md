@@ -564,25 +564,62 @@ rejected outright.
 `~/request_user_input`/`~/request_user_input/update` yet, so only this
 synthetic traffic has verified the path.
 
-### 3.4 Bridge ↔ Hardware node
+### 3.4 Bridge ↔ Hardware node -- **arm joint states implemented, chair/base still TBD**
 
-No shared interface package defines this today either, and no hardware
-driver node exists in this workspace yet. Unlike §3.3's engine camera
-(which only exists/matters while a specific engine is active), this
-telemetry -- arm joint states, chair/base speed and status -- is
+No shared interface package defines this (it's plain `sensor_msgs/msg/
+JointState`, no bridge-specific message type needed). Unlike §3.3's engine
+camera (which only exists/matters while a specific engine is active),
+this telemetry -- arm joint states, chair/base speed and status -- is
 **always-on and independent of engine selection**, analogous to how
-§3.2's scene camera is independent of Perception. It's expected to come
-from whatever node(s) directly own that hardware (e.g. an arm driver
-publishing `/joint_states`, a base/chair driver publishing speed/odometry/
-fault status) rather than being proxied through any engine or through the
+§3.2's scene camera is independent of Perception. It comes from whatever
+node(s) directly own that hardware (e.g. an arm driver publishing
+`/joint_states`, a base/chair driver publishing speed/odometry/fault
+status) rather than being proxied through any engine or through the
 Orchestrator's generic World-State JSON snapshot (`get_world_state`'s
 `snapshot_json`, not meant for high-frequency structured telemetry).
 
-This is the source for §5.2.B's "system status" channel.
+**Implemented: arm joint states.** The bridge subscribes directly to
+`arm_joint_states_topic` (default `/joint_states`,
+`sensor_msgs/msg/JointState`) -- see `rammp-deployments`'
+`december_2026/sheppy-manifest.yaml`'s `arm` node, whose real alternative
+(`kinova_gen3_driver`/`kinova_gen3_driver_nightly`) publishes the Kinova
+Gen3's 7 arm joints plus the 2F-85 gripper's own joint on this topic, and
+whose mock alternative (`arm_mock`) publishes the same topic name with
+empty `name`/`position` arrays, purely to keep it wired up on a
+workstation profile with no arm attached. **Design decision: forward
+every joint in the message by name, not a fixed index layout.** The Gen1
+prototype's `set_ui_joints` built a hardcoded 53-element float array
+keyed to specific skeleton-bone indices for its one chair+arm robot --
+that doesn't generalize (per §7's prior note) and this bridge has no
+chair/base to combine it with anyway. Instead, `_on_arm_joint_states`/
+`_forward_arm_joint_states` push the message's `name`/`position` arrays
+through as-is (radians converted to degrees, matching Gen1's degree
+convention for skeleton authoring) via a Remote Control call,
+`UpdateArmJointStates` (`{"Names": [...], "PositionsDeg": [...]}`) -- UE's
+own blueprint is responsible for mapping each joint name to its own
+skeleton bone, so the bridge needs no knowledge of the UE skeleton's
+layout and "use that for all the arm joints" (whatever the publishing
+node names them) just works without a bridge-side mapping table. An
+empty `JointState` (the mock) forwards as empty arrays; UE is expected to
+simply leave its skeleton unchanged on an empty update.
 
-**Still TBD** (tracked in §7): no hardware driver node/topic exists in
-this workspace yet, so the exact topic names/message types can't be
-pinned down until one does.
+This is the source for §5.2.B's "system status" channel (the arm-joints
+portion of it).
+
+**Verified:** a live smoke test (bridge node + a plain publisher node in
+one process) confirmed a populated `JointState` (7 arm joints + gripper)
+forwards with matching names and correctly-converted degree values, and
+that an empty `JointState` (the real shape of `arm_mock`'s own output)
+forwards as empty arrays without error. The jetson's `arm_mock` (sheppy
+node `arm`) has been confirmed running and publishing `/joint_states` on
+the shared robot; the bridge's own deployed copy on that jetson has not
+yet been updated to this session's commit, so end-to-end verification
+against the live mock over the real ROS graph is still pending a
+redeploy (not requested this session).
+
+**Still TBD** (tracked in §7): chair/base speed and status -- no
+chair/base driver (mock or real) exists in this workspace yet, so that
+part of §5.2.B remains unimplemented.
 
 
 ## 4. UI-facing interface (ROS2 server/publisher side)
@@ -734,16 +771,18 @@ either.
 
 Arm joints, chair/base speed and status, and similar small/structured/
 high-frequency telemetry -- pushed via Remote Control preset function
-calls (like Gen1's `setJoints`/`UpdateSystemState`), **not** the
-streaming channel, since this is small structured data rather than bulk
-pixel payloads. Sourced via direct **bridge ↔ hardware node**
-subscriptions (§3.4), not through the Orchestrator's generic World State
-and not through any engine -- this telemetry is always-on and
-independent of which engine (if any) is currently active, unlike §3.3's
-per-engine camera. **Open/TBD:** no hardware driver node in this
-workspace publishes this yet (§3.4), so the concrete topic names/shapes
-can't be pinned down until a real hardware driver (e.g. an arm or
-chair/base controller) exists.
+calls (not Gen1's own `setJoints`/`UpdateSystemState` names, see §3.4 for
+why: `UpdateArmJointStates` instead), **not** the streaming channel,
+since this is small structured data rather than bulk pixel payloads.
+Sourced via direct **bridge ↔ hardware node** subscriptions (§3.4), not
+through the Orchestrator's generic World State and not through any
+engine -- this telemetry is always-on and independent of which engine
+(if any) is currently active, unlike §3.3's per-engine camera.
+**Implemented: arm joints** (§3.4) -- forwarded by joint name, not a
+hardcoded skeleton-bone index array. **Open/TBD:** chair/base speed and
+status -- no chair/base driver (mock or real) in this workspace publishes
+that yet (§3.4), so the concrete topic names/shapes can't be pinned down
+until one exists.
 
 
 #### C. `InteractionPanel` -- task/capability prompt (renamed from "information")
@@ -946,16 +985,29 @@ to the task/button-dialog lifecycle.
   feedback message → `UpdateUserInputPanel` with a matching and then a
   mismatched token → a `button_press` completing the goal → a
   second goal rejected on a stale token) has verified the path.
-- **System status telemetry for §5.2.B (§3.4 Hardware node)** is
-  undefined -- no hardware driver node in this workspace publishes joint
-  states or chair/base speed and status today. System status is an
-  *intended* channel of this bridge, but implementation is blocked on a
-  real hardware driver node existing first.
-- Joint-state → UE skeleton **mapping logic** (the specific joint-index
-  layout the Gen1 prototype's `set_ui_joints` hardcoded for its chair+arm
-  robot) does not carry over as-is, since it was specific to that
-  hardware's joint layout -- §5.2.B/§3.4 needs its own mapping once a real
-  hardware driver's joint-state shape is known.
+- **Arm joint states for §5.2.B (§3.4 Hardware node) are now
+  implemented**, forwarding `arm_joint_states_topic` (default
+  `/joint_states`) by joint name (not a hardcoded skeleton-bone index
+  array like the Gen1 prototype's `set_ui_joints`), as a Remote Control
+  call (`UpdateArmJointStates`). Verified via an in-process live smoke
+  test (populated `JointState` forwards with matching names/correctly
+  degree-converted positions; an empty one, matching the real shape of
+  sheppy's `arm_mock`, forwards as empty arrays without error) and
+  against the jetson's live `arm_mock` directly (confirmed running,
+  publishing `/joint_states`) -- but the bridge's own copy deployed on
+  that jetson predates this session's commits, so full end-to-end
+  verification over the live ROS graph (jetson-deployed bridge ↔
+  jetson-deployed mock ↔ real UE) is still pending a redeploy. **Chair/
+  base speed and status, the other half of §5.2.B, remains unimplemented**
+  -- no chair/base driver (mock or real) exists in this workspace yet.
+- Joint-state → UE skeleton **mapping is now name-keyed, not a hardcoded
+  index layout.** The Gen1 prototype's `set_ui_joints` hardcoded a
+  53-element float array keyed to fixed skeleton-bone indices, specific
+  to its one chair+arm robot -- as previously noted here, that doesn't
+  carry over. §3.4/§5.2.B's `_forward_arm_joint_states` instead forwards
+  whatever `name`/`position` pairs the arm's `JointState` message
+  contains, letting UE's own blueprint resolve each name to a bone; the
+  bridge needs no per-robot joint layout at all for this to work.
 - **Idle/default `InteractionPanel` content is undefined.** The
   `hibernate` note (§3.1.1) says the bridge clears the panel "or replaces
   it with whatever default/idle panel state is defined" once the

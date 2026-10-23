@@ -101,9 +101,16 @@ engine's exclusive right to talk to the UI), so a stale/crashed publisher
 can't leak frames to UE. No real engine calls `acquire_control`/publishes
 to that topic or calls `~/request_user_input` yet, so these paths have
 only been exercised with synthetic test traffic. The
-system-status channel (§5.2.B) is not yet implementable -- no hardware
-driver node exists yet in the workspace to source joint/chair state
-from (see "Not yet in scope" in `docs/NODE_INTERFACE.md`).
+system-status channel (§5.2.B) now covers arm joints -- subscribes to
+`arm_joint_states_topic` (default `/joint_states`,
+`sensor_msgs/msg/JointState`, published by the arm driver or its sheppy
+mock `arm_mock`) and forwards every joint through to UE **by name**
+(not a hardcoded skeleton-bone index array like the Gen1 prototype),
+radians converted to degrees, via a `UpdateArmJointStates` Remote
+Control call -- but chair/base speed and status, the rest of §5.2.B,
+is still not implementable, since no chair/base driver (mock or real)
+exists yet in the workspace (see "Not yet in scope" in
+`docs/NODE_INTERFACE.md`).
 
 An earlier Python prototype that predates this package (built against an
 outdated draft of `docs/NODE_INTERFACE.md`, before the `InteractionPanel`
