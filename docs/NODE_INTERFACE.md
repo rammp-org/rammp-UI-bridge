@@ -552,11 +552,15 @@ Remote Control function calls:
 
 #### A. Camera stream (video data plane)
 
-Reuses the Gen1 prototype's TCP streaming mechanism, vendored unchanged
-into `rammp_ui_bridge/streaming/` (`protocol.py` + `sender.py`, `client.py`
-not needed -- the bridge only ever sends) -- `StreamSender.send_image`/
-`send_depth_uint16` framing, not the Remote Control WebSocket, since this
-is bulk pixel data. Two layers, not two interchangeable sources:
+Uses the RMSS binary TCP streaming protocol from
+[rammp-org/ramms-tools](https://github.com/rammp-org/ramms-tools) (MIT
+licensed), vendored unchanged into `rammp_ui_bridge/streaming/`
+(`protocol.py`, `sender.py`, `client.py`, `compression.py` -- the full
+`ramms_tools.streaming` subpackage, with only its internal imports made
+package-relative; the bridge only uses `StreamSender`, since it never
+receives) -- `StreamSender.send_image`/`send_depth_uint16` framing, not
+the Remote Control WebSocket, since this is bulk pixel data. Two layers,
+not two interchangeable sources:
 
 - **Base layer -- RGBD from the scene camera (§3.2), always streaming.**
   Color + depth, continuously, regardless of whether any engine is

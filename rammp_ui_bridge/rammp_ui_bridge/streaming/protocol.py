@@ -33,52 +33,49 @@ HEADER_SIZE = 32
 HEADER_FMT = "<4sBBHHIqIIH"  # 32 bytes total
 
 # Sanity-check that the struct matches HEADER_SIZE
-assert (
-    struct.calcsize(HEADER_FMT) == HEADER_SIZE
-), f"Header format size mismatch: {struct.calcsize(HEADER_FMT)} != {HEADER_SIZE}"
+assert struct.calcsize(HEADER_FMT) == HEADER_SIZE, (
+    f"Header format size mismatch: {struct.calcsize(HEADER_FMT)} != {HEADER_SIZE}"
+)
 
 
 class MessageType(IntEnum):
     """RMSS message types."""
-
-    NONE = 0x00
-    FRAME_RGB = 0x01
-    FRAME_DEPTH = 0x02
-    FRAME_RGBD = 0x03
-    FRAME_MOTION = 0x04
-    POINT_CLOUD = 0x05
-    OCTO_MAP = 0x06
-    IMAGE_DATA = 0x10
-    FRAME_DATA = 0x11
+    NONE          = 0x00
+    FRAME_RGB     = 0x01
+    FRAME_DEPTH   = 0x02
+    FRAME_RGBD    = 0x03
+    FRAME_MOTION  = 0x04
+    POINT_CLOUD   = 0x05
+    OCTO_MAP      = 0x06
+    IMAGE_DATA    = 0x10
+    FRAME_DATA    = 0x11
     METADATA_ONLY = 0xF0
-    SUBSCRIBE = 0xF1
-    UNSUBSCRIBE = 0xF2
-    ACK = 0xFD
-    ERROR = 0xFE
-    PING = 0xFF
+    SUBSCRIBE     = 0xF1
+    UNSUBSCRIBE   = 0xF2
+    ACK           = 0xFD
+    ERROR         = 0xFE
+    PING          = 0xFF
 
 
 class Compression(IntEnum):
     """Compression types stored in the Flags field."""
-
     NONE = 0
-    LZ4 = 1
+    LZ4  = 1
     JPEG = 2
-    PNG = 3
+    PNG  = 3
 
 
 # Flag bit constants
-FLAG_COMPRESSED = 0x0001
-FLAG_COMP_TYPE_MASK = 0x0006
+FLAG_COMPRESSED      = 0x0001
+FLAG_COMP_TYPE_MASK  = 0x0006
 FLAG_COMP_TYPE_SHIFT = 1
-FLAG_HAS_ALPHA = 0x0008
-FLAG_HIGH_PRIORITY = 0x0010
+FLAG_HAS_ALPHA       = 0x0008
+FLAG_HIGH_PRIORITY   = 0x0010
 
 
 @dataclass
 class StreamHeader:
     """32-byte RMSS message header."""
-
     message_type: MessageType = MessageType.NONE
     channel_id: int = 0
     flags: int = 0
@@ -126,18 +123,8 @@ class StreamHeader:
         """Parse a 32-byte header.  Returns None on magic/version mismatch."""
         if len(data) < HEADER_SIZE:
             return None
-        (
-            magic,
-            ver,
-            msg_type,
-            channel,
-            flags,
-            seq,
-            ts,
-            meta_len,
-            payload_len,
-            _reserved,
-        ) = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
+        (magic, ver, msg_type, channel, flags, seq,
+         ts, meta_len, payload_len, _reserved) = struct.unpack(HEADER_FMT, data[:HEADER_SIZE])
         if magic != MAGIC or ver != VERSION:
             return None
         h = cls()
@@ -159,7 +146,6 @@ class StreamHeader:
 @dataclass
 class StreamMessage:
     """Complete RMSS message: header + metadata + payload."""
-
     header: StreamHeader = field(default_factory=StreamHeader)
     metadata: bytes = b""
     payload: bytes = b""
@@ -174,7 +160,6 @@ class StreamMessage:
 
     def get_metadata_json(self) -> dict:
         import json
-
         s = self.get_metadata_string()
         return json.loads(s) if s else {}
 
@@ -187,9 +172,7 @@ class StreamMessage:
         return h.to_bytes() + self.metadata + self.payload
 
     @classmethod
-    def deserialize(
-        cls, buf: bytes, offset: int = 0
-    ) -> Optional[tuple["StreamMessage", int]]:
+    def deserialize(cls, buf: bytes, offset: int = 0) -> Optional[tuple["StreamMessage", int]]:
         """
         Try to deserialize one message starting at *offset* in *buf*.
 
@@ -199,7 +182,7 @@ class StreamMessage:
         if available < HEADER_SIZE:
             return None
 
-        header = StreamHeader.from_bytes(buf[offset : offset + HEADER_SIZE])
+        header = StreamHeader.from_bytes(buf[offset:offset + HEADER_SIZE])
         if header is None:
             return None
 

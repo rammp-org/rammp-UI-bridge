@@ -1,22 +1,45 @@
-"""RMSS streaming client -- vendored from the Gen1 prototype
-(``rammp_prototype_gui.streaming``, part of ``rammp-org/Demo-Software``)
-unchanged, per §5.2.A of ``docs/NODE_INTERFACE.md``: the bridge reuses the
-Gen1 TCP streaming protocol/sender for bulk pixel data (camera frames),
-separate from the Remote Control WebSocket (``unreal_remote_websocket``)
-used for everything else.
+"""RMSS binary streaming protocol — Python implementation.
 
-Only ``StreamSender`` (the "bridge is a TCP client of UE's streaming
-server" direction) is vendored -- ``StreamClient`` (the receive side) has
-no use here.
+Provides StreamClient for receiving data from UE and StreamSender for
+sending data to UE, plus the low-level protocol module for
+message framing and compression utilities.
+
+Vendored unchanged (only import paths adjusted to be package-relative)
+from https://github.com/rammp-org/ramms-tools 's ``ramms_tools.streaming``
+(MIT licensed) -- the authoritative source for this protocol/SDK, so this
+bridge doesn't need to depend on the ``ramms-tools`` PyPI/console-tool
+package just for its streaming client.
 """
 
-from .protocol import Compression, MessageType, StreamHeader, StreamMessage
+from .protocol import (
+    HEADER_SIZE,
+    MessageType,
+    Compression,
+    StreamHeader,
+    StreamMessage,
+)
+from .client import StreamClient, ChannelStats
 from .sender import StreamSender
+from .compression import (
+    has_jpeg,
+    has_lz4,
+    decompress_payload,
+    compress_jpeg,
+    compress_lz4,
+)
 
 __all__ = [
-    "Compression",
+    "HEADER_SIZE",
     "MessageType",
+    "Compression",
     "StreamHeader",
     "StreamMessage",
+    "StreamClient",
+    "ChannelStats",
     "StreamSender",
+    "has_jpeg",
+    "has_lz4",
+    "decompress_payload",
+    "compress_jpeg",
+    "compress_lz4",
 ]

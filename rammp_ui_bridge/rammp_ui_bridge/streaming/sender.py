@@ -46,14 +46,28 @@ Usage::
                       compression=Compression.JPEG)
 
     sender.disconnect()
+
+Non-blocking mode (default)::
+
+    # Queue size is configurable
+    sender = StreamSender("127.0.0.1", 30030, queue_size=4)
+    sender.connect()
+
+    # send_image / send_depth etc. are non-blocking.
+    # If the queue is full the oldest queued message is dropped (FIFO eviction),
+    # keeping the most recently enqueued frame.
+    sender.send_numpy_image(channel=0, array=img, group="wrist", role="color")
+
+    # Synchronous mode (legacy behaviour) — blocks on each send:
+    sender = StreamSender("127.0.0.1", 30030, queue_size=0)
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import socket
 import queue
+import socket
 import threading
 import time
 from pathlib import Path
