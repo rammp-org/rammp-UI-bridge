@@ -460,82 +460,92 @@ string engine_id                                # calling engine's own Capabilit
 uint8[16] token                                  # must match the current ~/ui_control grant (see
                                                  # §3.3.1 -- the same arbitration resource gates
                                                  # both the overlay camera and this action)
-string panel_json                              # optional: InteractionPanel-shaped JSON
-                                                 # (title/message/buttons, §5.2.C) the engine
-                                                 # wants shown; empty if this request is
-                                                 # object-only
-ObjectCandidate[] objects                       # optional: candidate objects the user can tap
-                                                 # on this engine's own overlay stream (§3.3.1);
-                                                 # empty if this request is panel-only
-string selected_instance_id                     # optional: one of objects' instance_id to show
-                                                 # as already highlighted when the goal starts
+string request_json
+# JSON object:
+#   {
+#     "panel_json": str,         # optional, default "" -- InteractionPanel-shaped JSON
+#                                # (title/message/buttons/progress/style, §5.2.C) the engine
+#                                # wants shown; omitted/"" if this request is object-only
+#     "objects": [                # optional, default [] -- candidate objects the user can tap
+#                                # on this engine's own overlay stream (§3.3.1); omitted/[]
+#                                # if this request is panel-only
+#       {"instance_id": str, "perception_class": str, "box": [x_min, y_min, x_max, y_max]}
+#     ],
+#     "selected_instance_id": str  # optional, default "" -- one of objects' instance_id to
+#                                # show as already highlighted when the goal starts
+#   }
 # (at least one of panel_json / objects must be non-empty)
 ---
 # result
-uint8 STATUS_BUTTON = 0      # user pressed one of panel_json's buttons
-uint8 STATUS_CANCELLED = 1   # engine cancelled the goal before that happened
-uint8 status
-string button_id             # set iff status == STATUS_BUTTON
+string result_json
+# JSON object:
+#   {"status": "button", "button_id": str}   # user pressed one of panel_json's buttons
+#   {"status": "cancelled"}                  # engine cancelled the goal before that happened
 ---
 # feedback -- sent once per object tap while the goal is still active,
 # never after the result above is sent. An object tap does NOT complete
 # the goal by itself (see point 3 below).
-uint8 EVENT_OBJECT_TAPPED = 0
-uint8 event_type
-string instance_id            # set iff event_type == EVENT_OBJECT_TAPPED
+string feedback_json
+# JSON object: {"event_type": "object_tapped", "instance_id": str}
 ```
 
 ```
 # UpdateUserInputPanel.srv -- called any number of times while a
 # RequestUserInput goal is active, to change what's displayed without
-# completing or restarting it (e.g. after an EVENT_OBJECT_TAPPED
-# feedback, to update the message and highlight the new selection).
+# completing or restarting it (e.g. after an "object_tapped" feedback,
+# to update the message and highlight the new selection).
 
 uint8[16] token
-bool update_panel
-string panel_json              # replaces the current panel entirely; set iff update_panel
-bool update_objects
-ObjectCandidate[] objects      # replaces the current candidate list entirely; set iff update_objects
-bool update_selected
-string selected_instance_id    # highlight this instance_id ("" clears); set iff update_selected
+string request_json
+# JSON object, every key optional -- only present keys are updated, an
+# absent key leaves that aspect unchanged:
+#   {
+#     "panel_json": str,          # replaces the current panel entirely, iff present
+#     "objects": [                # replaces the current candidate list entirely, iff present
+#       {"instance_id": str, "perception_class": str, "box": [x_min, y_min, x_max, y_max]}
+#     ],
+#     "selected_instance_id": str  # highlight this instance_id ("" clears), iff present
+#   }
 ---
 bool accepted
 string message
 ```
 
-`ObjectCandidate` (small, UI-facing -- not `ObjectRecord`, which is
-an Orchestrator/world-state concept): just `{instance_id, perception_class,
-box}`, the minimum UE needs to render and hit-test a tappable box. No
-`stream_id` field is needed per-object since every object in one goal
-implicitly belongs to the calling engine's own overlay stream -- the
-bridge tags them all with that engine's known `stream_id` when forwarding
-to UE.
+Each candidate object in `objects` is `{instance_id, perception_class,
+box}` -- the minimum UE needs to render and hit-test a tappable box; not
+`ObjectRecord` (an Orchestrator/world-state concept). No `stream_id` field
+is needed per-object since every object in one goal implicitly belongs to
+the calling engine's own overlay stream -- the bridge tags them all with
+that engine's known `stream_id` when forwarding to UE. (This shape used to
+be its own ROS message, `ObjectCandidate.msg` -- retired now that
+`objects` travels as plain JSON inside `request_json` instead of a typed
+array field.)
 
 Bridge behavior while a goal is active:
-1. If `panel_json` is non-empty, push it to UE's `InteractionPanel`
-   channel (§5.2.C) immediately -- this **takes over** whatever would
-   otherwise be shown there (e.g. `ExecuteAction` progress, §3.1.1),
-   reverting to the prior content once the goal ends.
-2. If `objects` is non-empty, push them to UE's `UpdateDetectedObjects`
-   channel (§5.2.D) tagged with the engine's own overlay `stream_id` and
-   `selected_instance_id` (initially `goal.selected_instance_id`),
-   exactly like any other detected-objects push -- tappable the same way
-   base-layer objects are.
+1. If `request_json`'s `panel_json` is non-empty, push it to UE's
+   `InteractionPanel` channel (§5.2.C) immediately -- this **takes over**
+   whatever would otherwise be shown there (e.g. `ExecuteAction` progress,
+   §3.1.1), reverting to the prior content once the goal ends.
+2. If `request_json`'s `objects` is non-empty, push them to UE's
+   `UpdateDetectedObjects` channel (§5.2.D) tagged with the engine's own
+   overlay `stream_id` and `selected_instance_id` (initially
+   `request_json`'s own `selected_instance_id`), exactly like any other
+   detected-objects push -- tappable the same way base-layer objects are.
 3. **An object tap does not complete the goal.** The user may tap
    several different candidates in a row while deciding; each tap is
-   reported to the engine as an `EVENT_OBJECT_TAPPED` feedback message
-   instead, and the bridge's own notion of "currently highlighted"
-   updates to match. The engine decides what to do about each tap --
-   typically calling `UpdateUserInputPanel` to change the displayed
-   message and/or `update_selected` to reflect the new choice back to
-   the user -- without the goal ending. The goal only completes when UE
+   reported to the engine as an `{"event_type": "object_tapped", ...}`
+   feedback message instead, and the bridge's own notion of "currently
+   highlighted" updates to match. The engine decides what to do about
+   each tap -- typically calling `UpdateUserInputPanel` with a
+   `selected_instance_id` key to reflect the new choice back to the
+   user -- without the goal ending. The goal only completes when UE
    reports a `button_press` matching one of the current panel's
-   `button_id`s (`STATUS_BUTTON`); by then the engine already knows
-   (from the feedback stream) which object, if any, is selected, and the
-   pressed `button_id` tells it what to do with that selection.
+   `button_id`s (`{"status": "button", ...}`); by then the engine already
+   knows (from the feedback stream) which object, if any, is selected,
+   and the pressed `button_id` tells it what to do with that selection.
 4. The engine can cancel the goal at any time (e.g. it no longer needs
    the answer); the bridge then withdraws whatever panel/objects it had
-   pushed on the engine's behalf and reports `STATUS_CANCELLED`.
+   pushed on the engine's behalf and reports `{"status": "cancelled"}`.
 5. Only one engine can have a goal active at a time, matching the
    Orchestrator's own one-engine-executing-at-a-time invariant -- a
    second concurrent goal is rejected by the bridge, as is any goal whose
@@ -557,8 +567,8 @@ candidate objects, simulate two alternating object taps (each produces
 exactly one feedback message, goal stays active), call
 `UpdateUserInputPanel` with the right token (accepted) and a wrong token
 (rejected), simulate a `button_press` (completes the goal with
-`STATUS_BUTTON`), and confirm a second goal with a stale/wrong token is
-rejected outright.
+`{"status": "button", ...}`), and confirm a second goal with a
+stale/wrong token is rejected outright.
 
 **Still open:** no real engine in this workspace calls
 `~/request_user_input`/`~/request_user_input/update` yet, so only this
@@ -972,7 +982,7 @@ to the task/button-dialog lifecycle.
   subscribed to, frames forwarded to UE over the `ramms_tools` RMSS
   streaming protocol (a pip dependency, see README's Prerequisites
   section). The overlay layer's detected-object semantics (class,
-  instance, box) are already covered by §3.3.2's `ObjectCandidate`
+  instance, box) are already covered by §3.3.2's `request_json.objects`
   independent of whether/when a real wrist-camera publishes; the base
   layer's equivalent is the `ObjectRecord` extension above.
 - **§3.3.2's `RequestUserInput`/`UpdateUserInputPanel` are now

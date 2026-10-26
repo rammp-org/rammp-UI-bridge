@@ -14,6 +14,16 @@ easy for UE's Remote Control API and Blueprint JSON parsing to consume
 generically (build N buttons from an array) without a schema migration
 every time a new panel shape is needed.
 
+**Where it lives on the wire (updated):** `RequestUserInput`/
+`UpdateUserInputPanel` no longer carry `panel_json` as its own top-level
+field. Both now carry one consolidated `request_json` string instead, and
+`panel_json` is one of its optional keys (itself still a JSON string,
+i.e. a JSON-string-within-a-JSON-object) -- see
+`rammp-UI-bridge/docs/NODE_INTERFACE.md` and `ENGINE_UI_INTEGRATION_GUIDE.md`
+for the full `request_json`/`result_json`/`feedback_json` shapes. This
+document only covers the `panel_json` **value** itself (the
+`InteractionPanel` object), which is unchanged by that wrapping.
+
 ---
 
 ## 1. Who produces/consumes it
@@ -21,8 +31,8 @@ every time a new panel shape is needed.
 | Direction | Field | Producer | Consumer |
 |---|---|---|---|
 | Orchestrator-driven panels | n/a (bridge builds these itself from Orchestrator service responses) | `ui_bridge_node.py`'s `build_panel()` | pushed to UE via `UpdatePanel({"PanelJson": ...})` |
-| Engine-driven panels | `RequestUserInput.Goal.panel_json` | the active engine (already `InteractionPanel`-shaped) | bridge pushes as-is to UE, resolves `button_press` against the goal instead of the normal Orchestrator-call mapping |
-| Engine-driven panel update | `UpdateUserInputPanel.Request.panel_json` | the active engine, mid-goal | bridge pushes as-is to UE, iff `request.update_panel` is true |
+| Engine-driven panels | `RequestUserInput.Goal.request_json["panel_json"]` | the active engine (already `InteractionPanel`-shaped) | bridge pushes as-is to UE, resolves `button_press` against the goal instead of the normal Orchestrator-call mapping |
+| Engine-driven panel update | `UpdateUserInputPanel.Request.request_json["panel_json"]` | the active engine, mid-goal | bridge pushes as-is to UE, iff `"panel_json"` is present as a key in `request_json` |
 
 **Transport (resolved):** a Remote Control function call,
 `UpdatePanel({"PanelJson": "<json string>"})` -- not the streaming channel.
@@ -192,7 +202,7 @@ error panels.
 }
 ```
 
-### 5.7 Engine-driven custom panel (via `RequestUserInput.panel_json`, confirm-before-action)
+### 5.7 Engine-driven custom panel (via `RequestUserInput`'s `request_json["panel_json"]`, confirm-before-action)
 ```json
 {
   "message": "Open the fridge door?",
@@ -240,11 +250,13 @@ panel-*schema* questions, so out of scope for this doc):
   falls back to the raw `action_id` as the button label (§7 of
   `NODE_INTERFACE.md`) -- a real UX label field is a future `CapabilityManifest`
   change, not a `panel_json` schema change.
-- The overlay-camera / engine-driven panel path (§3.3.2) is implemented but
-  has not been exercised against a real engine yet (no mock engine
-  currently calls `RequestUserInput` with a non-empty `objects` list) --
-  functionally orthogonal to this schema, which is already fully exercised
-  via the engine-driven `panel_json`-only case (fridge/pick-place UI demos).
+- The overlay-camera / engine-driven panel path (§3.3.2) is implemented and
+  now exercised by a mock engine too (`pick_place_ui_demo.py`'s `pick`
+  action sends `request_json` with a non-empty `objects` list), but still
+  not exercised against a **real** engine -- functionally orthogonal to
+  this schema, which is already fully exercised via the engine-driven
+  `panel_json`-only case (fridge UI demo) and the `panel_json` + `objects`
+  case (pick-place UI demo).
 
 ---
 
@@ -258,7 +270,7 @@ panel-*schema* questions, so out of scope for this doc):
   actually produces).
 - `rammp-interfaces-ros2/rammp_ui_bridge_interfaces/action/RequestUserInput.action`,
   `rammp-interfaces-ros2/rammp_ui_bridge_interfaces/srv/UpdateUserInputPanel.srv`
-  -- the two wire fields named `panel_json`.
+  -- the two wire fields (`request_json`) whose `panel_json` key carries this schema's value.
 - `rammp-UI-bridge/docs/NODE_INTERFACE.md` §5.2.C -- original design
   rationale (superset of the four legacy `UpdateSelection`/`UpdateProgress`/
   `UpdateActionResult`/`UpdateBridgeError` functions) and the "Open/TBD"

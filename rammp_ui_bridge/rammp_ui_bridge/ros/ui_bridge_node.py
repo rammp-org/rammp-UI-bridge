@@ -237,6 +237,25 @@ def panel_button_ids(panel_json: str) -> frozenset[str]:
     return frozenset(b.get("button_id", "") for b in payload.get("buttons", []) if b.get("button_id"))
 
 
+def parse_request_json(request_json: str) -> dict[str, Any]:
+    """Parses a ``RequestUserInput`` goal's or ``UpdateUserInputPanel``
+    request's ``request_json`` (§3.3.2) into a plain dict -- keys present:
+    ``panel_json`` (str), ``objects`` (list of ``{instance_id,
+    perception_class, box}`` dicts), ``selected_instance_id`` (str), each
+    only present if the caller included it (``UpdateUserInputPanel``
+    distinguishes "update this aspect" from "leave it alone" purely by key
+    presence, see rammp-interfaces-ros2's UpdateUserInputPanel.srv).
+    Malformed/non-object JSON parses to ``{}`` rather than raising, same
+    fail-soft convention as ``panel_button_ids``."""
+    if not request_json:
+        return {}
+    try:
+        payload = json.loads(request_json)
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def selection_panel_buttons(activations) -> list[tuple[str, str, str, dict[str, Any]]]:
     """Builds the button list for a just-selected object: one button per
     available action across every claiming engine (§3.1's ``EngineActivation``),
@@ -860,7 +879,7 @@ class UiBridgeNode(Node):
         also run for it). A matched ``select_object`` does NOT end the
         goal -- the user may tap several different objects in a row while
         deciding -- it's reported to the engine as feedback instead
-        (``RequestUserInput.Feedback.EVENT_OBJECT_TAPPED``), and
+        (``feedback_json``'s ``event_type: "object_tapped"``), and
         ``_active_input_goal``'s own ``selected_instance_id`` is updated so
         a freshly-pushed panel/objects (e.g. from
         ``_on_update_user_input_panel``) reflects it. Only a matched
@@ -879,15 +898,14 @@ class UiBridgeNode(Node):
                 button_id = command.get("button_id", "")
                 if button_id not in goal_state["button_ids"]:
                     return False
-                goal_state["result"]["status"] = RequestUserInput.Result.STATUS_BUTTON
+                goal_state["result"]["status"] = "button"
                 goal_state["result"]["button_id"] = button_id
                 goal_state["event"].set()
                 return True
             else:
                 return False
         feedback = RequestUserInput.Feedback()
-        feedback.event_type = RequestUserInput.Feedback.EVENT_OBJECT_TAPPED
-        feedback.instance_id = instance_id
+        feedback.feedback_json = json.dumps({"event_type": "object_tapped", "instance_id": instance_id})
         goal_handle.publish_feedback(feedback)
         return True
 
@@ -1083,30 +1101,32 @@ class UiBridgeNode(Node):
                 "another engine's goal is already active"
             )
             return GoalResponse.REJECT
-        if not goal_request.panel_json and not goal_request.objects:
+        request = parse_request_json(goal_request.request_json)
+        if not request.get("panel_json") and not request.get("objects"):
             self.get_logger().warning(
                 f"rejecting RequestUserInput from '{goal_request.engine_id}': "
-                "neither panel_json nor objects set"
+                "neither panel_json nor objects set in request_json"
             )
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
     def _push_engine_objects(
-        self, engine_id: str, objects, selected_instance_id: str
+        self, engine_id: str, objects: list[dict[str, Any]], selected_instance_id: str
     ) -> None:
         """Pushes an engine's ``RequestUserInput`` candidate objects to UE's
         ``UpdateDetectedObjects`` channel, tagged with that engine's own
         overlay ``stream_id`` and the currently-highlighted selection (if
         any) -- shared by the goal's initial push and every subsequent
-        ``_on_update_user_input_panel`` call."""
+        ``_on_update_user_input_panel`` call. ``objects`` is already a list
+        of plain dicts (parsed from ``request_json``), not ROS messages."""
         self.ue.call_function(
             "UpdateDetectedObjects",
             {
                 "Objects": [
                     {
-                        "instance_id": o.instance_id,
-                        "perception_class": o.perception_class,
-                        "box": list(o.box),
+                        "instance_id": o.get("instance_id", ""),
+                        "perception_class": o.get("perception_class", ""),
+                        "box": list(o.get("box", (0.0, 0.0, 0.0, 0.0))),
                         "stream_id": engine_id,
                     }
                     for o in objects
@@ -1117,8 +1137,12 @@ class UiBridgeNode(Node):
 
     def _on_request_user_input_execute(self, goal_handle):
         goal = goal_handle.request
-        button_ids = panel_button_ids(goal.panel_json)
-        object_ids = frozenset(o.instance_id for o in goal.objects)
+        request = parse_request_json(goal.request_json)
+        panel_json = request.get("panel_json") or ""
+        objects = request.get("objects") or []
+        selected_instance_id = request.get("selected_instance_id") or ""
+        button_ids = panel_button_ids(panel_json)
+        object_ids = frozenset(o.get("instance_id", "") for o in objects)
         done_event = threading.Event()
         with self._active_input_lock:
             self._active_input_goal = {
@@ -1126,26 +1150,26 @@ class UiBridgeNode(Node):
                 "goal_handle": goal_handle,
                 "button_ids": button_ids,
                 "object_ids": object_ids,
-                "objects": list(goal.objects),
-                "selected_instance_id": goal.selected_instance_id,
+                "objects": list(objects),
+                "selected_instance_id": selected_instance_id,
                 "event": done_event,
                 "result": {
-                    "status": RequestUserInput.Result.STATUS_CANCELLED,
+                    "status": "cancelled",
                     "button_id": "",
                 },
             }
 
-        if goal.panel_json:
-            self.ue.call_function("UpdatePanel", {"PanelJson": goal.panel_json})
-        if goal.objects:
-            self._push_engine_objects(goal.engine_id, goal.objects, goal.selected_instance_id)
+        if panel_json:
+            self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
+        if objects:
+            self._push_engine_objects(goal.engine_id, objects, selected_instance_id)
 
         try:
             while not done_event.is_set():
                 if goal_handle.is_cancel_requested:
                     goal_handle.canceled()
                     result = RequestUserInput.Result()
-                    result.status = RequestUserInput.Result.STATUS_CANCELLED
+                    result.result_json = json.dumps({"status": "cancelled"})
                     return result
                 time.sleep(0.02)
 
@@ -1153,8 +1177,10 @@ class UiBridgeNode(Node):
             with self._active_input_lock:
                 state = self._active_input_goal["result"]
                 result = RequestUserInput.Result()
-                result.status = state["status"]
-                result.button_id = state["button_id"]
+                if state["status"] == "button":
+                    result.result_json = json.dumps({"status": "button", "button_id": state["button_id"]})
+                else:
+                    result.result_json = json.dumps({"status": "cancelled"})
             return result
         finally:
             with self._active_input_lock:
@@ -1170,7 +1196,7 @@ class UiBridgeNode(Node):
         """Lets the engine currently holding an active ``RequestUserInput``
         goal change what's displayed (new panel/objects/highlighted
         selection) without completing or restarting the goal -- e.g. after
-        a ``EVENT_OBJECT_TAPPED`` feedback, to say "<object> selected" and
+        a ``"object_tapped"`` feedback, to say "<object> selected" and
         highlight it."""
         with self._ui_control_lock:
             granted = bool(self._ui_owner_id) and bytes(request.token) == self._ui_token
@@ -1179,26 +1205,32 @@ class UiBridgeNode(Node):
             response.message = "token doesn't match the current ui_control grant"
             return response
 
+        update = parse_request_json(request.request_json)
+        update_panel = "panel_json" in update
+        update_objects = "objects" in update
+        update_selected = "selected_instance_id" in update
+
         with self._active_input_lock:
             state = self._active_input_goal
             if state is None:
                 response.accepted = False
                 response.message = "no active RequestUserInput goal"
                 return response
-            if request.update_panel:
-                state["button_ids"] = panel_button_ids(request.panel_json)
-            if request.update_objects:
-                state["objects"] = list(request.objects)
-                state["object_ids"] = frozenset(o.instance_id for o in request.objects)
-            if request.update_selected:
-                state["selected_instance_id"] = request.selected_instance_id
+            if update_panel:
+                state["button_ids"] = panel_button_ids(update["panel_json"])
+            if update_objects:
+                objects = update["objects"] or []
+                state["objects"] = list(objects)
+                state["object_ids"] = frozenset(o.get("instance_id", "") for o in objects)
+            if update_selected:
+                state["selected_instance_id"] = update["selected_instance_id"]
             engine_id = state["engine_id"]
             objects = state["objects"]
             selected_instance_id = state["selected_instance_id"]
 
-        if request.update_panel:
-            self.ue.call_function("UpdatePanel", {"PanelJson": request.panel_json})
-        if request.update_objects or request.update_selected:
+        if update_panel:
+            self.ue.call_function("UpdatePanel", {"PanelJson": update["panel_json"]})
+        if update_objects or update_selected:
             self._push_engine_objects(engine_id, objects, selected_instance_id)
 
         response.accepted = True

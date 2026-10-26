@@ -150,25 +150,26 @@ panel_json = json.dumps({
 })
 goal = RequestUserInput.Goal(
     engine_id="drink_dispenser", token=token,
-    panel_json=panel_json, objects=[], selected_instance_id="",
+    request_json=json.dumps({"panel_json": panel_json}),
 )
 ```
 
 The goal completes as soon as the user presses one of these buttons --
-`result.button_id` (`"small"`/`"medium"`/`"large"`) directly tells you which
-target was chosen. No feedback loop needed for this case.
+the result's `button_id` (`"small"`/`"medium"`/`"large"`), parsed out of
+`result_json`, directly tells you which target was chosen. No feedback
+loop needed for this case.
 
 **Case B -- tappable objects on your own camera stream**, e.g. "which of
-these 3 detected cups": build one `ObjectCandidate` per cup (its
+these 3 detected cups": build one candidate-object dict per cup (its
 `instance_id`/`perception_class`/`box` in *your own camera's* pixel space --
 typically what your perception step already produced), and let the user
 tap directly on them:
 
 ```python
 objects = [
-    ObjectCandidate(instance_id="cup_1", perception_class="cup", box=[10, 20, 90, 180]),
-    ObjectCandidate(instance_id="cup_2", perception_class="cup", box=[120, 30, 210, 190]),
-    ObjectCandidate(instance_id="cup_3", perception_class="cup", box=[230, 15, 320, 175]),
+    {"instance_id": "cup_1", "perception_class": "cup", "box": [10, 20, 90, 180]},
+    {"instance_id": "cup_2", "perception_class": "cup", "box": [120, 30, 210, 190]},
+    {"instance_id": "cup_3", "perception_class": "cup", "box": [230, 15, 320, 175]},
 ]
 panel_json = json.dumps({
     "title": "Pick a cup",
@@ -178,7 +179,7 @@ panel_json = json.dumps({
 })
 goal = RequestUserInput.Goal(
     engine_id="drink_dispenser", token=token,
-    panel_json=panel_json, objects=objects, selected_instance_id="",
+    request_json=json.dumps({"panel_json": panel_json, "objects": objects}),
 )
 ```
 
@@ -186,7 +187,7 @@ If you also publish your own overlay video (so the user sees a live camera
 feed with these boxes drawn on it, not just a static frame), publish
 `EngineOverlayImage` (`image`, same `token`) to `engine_overlay_topic`
 (default `/engine_overlay/image_raw`) for as long as this goal is active.
-This is optional -- `RequestUserInput`'s `objects` field works against
+This is optional -- `request_json`'s `objects` key works against
 whatever's currently on screen (the base scene camera or your overlay),
 UE just needs *a* box to hit-test against.
 
@@ -200,54 +201,55 @@ send_future = action_client.send_goal_async(goal, feedback_callback=on_feedback)
 ### 2.3 React to taps (Case B only) via feedback + `~/request_user_input/update`
 
 Every tap while the goal is active arrives as feedback
-(`event_type=EVENT_OBJECT_TAPPED`, `instance_id=...`) -- it does **not**
-complete the goal by itself; the user may tap several cups before deciding.
-On each tap, update your own tracked "currently selected" state and tell the
-bridge to reflect it (highlight + message change), via
-`UpdateUserInputPanel.srv`:
+(`feedback_json` parses to `{"event_type": "object_tapped", "instance_id": ...}`)
+-- it does **not** complete the goal by itself; the user may tap several
+cups before deciding. On each tap, update your own tracked "currently
+selected" state and tell the bridge to reflect it (highlight + message
+change), via `UpdateUserInputPanel.srv`:
 
 ```python
 def on_feedback(feedback_msg):
-    fb = feedback_msg.feedback
-    if fb.event_type == RequestUserInput.Feedback.EVENT_OBJECT_TAPPED:
-        selected = fb.instance_id
+    fb = json.loads(feedback_msg.feedback.feedback_json)
+    if fb.get("event_type") == "object_tapped":
+        selected = fb["instance_id"]
         update_client.call(UpdateUserInputPanel.Request(
             token=token,
-            update_panel=True,
-            panel_json=json.dumps({
-                "title": "Pick a cup",
-                "message": f"{selected} selected -- press Confirm to continue.",
-                "buttons": [{"button_id": "confirm", "label": "Confirm", "style": "normal"},
-                            {"button_id": "cancel",  "label": "Cancel",  "style": "warning"}],
+            request_json=json.dumps({
+                "panel_json": json.dumps({
+                    "title": "Pick a cup",
+                    "message": f"{selected} selected -- press Confirm to continue.",
+                    "buttons": [{"button_id": "confirm", "label": "Confirm", "style": "normal"},
+                                {"button_id": "cancel",  "label": "Cancel",  "style": "warning"}],
+                }),
+                "selected_instance_id": selected,
             }),
-            update_objects=False, objects=[],
-            update_selected=True, selected_instance_id=selected,
         ))
 ```
 
-`update_objects=True` also lets you replace the candidate list entirely
-mid-goal (e.g. if your own perception re-detects and the boxes moved) --
-set only the `update_*` flags for what actually changed; unset fields in
-the request are ignored.
+Including an `"objects"` key also lets you replace the candidate list
+entirely mid-goal (e.g. if your own perception re-detects and the boxes
+moved) -- include only the keys for what actually changed; an omitted key
+leaves that aspect of the panel/candidate list/selection unchanged.
 
 ### 2.4 Resolve the final choice
 
-The goal completes with `result.status == STATUS_BUTTON` when the user
-presses a button (`result.button_id` is set), or `STATUS_CANCELLED` if you
-cancel the goal yourself (e.g. the rest of action A timed out). For Case B,
-by the time a button is pressed you already know the target from your own
-tracked "currently selected" state (updated in §2.3) -- `button_id` tells
-you *what to do* with it (`"confirm"` vs `"cancel"`), while the selection
-itself came from the feedback stream, not from `result`.
+The goal completes with `result_json` parsing to `{"status": "button",
+"button_id": ...}` when the user presses a button, or `{"status":
+"cancelled"}` if you cancel the goal yourself (e.g. the rest of action A
+timed out). For Case B, by the time a button is pressed you already know
+the target from your own tracked "currently selected" state (updated in
+§2.3) -- `button_id` tells you *what to do* with it (`"confirm"` vs
+`"cancel"`), while the selection itself came from the feedback stream, not
+from the result.
 
 ```python
-result = await send_future  # or block via .result() off the executor thread
-if result.status == RequestUserInput.Result.STATUS_BUTTON:
-    if result.button_id == "confirm" and selected:
+result = json.loads((await send_future).result_json)  # or block via .result() off the executor thread
+if result["status"] == "button":
+    if result["button_id"] == "confirm" and selected:
         proceed_with_target(selected)
-    elif result.button_id == "cancel":
+    elif result["button_id"] == "cancel":
         abort_step()
-else:  # STATUS_CANCELLED
+else:  # "cancelled"
     abort_step()
 ```
 
@@ -284,15 +286,20 @@ engine's overlay/input requests while held).
 All in `rammp-interfaces-ros2`:
 
 - `rammp_ui_bridge_interfaces/action/RequestUserInput` -- goal
-  (`engine_id`, `token`, `panel_json`, `objects[]`, `selected_instance_id`),
-  feedback (`event_type`, `instance_id`), result (`status`, `button_id`).
+  (`engine_id`, `token`, `request_json` -- JSON `panel_json`/`objects[]`/
+  `selected_instance_id`, all optional), feedback (`feedback_json` --
+  JSON `{"event_type": "object_tapped", "instance_id": str}`), result
+  (`result_json` -- JSON `{"status": "button", "button_id": str}` or
+  `{"status": "cancelled"}`).
 - `rammp_ui_bridge_interfaces/srv/UpdateUserInputPanel` -- request
-  (`token`, `update_panel`/`panel_json`, `update_objects`/`objects[]`,
-  `update_selected`/`selected_instance_id`), response (`accepted`,
+  (`token`, `request_json` -- JSON object, every key (`panel_json`/
+  `objects[]`/`selected_instance_id`) optional; a present key replaces
+  that aspect, an absent key leaves it unchanged), response (`accepted`,
   `message`).
-- `rammp_ui_bridge_interfaces/msg/ObjectCandidate` -- `instance_id`,
-  `perception_class`, `box` (`[x_min, y_min, x_max, y_max]` in your
-  camera's own pixel space).
+- Candidate object shape (inside `request_json`'s `objects[]`, no longer
+  its own ROS message): `{instance_id, perception_class, box}` --
+  `box` is `[x_min, y_min, x_max, y_max]` in your camera's own pixel
+  space.
 - `rammp_ui_bridge_interfaces/msg/EngineOverlayImage` -- `image`
   (`sensor_msgs/Image`), `token`.
 - `rammp_common_interfaces/srv/{AcquireControl,ReleaseControl}` and
