@@ -300,8 +300,10 @@ All in `rammp-interfaces-ros2`:
   by `rammp_arm_interfaces/JointSetpoint` and
   `rammp_base_interfaces/TwistSetpoint`.
 - `InteractionPanel` JSON shape (`panel_json` string content):
-  `{"title": str, "message": str, "buttons": [{"button_id": str, "label": str, "style": "normal"|"warning"|"error"}], "progress": {...}}`
-  (`docs/NODE_INTERFACE.md` §5.2.C).
+  `{"title": str, "message": str, "buttons": [{"button_id": str, "label": str, "style": "normal"|"warning"|"error"}], "progress": {...}, "style": "normal"|"warning"|"error"}`
+  -- full schema, every optional-key rule, and worked examples for every
+  panel shape the bridge builds: `docs/INTERACTION_PANEL_SCHEMA.md`
+  (design rationale: `docs/NODE_INTERFACE.md` §5.2.C).
 
 See also: `docs/NODE_INTERFACE.md` §3.3.2/§5.2.C (bridge-side spec this
 guide is based on), `rammp-orchestrator/rammp_orchestrator/docs/

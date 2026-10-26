@@ -834,19 +834,18 @@ unified, versionable JSON schema is easier for UE to parse generically
 (build N buttons from an array) and to extend later (new optional fields)
 than a growing set of bespoke RPC function signatures.
 
-**Open/TBD:**
-- Transport: either a Remote Control function call (e.g.
-  `UpdatePanel({"PanelJson": "..."})`) or the streaming channel --
-  undecided; likely driven by size/frequency once real payloads are
-  measured (Remote Control calls are simpler for small/sporadic panels;
-  the streaming channel may be preferable if panels become large/frequent).
-- Exact JSON field names/casing and whether `world_state`/
-  `detected_objects` pushes (`UpdateWorldState`/`UpdateDetectedObjects`)
-  also fold into this scheme or remain separate -- for now, treat those two
-  as still-separate raw-data pushes, distinct from the dialog/prompt
-  `InteractionPanel` describes.
-- The name itself -- `InteractionPanel` was chosen over `ActionPanel`/
-  `UiPanel`/the placeholder `information`; open to revision.
+**Resolved -- see `docs/INTERACTION_PANEL_SCHEMA.md` for the full schema:**
+the three questions originally left open here are now settled by what the
+implementation actually does:
+- Transport: a Remote Control function call, `UpdatePanel({"PanelJson":
+  "..."})` -- not the streaming channel.
+- Exact JSON field names/casing: `title`/`message`/`buttons[]`
+  (`button_id`/`label`/`style`)/`progress`/`style`, documented in full
+  there, including every panel shape the bridge actually builds today.
+- `world_state`/`detected_objects` stay separate (§5.2.D), never folded
+  into `InteractionPanel`.
+- The name `InteractionPanel` is kept as-is.
+
 
 #### D. World state / detected objects (Remote Control preset functions)
 
