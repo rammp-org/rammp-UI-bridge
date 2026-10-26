@@ -1227,8 +1227,10 @@ class UiBridgeNode(Node):
         )
 
     def _poll_detected_objects(self) -> None:
-        if not self.ue.is_connected():
-            return
+        # Polled (and logged) regardless of UE connection -- mirrors the
+        # scene-camera subscription's "log always, forward to UE only if
+        # connected" pattern, so detection changes are visible in this
+        # node's own log without needing a real/fake UE client attached.
         if not self._get_detected_objects_client.service_is_ready():
             return
         future = self._get_detected_objects_client.call_async(GetDetectedObjects.Request())
@@ -1240,6 +1242,12 @@ class UiBridgeNode(Node):
         if ids == self._last_detected_ids:
             return  # same set of visible instances as last push
         self._last_detected_ids = ids
+        if ids:
+            self.get_logger().info(f"detected objects now: {sorted(ids)}")
+        else:
+            self.get_logger().info("detected objects now: (none)")
+        if not self.ue.is_connected():
+            return
         self.ue.call_function(
             "UpdateDetectedObjects",
             {"Objects": [_object_record_to_dict(o) for o in resp.objects]},
