@@ -844,7 +844,7 @@ unified, versionable JSON schema is easier for UE to parse generically
 (build N buttons from an array) and to extend later (new optional fields)
 than a growing set of bespoke RPC function signatures.
 
-**Resolved -- see `docs/INTERACTION_PANEL_SCHEMA.md` for the full schema:**
+**Resolved -- see `docs/USER_INPUT_JSON_SCHEMA.md` for the full schema:**
 the three questions originally left open here are now settled by what the
 implementation actually does:
 - Transport: a Remote Control function call, `UpdatePanel({"PanelJson":
