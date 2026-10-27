@@ -28,6 +28,28 @@ it manually into the same Python environment colcon builds against:
 pip install git+https://github.com/rammp-org/ramms-tools.git
 ```
 
+## Testing without real UE
+
+`mock_ue` is a standalone dev tool that stands in for Unreal Engine itself
+(not part of `ui_bridge_node` -- it never touches ROS2). It opens a
+WebSocket *server* on `ue_host`/`ue_ws_port`'s default (`127.0.0.1:30020`)
+and serves a small control web page:
+
+```bash
+ros2 run rammp_ui_bridge mock_ue
+# then open http://127.0.0.1:8000/ in a browser
+```
+
+The page shows the live `panel_json` (title/message/buttons, clickable) and
+detected objects (clickable -> `select_object`) `ui_bridge_node` is pushing,
+and a connection-status/log panel. No `ue_host`/`ue_ws_port` parameter
+changes are needed on `ui_bridge_node` since the defaults already match.
+Video streaming (the separate RMSS TCP channel) is out of scope for this
+mock -- it only covers the Remote Control WebSocket (panel/object/world
+state push + user-input) protocol. See
+`rammp_ui_bridge/mocks/mock_ue.py`'s module docstring for the protocol
+details.
+
 ## What this node does
 
 1. **Connects to UE** over its Remote Control WebSocket API (a preset-based
