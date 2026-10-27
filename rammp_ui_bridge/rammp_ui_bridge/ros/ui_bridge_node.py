@@ -716,8 +716,10 @@ class UiBridgeNode(Node):
             requested_token = bytes(request.token)
             if requested_token != bytes(16):
                 self._ui_token = requested_token
+                minted_fresh = False
             else:
                 self._ui_token = os.urandom(16)
+                minted_fresh = True
             self._ui_owner_id = request.owner_id
             self._ui_generation += 1
             response.accepted = True
@@ -726,7 +728,8 @@ class UiBridgeNode(Node):
             response.message = f"granted to '{request.owner_id}'"
         self.get_logger().info(
             f"ui control acquired by '{request.owner_id}' "
-            f"(generation {self._ui_generation})"
+            f"({'minted a new' if minted_fresh else 'using orchestrator-supplied'} "
+            f"token {self._ui_token.hex()[:8]}..., generation {self._ui_generation})"
         )
         self._publish_ui_control_status()
         return response
