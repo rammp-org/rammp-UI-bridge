@@ -205,6 +205,9 @@ _PAGE = """<!doctype html>
   button.error { background: #ffb3b3; }
   #objects button { background: #dbe9ff; }
   #objects button.selected { outline: 2px solid #2a6df4; }
+  #progress-wrap { display: none; margin: 0.5rem 0; }
+  #progress-bar { width: 100%; height: 1.2rem; }
+  #progress-label { font-size: 0.8rem; color: #555; }
   #log { font-family: monospace; font-size: 0.8rem; background: #111; color: #0f0;
          padding: 0.5rem; height: 160px; overflow-y: auto; white-space: pre-wrap; }
 </style>
@@ -214,6 +217,10 @@ _PAGE = """<!doctype html>
   <div id="status">connecting...</div>
   <h3 id="panel-title"></h3>
   <p id="panel-message"></p>
+  <div id="progress-wrap">
+    <progress id="progress-bar" max="1" value="0"></progress>
+    <div id="progress-label"></div>
+  </div>
   <div id="buttons"></div>
   <h3>Detected objects</h3>
   <div id="objects"></div>
@@ -231,6 +238,18 @@ async function poll() {
 
     document.getElementById('panel-title').textContent = s.panel.title || '';
     document.getElementById('panel-message').textContent = s.panel.message || '';
+
+    const progressWrap = document.getElementById('progress-wrap');
+    const p = s.panel.progress;
+    if (p) {
+      progressWrap.style.display = 'block';
+      // p.pct is a 0.0-1.0 fraction (matches UE's native ProgressBar.Percent).
+      document.getElementById('progress-bar').value = p.pct;
+      document.getElementById('progress-label').textContent =
+        p.phase + ': ' + Math.round(p.pct * 100) + '% -- ' + (p.message || '');
+    } else {
+      progressWrap.style.display = 'none';
+    }
 
     const buttonsDiv = document.getElementById('buttons');
     buttonsDiv.innerHTML = '';

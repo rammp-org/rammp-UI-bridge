@@ -249,7 +249,12 @@ instead of a separate Remote Control call:
 ```jsonc
 {
   "phase": "string",     // e.g. "approach", "grasp" -- engine-defined, opaque to UE
-  "pct": 0.0,            // float, 0.0-100.0 (not 0.0-1.0) -- matches ExecuteAction.Feedback.progress.pct
+  "pct": 0.0,            // float, 0.0-1.0 (a fraction, not a percentage) --
+                         // matches ExecuteAction.Feedback.progress.pct and
+                         // Unreal's native UProgressBar::Percent, which also
+                         // takes a 0.0-1.0 fraction -- UE can bind this field
+                         // straight to a ProgressBar widget's Percent with no
+                         // conversion
   "message": "string",   // human-readable status text for this progress tick
   "pausable": true        // bool -- whether a Pause button should currently be offered
 }
@@ -290,7 +295,7 @@ error panels.
     {"button_id": "control:resume", "label": "Resume", "style": "normal"},
     {"button_id": "control:cancel", "label": "Cancel", "style": "warning"}
   ],
-  "progress": {"phase": "opening", "pct": 40.0, "message": "opening door", "pausable": true}
+  "progress": {"phase": "opening", "pct": 0.4, "message": "opening door", "pausable": true}
 }
 ```
 
