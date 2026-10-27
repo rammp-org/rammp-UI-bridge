@@ -992,20 +992,22 @@ class UiBridgeNode(Node):
         )
 
         def on_feedback(feedback_msg):
+            # Per the project's decision that an engine now owns its own
+            # live progress panel for the whole action (acquiring
+            # ui_control once and pushing it directly via
+            # RequestUserInput/UpdateUserInputPanel -- see
+            # ENGINE_UI_INTEGRATION_GUIDE.md's "held progress session"
+            # section), this feedback is no longer rendered here: it would
+            # otherwise race the engine's own panel pushes and show stale
+            # Orchestrator-relayed control:pause/control:cancel buttons that
+            # the engine isn't listening for. Kept purely as a log line --
+            # ExecuteAction's feedback still exists for the Orchestrator's
+            # own internal progress tracking.
             p = feedback_msg.feedback.progress
-            panel_json, mapping = build_panel(
-                title=f"{engine_id}: {action_id}",
-                message=p.message,
-                buttons=control_panel_buttons(p.pausable),
-                progress={
-                    "phase": p.phase,
-                    "pct": p.pct,
-                    "message": p.message,
-                    "pausable": p.pausable,
-                },
+            self.get_logger().debug(
+                f"{engine_id}: {action_id} progress (orchestrator-internal) "
+                f"{p.phase} {p.pct:.0%} -- {p.message}"
             )
-            self._panel_buttons = mapping
-            self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
 
         send_future = self._execute_action_client.send_goal_async(
             goal, feedback_callback=on_feedback
