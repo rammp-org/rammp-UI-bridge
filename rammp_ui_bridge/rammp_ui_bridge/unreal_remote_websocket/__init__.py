@@ -57,6 +57,13 @@ class UnrealRemoteWebsocket:
         self._send_lock = Lock()  # serialize sends
         self.ws_client = None
         self.user_input_callback = user_input_callback
+        # Only print "GUI connection error"/"GUI disconnected" on the first
+        # failed attempt of a disconnected streak -- without this, the retry
+        # loop below (reconnect every 3s while UE isn't running) spams one
+        # pair of these lines per attempt forever. Reset to False as soon as
+        # a connection actually succeeds, so the next genuine disconnect is
+        # still reported.
+        self._disconnected_logged = False
 
         t = threading.Thread(target=self.start_async_loop, daemon=True)
         t.start()
@@ -70,6 +77,7 @@ class UnrealRemoteWebsocket:
                 async with websockets.connect(self.base_url) as ws:
                     self.ws_client = ws
                     print("GUI connected.")
+                    self._disconnected_logged = False
                     await self.register_preset()  # Register preset on connect
                     print("Preset registration sent.")
                     async for message in ws:
@@ -92,12 +100,16 @@ class UnrealRemoteWebsocket:
                     await self._response_queue.put(
                         {"_error": str(e)}
                     )  # Unblock any waiting send_and_wait calls
-                    print(f"GUI connection error: {e}")
+                    if not self._disconnected_logged:
+                        print(f"GUI connection error: {e}")
             finally:
                 self.ws_client = None
                 if not self.ws_shutdown:
-                    print("GUI disconnected.")
+                    if not self._disconnected_logged:
+                        print("GUI disconnected.")
+                        self._disconnected_logged = True
                     await asyncio.sleep(3)  # Wait before trying to reconnect
+
 
     async def register_preset(self):
         if self.preset is None:
