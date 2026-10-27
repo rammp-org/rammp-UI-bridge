@@ -33,11 +33,6 @@ def generate_launch_description():
                 description="Node namespace the Orchestrator's services/action are advertised under",
             ),
             DeclareLaunchArgument(
-                "world_state_poll_period",
-                default_value="0.5",
-                description="Seconds between ~/get_world_state polls",
-            ),
-            DeclareLaunchArgument(
                 "detected_objects_poll_period",
                 default_value="0.5",
                 description="Seconds between ~/get_detected_objects polls",
@@ -80,9 +75,6 @@ def generate_launch_description():
                         "ue_stream_port": LaunchConfiguration("ue_stream_port"),
                         "ue_preset": LaunchConfiguration("ue_preset"),
                         "orchestrator_ns": LaunchConfiguration("orchestrator_ns"),
-                        "world_state_poll_period": LaunchConfiguration(
-                            "world_state_poll_period"
-                        ),
                         "detected_objects_poll_period": LaunchConfiguration(
                             "detected_objects_poll_period"
                         ),

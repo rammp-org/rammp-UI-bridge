@@ -20,7 +20,7 @@ performance question below.
 
 ## Why language doesn't matter much here, today
 
-- **Workload shape**: `get_world_state`/`get_detected_objects` polls at
+- **Workload shape**: `get_detected_objects` polls at
   0.5-2 Hz, sparse user-triggered commands, `ExecuteAction` feedback at
   whatever rate an engine's `Progress` messages arrive (typically a few Hz
   during an active action, idle otherwise). None of this is CPU-bound.

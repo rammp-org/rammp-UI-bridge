@@ -6,8 +6,8 @@ public ROS2 interface
 ([`rammp_orchestrator_interfaces`](https://github.com/rammp-org/rammp-interfaces-ros2)).
 UE is not a ROS2 participant, so this node is the only thing that talks to
 both sides: it translates UE user-input events into Orchestrator
-service/action calls, and pushes Orchestrator state (world state, detected
-objects, action progress/results) back to UE for rendering.
+service/action calls, and pushes Orchestrator state (detected objects,
+action progress/results) back to UE for rendering.
 
 ```
  ┌──────────────┐   UE Remote Control    ┌────────────────┐   ROS2 services/   ┌───────────────┐
@@ -45,8 +45,8 @@ detected objects (clickable -> `select_object`) `ui_bridge_node` is pushing,
 and a connection-status/log panel. No `ue_host`/`ue_ws_port` parameter
 changes are needed on `ui_bridge_node` since the defaults already match.
 Video streaming (the separate RMSS TCP channel) is out of scope for this
-mock -- it only covers the Remote Control WebSocket (panel/object/world
-state push + user-input) protocol. See
+mock -- it only covers the Remote Control WebSocket (panel/object push +
+user-input) protocol. See
 `rammp_ui_bridge/mocks/mock_ue.py`'s module docstring for the protocol
 details.
 
@@ -67,7 +67,7 @@ details.
 3. **Pushes state back to UE over four channels**: a camera video stream
    (RGBD from Perception and/or RGB from an engine's own camera, each
    optionally carrying detected-object info), system status (arm
-   joints/base status), world-state/detected-objects pushes, and a single
+   joints/base status), detected-objects pushes, and a single
    dynamic `InteractionPanel` JSON schema (title/message/buttons/progress)
    that lets UE build whatever popup/dialog the current task calls for
    without hardcoding layouts per action. See `docs/NODE_INTERFACE.md` §5.2

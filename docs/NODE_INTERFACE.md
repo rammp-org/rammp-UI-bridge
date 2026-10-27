@@ -23,7 +23,6 @@ implementation-language question itself.
 | `ue_ws_port` | int | `30020` | UE Remote Control WebSocket API port |
 | `ue_preset` | string | `RAMMP` | UE Remote Control preset name to register against |
 | `orchestrator_ns` | string | `/rammp_orchestrator` | Namespace the Orchestrator's services/action are advertised under |
-| `world_state_poll_period` | double (seconds) | `0.5` | Interval between `~/get_world_state` polls |
 | `detected_objects_poll_period` | double (seconds) | `0.5` | Interval between `~/get_detected_objects` polls |
 | `connection_publish_period` | double (seconds) | `1.0` | Interval between connection-status publishes |
 | `service_wait_timeout` | double (seconds) | `5.0` | How long to wait for an Orchestrator service/action server to become available before reporting it unavailable |
@@ -39,8 +38,8 @@ Orchestrator is not involved in, and has no visibility into, that
 request/response exchange at all.
 
 - **§3.1 Bridge ↔ Orchestrator** -- the control/state surface: object
-  selection, actions, pause/resume/cancel, world state, and detected
-  objects (including pixel-space bounding boxes -- see the note in
+  selection, actions, pause/resume/cancel, and detected objects
+  (including pixel-space bounding boxes -- see the note in
   §3.1.1's `get_detected_objects` entry for why this is sourced from the
   Orchestrator rather than a direct Perception subscription).
 - **§3.2 Bridge ↔ Camera** -- a *direct* subscription to the scene
@@ -75,7 +74,6 @@ under `orchestrator_ns` (§2).
 
 | Orchestrator interface | Type | Used for |
 |---|---|---|
-| `<orchestrator_ns>/get_world_state` | `GetWorldState.srv` | Polled; result pushed to UE on version change |
 | `<orchestrator_ns>/get_detected_objects` | `GetDetectedObjects.srv` | Polled; result pushed to UE on instance-set change (see note below re: bounding boxes) |
 | `<orchestrator_ns>/select_object` | `SelectObject.srv` | Called when UE sends a `select_object` command (user tapped an object) |
 | `<orchestrator_ns>/deselect` | `Deselect.srv` | Called when the bridge resolves a `button_press` whose panel button represented "deselect"/"back" (§5.1) |
@@ -202,18 +200,6 @@ should prefer the action feedback channel (it's scoped to the specific
 goal the bridge itself issued), but the topic is available as a fallback
 if a future design needs progress visibility decoupled from holding an
 active goal handle (e.g. a supervisory/read-only UI).
-
-#### `get_world_state` (`GetWorldState.srv`)
-
-```
-# request: (empty)
----
-# response
-string snapshot_json
-int64 version
-```
-Polled at `world_state_poll_period`; pushed to UE (`UpdateWorldState`,
-§5.2.D) only when `version` changes from the last *pushed* value.
 
 #### `get_detected_objects` (`GetDetectedObjects.srv`)
 
@@ -852,35 +838,32 @@ implementation actually does:
 - Exact JSON field names/casing: `title`/`message`/`buttons[]`
   (`button_id`/`label`/`style`)/`progress`/`style`, documented in full
   there, including every panel shape the bridge actually builds today.
-- `world_state`/`detected_objects` stay separate (§5.2.D), never folded
+- `detected_objects` stays separate (§5.2.D), never folded
   into `InteractionPanel`.
 - The name `InteractionPanel` is kept as-is.
 
 
-#### D. World state / detected objects (Remote Control preset functions)
+#### D. Detected objects (Remote Control preset function)
 
-Separate from `InteractionPanel`, the bridge pushes two raw-data feeds over
+Separate from `InteractionPanel`, the bridge pushes a raw-data feed over
 the same Remote Control preset-function mechanism as §5.2.B (request/
 response RPC over the WebSocket, `PUT /remote/preset/<preset>/function/
-<FunctionName>`) -- not the streaming channel, since both are small,
-infrequent JSON payloads rather than bulk pixel data:
+<FunctionName>`) -- not the streaming channel, since it's a small,
+infrequent JSON payload rather than bulk pixel data:
 
 | Function | Parameters | Pushed when |
 |---|---|---|
-| `UpdateWorldState` | `Version` (int), `SnapshotJson` (string, JSON-encoded World State) | `~/get_world_state` poll result's `version` differs from the last pushed value |
 | `UpdateDetectedObjects` | `Objects`: array of `{instance_id, perception_class, last_pose, location, opened, last_seen, box, stream_id}` -- `box`/`stream_id` are the proposed `ObjectRecord` extension (§3.1) | `~/get_detected_objects` poll result's set of `instance_id`s differs from the last pushed set, or any pushed object's `box` changes materially (exact threshold TBD at implementation time) |
 
 Mechanics:
 
-1. The bridge polls `~/get_world_state` every `world_state_poll_period`
-   and `~/get_detected_objects` every `detected_objects_poll_period`
-   (§2) -- polling, not a subscription, since the Orchestrator exposes
-   these as services, not topics.
+1. The bridge polls `~/get_detected_objects` every
+   `detected_objects_poll_period` (§2) -- polling, not a subscription,
+   since the Orchestrator exposes this as a service, not a topic.
 2. Each poll response is compared against what was last actually pushed
-   to UE (World State `version` number; the `frozenset` of detected
-   `instance_id`s, plus each object's `box` once that field exists) --
-   **not** against the previous poll response, so a dropped/late poll
-   can't cause a spurious re-push.
+   to UE (the `frozenset` of detected `instance_id`s, plus each object's
+   `box` once that field exists) -- **not** against the previous poll
+   response, so a dropped/late poll can't cause a spurious re-push.
 3. Only on a real change does the bridge call the corresponding UE preset
    function, once, with the full new snapshot/object list (not a diff) --
    UE always receives a complete, self-consistent payload rather than
@@ -909,11 +892,10 @@ to the task/button-dialog lifecycle.
 
 ### 5.3 Push semantics
 
-- World-state/detected-objects pushes remain **change-triggered, not
-  every-poll** -- the bridge must track the last-pushed World State
-  `version` and the last-pushed set of detected `instance_id`s, and only
-  push when either actually changed. This bounds UE-side traffic to actual
-  state changes regardless of poll frequency.
+- Detected-objects pushes remain **change-triggered, not every-poll** --
+  the bridge must track the last-pushed set of detected `instance_id`s,
+  and only push when it actually changed. This bounds UE-side traffic to
+  actual state changes regardless of poll frequency.
 - `InteractionPanel` pushes are **event-triggered** -- one push whenever
   the available actions, progress, or an error condition changes (e.g. on
   `select_object` response, on each `ExecuteAction` feedback message, on
@@ -940,7 +922,7 @@ to the task/button-dialog lifecycle.
   derived from the *other* peers -- each source's absence should degrade
   only its own UE channel (e.g. frozen/blank overlay video, stale system
   status) while Orchestrator-sourced channels (`InteractionPanel`,
-  detected objects, world state) keep working normally.
+  detected objects) keep working normally.
 - The UE WebSocket connection must reconnect automatically on drop
   (including re-registering the preset) without requiring the node to
   restart, and `~/ue_connection` must reflect disconnection promptly.

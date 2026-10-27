@@ -4,7 +4,7 @@ Orchestrator's public ROS2 interface (``rammp_orchestrator_interfaces``), per
 
 This plays exactly the role ``rammp_orchestrator.mocks.ui_node.UINode`` plays
 in the Orchestrator's own test suite -- a client of
-``~/get_world_state``/``~/get_detected_objects``/``~/select_object``/
+``~/get_detected_objects``/``~/select_object``/
 ``~/deselect``/``~/control``/``~/execute_action`` -- except driven by actual
 UE user input instead of a scripted demo, and it pushes every response back
 to UE instead of printing it.
@@ -101,7 +101,6 @@ from rammp_orchestrator_interfaces.srv import (
     Control,
     Deselect,
     GetDetectedObjects,
-    GetWorldState,
     SelectObject,
 )
 from rammp_ui_bridge_interfaces.action import RequestUserInput
@@ -311,7 +310,6 @@ class UiBridgeNode(Node):
         self.declare_parameter("ue_ws_port", 30020)
         self.declare_parameter("ue_preset", "RAMMP")
         self.declare_parameter("orchestrator_ns", "/rammp_orchestrator")
-        self.declare_parameter("world_state_poll_period", 0.5)
         self.declare_parameter("detected_objects_poll_period", 0.5)
         self.declare_parameter("connection_publish_period", 1.0)
         self.declare_parameter("service_wait_timeout", 5.0)
@@ -355,7 +353,6 @@ class UiBridgeNode(Node):
         )
 
         self._cb_group = ReentrantCallbackGroup()
-        self._last_world_state_version: int | None = None
         self._last_detected_ids: frozenset[str] = frozenset()
 
         # -- panel/selection state ------------------------------------------------
@@ -443,9 +440,6 @@ class UiBridgeNode(Node):
         )
         self._stream_reconnect_thread.start()
 
-        self._get_world_state_client = self.create_client(
-            GetWorldState, f"{self._ns}/get_world_state", callback_group=self._cb_group
-        )
         self._get_detected_objects_client = self.create_client(
             GetDetectedObjects,
             f"{self._ns}/get_detected_objects",
@@ -513,11 +507,6 @@ class UiBridgeNode(Node):
         self.create_timer(
             self.get_parameter("connection_publish_period").value,
             self._publish_connection_status,
-        )
-        self.create_timer(
-            self.get_parameter("world_state_poll_period").value,
-            self._poll_world_state,
-            callback_group=self._cb_group,
         )
         self.create_timer(
             self.get_parameter("detected_objects_poll_period").value,
@@ -1238,26 +1227,8 @@ class UiBridgeNode(Node):
         return response
 
     # ------------------------------------------------------------------
-    # Orchestrator -> UE: polled push of world state / detected objects
+    # Orchestrator -> UE: polled push of detected objects
     # ------------------------------------------------------------------
-    def _poll_world_state(self) -> None:
-        if not self.ue.is_connected():
-            return
-        if not self._get_world_state_client.service_is_ready():
-            return
-        future = self._get_world_state_client.call_async(GetWorldState.Request())
-        future.add_done_callback(self._on_world_state_response)
-
-    def _on_world_state_response(self, future) -> None:
-        resp = future.result()
-        if resp.version == self._last_world_state_version:
-            return  # unchanged since the last push -- avoid spamming UE
-        self._last_world_state_version = resp.version
-        self.ue.call_function(
-            "UpdateWorldState",
-            {"Version": resp.version, "SnapshotJson": resp.snapshot_json},
-        )
-
     def _poll_detected_objects(self) -> None:
         # Polled (and logged) regardless of UE connection -- mirrors the
         # scene-camera subscription's "log always, forward to UE only if

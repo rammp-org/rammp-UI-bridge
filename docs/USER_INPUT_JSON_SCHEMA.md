@@ -416,10 +416,10 @@ No schema-version field exists anywhere in `request_json`/`result_json`/
 Carried over from `NODE_INTERFACE.md` §5.2.C, still genuinely open (not
 schema questions, so out of scope for this doc):
 
-- Whether `world_state`/`detected_objects` pushes should ever fold into this
-  scheme -- **no**, per §5.2.D, they remain separate `UpdateWorldState`/
-  `UpdateDetectedObjects` calls, keyed by their own change-triggered cadence
-  rather than the task/button-dialog lifecycle.
+- Whether `detected_objects` pushes should ever fold into this
+  scheme -- **no**, per §5.2.D, they remain a separate `UpdateDetectedObjects`
+  call, keyed by its own change-triggered cadence rather than the
+  task/button-dialog lifecycle.
 - `ActionSpec` has no `label` field yet, so `selection_panel_buttons()`
   falls back to the raw `action_id` as the button label (§7 of
   `NODE_INTERFACE.md`) -- a real UX label field is a future
