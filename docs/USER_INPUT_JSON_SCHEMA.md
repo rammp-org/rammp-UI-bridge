@@ -80,8 +80,13 @@ enforce different presence rules:
 Bridge behavior while a `RequestUserInput` goal is active:
 1. If `request_json`'s `panel_json` is non-empty, push it to UE's
    `InteractionPanel` channel immediately -- this **takes over** whatever
-   would otherwise be shown there (e.g. `ExecuteAction` progress),
-   reverting to the prior content once the goal ends.
+   the Orchestrator-driven selection panel was showing. Once the goal
+   ends, the bridge reverts to that cached selection/idle state right
+   away, then (moments later, once the Orchestrator reclaims `ui_control`
+   at the end of the `execute_action` run) replaces it again with a
+   freshly re-queried panel reflecting any World State changes the action
+   made -- see §7.3 and `docs/NODE_INTERFACE.md` §5.2.C's "Engine-driven
+   override" note.
 2. If `request_json`'s `objects` is non-empty, push them to UE's
    `UpdateDetectedObjects` channel tagged with the engine's own overlay
    `stream_id` and the current `selected_instance_id`, exactly like any
@@ -243,8 +248,15 @@ never part of `panel_json`/sent to UE**, it's rebuilt bridge-side every push.
 
 ### 6.4 `progress` object (optional)
 
-Identical shape to `ExecuteAction`'s feedback message, folded into the panel
-instead of a separate Remote Control call:
+Same field shape as `rammp_orchestrator_interfaces/action/ExecuteAction`'s
+feedback message (`phase`/`pct`/`message`/`pausable`), but it does **not**
+arrive in the panel via that feedback channel -- the Orchestrator-relayed
+`ExecuteAction` feedback is only logged today (`docs/NODE_INTERFACE.md`
+§3.1.1), not rendered. Instead, an engine that wants a live progress panel
+holds `ui_control` for the whole `execute_action` run (§2.1 of
+`ENGINE_UI_INTEGRATION_GUIDE.md`) and includes this `progress` object
+itself inside the `panel_json` it pushes via its own `RequestUserInput`
+goal / `UpdateUserInputPanel` calls, one push per step:
 
 ```jsonc
 {
@@ -260,9 +272,9 @@ instead of a separate Remote Control call:
 }
 ```
 
-Only ever present while an `execute_action` is in-flight and reporting
-progress (`_on_progress`-driven pushes); absent on idle/selection/result/
-error panels.
+Only ever present in an engine-pushed panel while it's running its own
+live-progress session; absent on the bridge's own idle/selection/error
+panels, which never set this field.
 
 ---
 

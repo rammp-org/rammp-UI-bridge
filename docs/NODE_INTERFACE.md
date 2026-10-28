@@ -78,7 +78,7 @@ under `orchestrator_ns` (§2).
 | `<orchestrator_ns>/select_object` | `SelectObject.srv` | Called when UE sends a `select_object` command (user tapped an object) |
 | `<orchestrator_ns>/deselect` | `Deselect.srv` | Called when the bridge resolves a `button_press` whose panel button represented "deselect"/"back" (§5.1) |
 | `<orchestrator_ns>/control` | `Control.srv` | Called when the bridge resolves a `button_press` whose panel button represented a pause/resume/cancel control (§5.1) |
-| `<orchestrator_ns>/execute_action` | `ExecuteAction.action` | Called when the bridge resolves a `button_press` whose panel button represented a specific action (§5.1); feedback and result both relayed to UE |
+| `<orchestrator_ns>/execute_action` | `ExecuteAction.action` | Called when the bridge resolves a `button_press` whose panel button represented a specific action (§5.1); feedback is logged only (§3.1.1) -- the live panel during execution comes from the engine's own `RequestUserInput` goal (§3.3.2) instead |
 
 The bridge never calls `register_engine`, `write_world_state`,
 `update_object_state`, or `request_intent` -- those are engine-facing, not
@@ -181,16 +181,27 @@ rammp_orchestrator_interfaces/Result result
 rammp_orchestrator_interfaces/Progress progress
 ```
 `engine_id`/`action_id` are exactly the pair the bridge resolved from the
-tapped `button_id` (see the `select_object` note above). Feedback
-(`Progress`: `phase`, `pct`, `message`, `pausable`) streams into the
-`InteractionPanel`'s progress field (§5.2.C) for the lifetime of the goal;
-`Progress.pausable` tells the bridge whether to keep a "Pause" button live
-on the panel for this step. `Result` (`status` one of
-`STATUS_SUCCESS`/`STATUS_FAILED`/`STATUS_CANCELLED`, plus `payload_json`,
-`error_code`, `recoverable`, `suggestions[]`) arrives once and should
-collapse the in-progress panel into a terminal state: a success/failure
-message, and -- per `recoverable`/`suggestions` -- either a retry button
-(re-issuing the same `execute_action` goal) or a dismiss/deselect button.
+tapped `button_id` (see the `select_object` note above).
+
+**Revised design decision: this feedback is no longer rendered into a
+panel by the bridge.** An earlier revision of this doc had the bridge
+fold each `Progress` message straight into the `InteractionPanel`'s
+`progress` field for the lifetime of the goal. That's been dropped in
+favor of the engine holding `ui_control` (§3.3.1) for the whole
+pausable/cancellable run and pushing its own live progress panel
+directly via a `RequestUserInput` goal/`UpdateUserInputPanel` calls
+(§3.3.2) -- including whatever Pause/Cancel buttons it wants shown, on
+its own schedule, not tied to this action's feedback cadence. This
+`ExecuteAction` feedback still arrives (the Orchestrator relays every
+`Progress` the engine reports internally) but the bridge now only logs
+it (`on_feedback`) for debugging -- it is purely the Orchestrator's own
+progress bookkeeping, not a UI-rendering signal. `Result` (`status` one
+of `STATUS_SUCCESS`/`STATUS_FAILED`/`STATUS_CANCELLED`, plus
+`payload_json`, `error_code`, `recoverable`, `suggestions[]`) still
+arrives once the goal ends, but by then the engine has already released
+`ui_control` and the Orchestrator has reclaimed it with a fresh token
+(§3.3.1) -- the bridge reacts to that reclaim, not to this `Result`, by
+refreshing the panel back to the current selection's available actions.
 
 **Note on the standalone `~/progress` topic.** The Orchestrator node also
 publishes every `Progress` update as a plain topic
@@ -375,15 +386,43 @@ arbitration (see `rammp_common_interfaces`). The bridge hosts three
 endpoints:
 
 - `~/ui_control/acquire_control` (`rammp_common_interfaces/AcquireControl`) --
-  an engine calls this (with its own `owner_id`) when it's about to start
-  publishing overlay frames and/or calling `~/request_user_input`. Like
-  the hardware-arbitration precedent, this call **seizes**: it always
-  succeeds and always returns a fresh 16-byte token, even if another
-  owner currently holds it -- by operational contract this is only ever
-  called by the engine the Orchestrator just activated, so there should
-  never be a real conflict in practice, but the "seize" semantics mean a
-  stuck/crashed owner can never permanently block a correctly-behaving
-  new owner.
+  called with an `owner_id` identifying the caller, whenever it's about to
+  start publishing overlay frames and/or calling `~/request_user_input`.
+  Like the hardware-arbitration precedent, this call **seizes**: it always
+  succeeds and always returns a fresh 16-byte token (or the caller's own
+  pre-generated one, see below), even if another owner currently holds
+  it -- the "seize" semantics mean a stuck/crashed owner can never
+  permanently block a correctly-behaving new owner. In practice there are
+  two distinct callers:
+  - **An engine** (by operational contract, via the Orchestrator's own
+    `~/acquire_ui_control` proxy, not this endpoint directly -- see
+    `rammp-orchestrator/docs/ENGINE_UI_INTEGRATION_GUIDE.md` §2.1),
+    around the start of a pausable/cancellable `execute_action` run or
+    any other time it needs to show its own panel/overlay -- not
+    necessarily tied to `activate()`. It holds the token for as long as
+    it owns the live UI (e.g. the whole progress panel, including
+    Pause/Cancel, for one `execute_action` goal) and releases/lets its
+    own goal end when done. While an execution is in progress, the
+    Orchestrator's acquire-proxy endpoints (`~/acquire_ui_control`,
+    `~/acquire_arm_control`, `~/acquire_base_control`) all inject that
+    one execution's own session token (`AcquireControl.Request.token`
+    non-all-zero) instead of asking each resource to mint its own -- the
+    bridge grants exactly that token when it sees one supplied, so an
+    engine's `ui_control` token and its arm/base-control token (echoed
+    back in messages like `rammp_arm_interfaces/TwistSetpoint.token`)
+    end up identical for that execution, letting the engine stamp one
+    token everywhere instead of tracking several.
+  - **The Orchestrator itself**, with `owner_id="rammp_orchestrator"`,
+    once an `execute_action` goal finishes (regardless of outcome) --
+    this is both the explicit "hand control back" step and a safety net
+    if the engine crashed without releasing. Granting this reclaim is
+    what triggers the bridge to refresh the panel: `_on_ui_acquire_control`
+    recognizes this `owner_id` and re-runs `select_object` for whatever's
+    currently selected (not the activations cached from the original
+    tap, which would otherwise show pre-action availability, e.g. a
+    fridge still offering "open" after it was just opened), then pushes
+    the refreshed `InteractionPanel`. If nothing is selected, or the
+    object is no longer selectable, it falls back to the idle panel.
 - `~/ui_control/release_control` (`rammp_common_interfaces/ReleaseControl`) --
   called by the current owner (with its token) when it's done, e.g. from
   its own `hibernate`. Refused (token mismatch) if called by anyone else.
@@ -402,12 +441,16 @@ matching token are forwarded (`_forward_engine_overlay_color`) to UE,
 unconditionally, on fixed channel 2, `group="overlay"`,
 `stream_id="engine/overlay"` -- exactly the same shape as the base
 layer's forwarding, just one channel number up. An engine's expected
-lifecycle is: call `acquire_control` once it starts (e.g. on `activate`),
+lifecycle is: call `acquire_control` once it starts needing the UI,
 publish `EngineOverlayImage` frames (and/or call `~/request_user_input`,
 §3.3.2) stamped with that token while active, and call `release_control`
-when done (e.g. on `hibernate`). UE's own receive-timeout still handles
-falling back to the base-layer-only view if nothing is forwarded for a
-while (see §5.2.A).
+(or just let its holding goal end) when done -- at which point the
+Orchestrator reclaims control per the bullet above. Every grant/mint is
+logged (`ui control acquired by '<owner_id>' (minted a new/using
+orchestrator-supplied token ..., generation N)`) so it's visible in the
+node's log which owner holds the UI and when it changed hands. UE's own
+receive-timeout still handles falling back to the base-layer-only view if
+nothing is forwarded for a while (see §5.2.A).
 
 **Not yet decided:** whether this resource also needs a `RevokeControl`
 (operator-override, no-token) path for a hard crash-recovery case -- not
@@ -510,8 +553,9 @@ array field.)
 Bridge behavior while a goal is active:
 1. If `request_json`'s `panel_json` is non-empty, push it to UE's
    `InteractionPanel` channel (§5.2.C) immediately -- this **takes over**
-   whatever would otherwise be shown there (e.g. `ExecuteAction` progress,
-   §3.1.1), reverting to the prior content once the goal ends.
+   whatever would otherwise be shown there (e.g. the selected object's
+   available-actions panel), reverting to the prior content once the
+   goal ends.
 2. If `request_json`'s `objects` is non-empty, push them to UE's
    `UpdateDetectedObjects` channel (§5.2.D) tagged with the engine's own
    overlay `stream_id` and `selected_instance_id` (initially
@@ -556,9 +600,18 @@ exactly one feedback message, goal stays active), call
 `{"status": "button", ...}`), and confirm a second goal with a
 stale/wrong token is rejected outright.
 
-**Still open:** no real engine in this workspace calls
-`~/request_user_input`/`~/request_user_input/update` yet, so only this
-synthetic traffic has verified the path.
+**Also verified against a real engine:** `fridge_ui_demo`
+(`rammp_orchestrator`'s `engine_node`) now drives this path for real --
+it holds `ui_control` for the whole `open`/`close` `execute_action` run,
+confirms via a `RequestUserInput` goal before starting, and pushes its
+own live progress panel (Pause/Cancel buttons, `pct` updates) through
+`UpdateUserInputPanel` calls rather than relying on `ExecuteAction`
+feedback (§3.1.1) to drive the UI. Live-verified end to end via
+`mock_ue`'s HTTP API: select → confirm dialog → live progress panel →
+pause genuinely halts `pct` → resume continues → completion → the
+Orchestrator's reclaim (§3.3.1) refreshes the panel to the object's
+now-current available actions (e.g. `close`/`Deselect` after `open`
+finishes, flipping back to `open`/`Deselect` after `close`).
 
 ### 3.4 Bridge ↔ Hardware node -- **arm joint states implemented, chair/base still TBD**
 
@@ -613,9 +666,13 @@ yet been updated to this session's commit, so end-to-end verification
 against the live mock over the real ROS graph is still pending a
 redeploy (not requested this session).
 
-**Still TBD** (tracked in §7): chair/base speed and status -- no
-chair/base driver (mock or real) exists in this workspace yet, so that
-part of §5.2.B remains unimplemented.
+**Still TBD** (tracked in §7): chair/base speed and status -- a mock
+base driver exists now (`rammp_orchestrator/ros/mock_base_driver_node.py`),
+but it only consumes `rammp_base_interfaces/TwistSetpoint` for
+resource-arbitration purposes (per the engine's `base` lock); it doesn't
+publish any speed/odometry/status telemetry topic, so there's still
+nothing for the bridge to subscribe to and that part of §5.2.B remains
+unimplemented.
 
 
 ## 4. UI-facing interface (ROS2 server/publisher side)
@@ -776,9 +833,10 @@ engine -- this telemetry is always-on and independent of which engine
 (if any) is currently active, unlike §3.3's per-engine camera.
 **Implemented: arm joints** (§3.4) -- forwarded by joint name, not a
 hardcoded skeleton-bone index array. **Open/TBD:** chair/base speed and
-status -- no chair/base driver (mock or real) in this workspace publishes
-that yet (§3.4), so the concrete topic names/shapes can't be pinned down
-until one exists.
+status -- a mock base driver exists (§3.4), but it only consumes
+`TwistSetpoint` for resource arbitration and doesn't publish any
+speed/odometry/status telemetry, so the concrete topic names/shapes
+can't be pinned down until something does.
 
 
 #### C. `InteractionPanel` -- task/capability prompt (renamed from "information")
@@ -794,9 +852,13 @@ UE**):
   `normal` / `warning` / `error`, and `button_id` is an opaque identifier
   the bridge assigns and later resolves when UE reports a button press
   (see §5.1)
-- `progress` (optional): `{phase, pct, message, pausable}` -- the same
-  shape as `ExecuteAction` feedback, folded into the panel instead of a
-  separate function call
+- `progress` (optional): `{phase, pct, message, pausable}` -- same field
+  shape as `rammp_orchestrator_interfaces/Progress`, included at the
+  pushing engine's own discretion (via `RequestUserInput`/
+  `UpdateUserInputPanel`, §3.3.2) rather than auto-folded in by the
+  bridge from `ExecuteAction` feedback (§3.1.1); the bridge does not
+  inspect or build this field itself, it just forwards whatever
+  `panel_json` the engine supplied
 
 Per §5.1, every button the bridge puts in `buttons` corresponds to exactly
 one of: an available action (from `ActionAvailability`, resolved on tap as
@@ -812,14 +874,20 @@ new panel is pushed.
 **Engine-driven override (§3.3.2):** while an active engine's
 `RequestUserInput` goal has a non-empty `panel_json`, that content
 **takes over this channel entirely**, replacing whatever would otherwise
-be shown (e.g. `ExecuteAction` progress, or the action/control buttons for
-the currently selected object). The bridge pushes it as-is (it's already
-`InteractionPanel`-shaped) and resolves any resulting `button_press`
-against that goal, not against the normal Orchestrator-call mapping
-above (per §5.1's dispatch priority). Once the goal completes or is
-cancelled, the bridge reverts to pushing whatever panel content the
-normal Orchestrator-driven state (selected object, in-progress action,
-etc.) calls for.
+be shown (e.g. the action/control buttons for the currently selected
+object). The bridge pushes it as-is (it's already `InteractionPanel`-
+shaped) and resolves any resulting `button_press` against that goal, not
+against the normal Orchestrator-call mapping above (per §5.1's dispatch
+priority). Once the goal completes or is cancelled, the bridge rebuilds
+whatever panel reflects the normal Orchestrator-driven state
+(`_rebuild_idle_or_selected_panel`) -- but if this was the engine's last
+goal for a held `execute_action` session, that rebuild uses activations
+cached from before the action ran, so it's superseded moments later once
+the Orchestrator reclaims `ui_control` (§3.3.1) and the bridge re-fetches
+fresh activations via `select_object` instead -- the net effect the user
+sees is the panel settling on the object's *post-action* available
+actions (e.g. `close`/`Deselect` after `open` finishes), not the stale
+pre-action ones.
 
 This is deliberately a superset that can express what §5.2 previously
 modeled as four separate functions (`UpdateSelection` i.e. available
@@ -898,8 +966,11 @@ to the task/button-dialog lifecycle.
   actual state changes regardless of poll frequency.
 - `InteractionPanel` pushes are **event-triggered** -- one push whenever
   the available actions, progress, or an error condition changes (e.g. on
-  `select_object` response, on each `ExecuteAction` feedback message, on
-  terminal result, or on a reportable bridge error), no polling involved.
+  `select_object` response, on each engine-driven `RequestUserInput`/
+  `UpdateUserInputPanel` call, on the Orchestrator reclaiming `ui_control`
+  after an `execute_action` finishes (§3.3.1), or on a reportable bridge
+  error), no polling involved. `ExecuteAction` feedback itself is *not*
+  one of these triggers (§3.1.1) -- it's logged only.
 - Camera stream and system-status pushes are inherently continuous/
   event-driven at whatever rate their ROS2 sources publish, once those
   sources are defined (see §5.2.A/B "Open/TBD").
@@ -968,14 +1039,16 @@ to the task/button-dialog lifecycle.
   independent of whether/when a real wrist-camera publishes; the base
   layer's equivalent is the `ObjectRecord` extension above.
 - **§3.3.2's `RequestUserInput`/`UpdateUserInputPanel` are now
-  implemented**, gated by the same `~/ui_control` grant as the overlay
-  camera, but unexercised against a real engine -- no real engine calls
-  `~/request_user_input`/`~/request_user_input/update` yet, so only
-  synthetic test traffic (acquire token → goal with two candidate
-  objects → two alternating object taps, each producing exactly one
-  feedback message → `UpdateUserInputPanel` with a matching and then a
-  mismatched token → a `button_press` completing the goal → a
-  second goal rejected on a stale token) has verified the path.
+  implemented and exercised against a real engine.** Gated by the same
+  `~/ui_control` grant as the overlay camera; synthetic test traffic
+  (acquire token → goal with two candidate objects → two alternating
+  object taps, each producing exactly one feedback message →
+  `UpdateUserInputPanel` with a matching and then a mismatched token → a
+  `button_press` completing the goal → a second goal rejected on a stale
+  token) verified the mechanics first, and `fridge_ui_demo`
+  (`rammp_orchestrator`'s `engine_node`) now drives it for a real
+  confirm-dialog + held live-progress-panel `execute_action` flow
+  end to end (§3.1.1, §3.3.1) -- live-verified via `mock_ue`'s HTTP API.
 - **Arm joint states for §5.2.B (§3.4 Hardware node) are now
   implemented**, forwarding `arm_joint_states_topic` (default
   `/joint_states`) by joint name (not a hardcoded skeleton-bone index
@@ -990,7 +1063,11 @@ to the task/button-dialog lifecycle.
   verification over the live ROS graph (jetson-deployed bridge ↔
   jetson-deployed mock ↔ real UE) is still pending a redeploy. **Chair/
   base speed and status, the other half of §5.2.B, remains unimplemented**
-  -- no chair/base driver (mock or real) exists in this workspace yet.
+    -- a mock base driver now exists
+    (`rammp_orchestrator/ros/mock_base_driver_node.py`), but it only
+    consumes `TwistSetpoint` for resource arbitration and publishes no
+    speed/odometry/status telemetry, so there's still nothing for the
+    bridge to subscribe to.
 - Joint-state → UE skeleton **mapping is now name-keyed, not a hardcoded
   index layout.** The Gen1 prototype's `set_ui_joints` hardcoded a
   53-element float array keyed to fixed skeleton-bone indices, specific

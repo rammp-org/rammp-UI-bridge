@@ -128,10 +128,28 @@ token = resp.token                # keep this -- stamp every subsequent call wit
 
 This call **seizes**: if another engine (or a stale goal) currently holds
 `ui_control`, you get it anyway and their outstanding goal/overlay frames
-are invalidated. Only acquire it when you're actually about to ask for
-input -- don't hold it for your whole action. Release it the same way, via
+are invalidated. For a single ask-and-release input step like the rest of
+this section walks through, only acquire it when you're actually about to
+ask for input, and release it right after -- don't hold it for your whole
+action just for this. Release it the same way, via
 `/rammp_orchestrator/release_ui_control` (`ReleaseControl.srv`), not the
 bridge's own release service.
+
+**Holding it across a whole execution instead (live progress panels).**
+If what you actually want is a continuously-updating panel for the
+duration of a pausable/cancellable `execute_action` run (progress bar,
+Pause/Cancel buttons, not just a one-off question), acquire once at the
+start of that run and keep the token for as long as you're driving the
+UI yourself -- release only when the run ends (success, failure, or
+cancel), handing display control back to the Orchestrator's own
+selection panel at that point (see `docs/NODE_INTERFACE.md` §3.1.1/§3.3.1
+for how the bridge reacts once it's reclaimed). `fridge_ui_demo`
+(`rammp_orchestrator`'s reference engine) does exactly this via its
+`UiBridgeProgressSession` helper (`rammp_orchestrator/ros/
+ui_bridge_client.py`): `start()` once per `execute_action` goal, `show()`
+on every progress step (refreshing the open goal in place via
+`UpdateUserInputPanel` rather than opening a new one each time), and
+`finish()` once the run is over.
 
 ### 2.2 Decide: are the targets tappable objects, plain buttons, or both?
 
