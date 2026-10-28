@@ -303,6 +303,14 @@ class UiBridgeNode(Node):
     as long as the calling engine's goal is outstanding.
     """
 
+    # Must match OrchestratorNode._UI_OWNER_ID (rammp_orchestrator/ros/
+    # orchestrator_node.py) -- the owner_id the Orchestrator itself passes
+    # to AcquireControl.srv when it reclaims ui_control after an engine's
+    # action finishes executing. Used to tell "the Orchestrator just took
+    # control back" apart from "an engine just acquired it for its own
+    # progress/RequestUserInput session" in _on_ui_acquire_control.
+    _ORCHESTRATOR_OWNER_ID = "rammp_orchestrator"
+
     def __init__(self) -> None:
         super().__init__("ui_bridge_node")
 
@@ -361,6 +369,7 @@ class UiBridgeNode(Node):
         # (not an engine-supplied one, see _active_input_goal below).
         self._panel_buttons: dict[str, dict[str, Any]] = {}
         self._selected_instance_id: str = ""
+        self._selected_perception_class: str = ""
         self._selected_activations: list = []
         # Set while a RequestUserInput goal from an engine is active; see
         # _on_request_user_input_execute. None when no engine is waiting on
@@ -732,6 +741,15 @@ class UiBridgeNode(Node):
             f"token {self._ui_token.hex()[:8]}..., generation {self._ui_generation})"
         )
         self._publish_ui_control_status()
+        if request.owner_id == self._ORCHESTRATOR_OWNER_ID:
+            # The Orchestrator reclaiming control marks "an engine's action
+            # just finished" (see OrchestratorNode._reclaim_ui_control) --
+            # whatever panel the engine last pushed is now stale, and even
+            # the cached activations from the original select_object tap
+            # may no longer reflect reality (e.g. a fridge's 'opened' flag
+            # just flipped), so re-fetch and re-push instead of leaving the
+            # UE showing the engine's last frame.
+            self._refresh_selected_activations()
         return response
 
     def _on_ui_release_control(
@@ -913,21 +931,64 @@ class UiBridgeNode(Node):
         ):
             self._report_service_unavailable("select_object")
             return
+        perception_class = command.get("perception_class", "")
         req = SelectObject.Request(
             instance_id=instance_id,
-            perception_class=command.get("perception_class", ""),
+            perception_class=perception_class,
         )
         future = self._select_object_client.call_async(req)
-        future.add_done_callback(lambda fut: self._on_select_object_response(fut, instance_id))
+        future.add_done_callback(
+            lambda fut: self._on_select_object_response(fut, instance_id, perception_class)
+        )
 
-    def _on_select_object_response(self, future, instance_id: str) -> None:
+    def _on_select_object_response(
+        self, future, instance_id: str, perception_class: str, *, silent: bool = False
+    ) -> None:
         resp = future.result()
         if not resp.success:
+            if silent:
+                # Fired from a background re-select (see
+                # _refresh_selected_activations); the object may have
+                # dropped out of detection or its class may have changed
+                # since it was selected, so fall back to whatever panel
+                # currently reflects reality instead of surfacing an error
+                # for an action the user never took.
+                self._selected_instance_id = ""
+                self._selected_perception_class = ""
+                self._selected_activations = []
+                self._push_idle_panel()
+                return
             self._push_error_panel(resp.message or f"could not select '{instance_id}'")
             return
         self._selected_instance_id = instance_id
+        self._selected_perception_class = perception_class
         self._selected_activations = list(resp.activations)
         self._push_selection_panel(instance_id, resp.activations, resp.message)
+
+    def _refresh_selected_activations(self) -> None:
+        # Re-runs select_object for whatever's currently selected so the
+        # panel reflects the live World State (e.g. a fridge's 'opened'
+        # flag flipping close/deselect into availability) instead of the
+        # activations cached from the original tap, which are stale after
+        # any action has executed. Called once the Orchestrator reclaims
+        # ui_control at the end of an engine's execution -- see
+        # _on_ui_acquire_control.
+        instance_id = self._selected_instance_id
+        perception_class = self._selected_perception_class
+        if not instance_id:
+            return
+        if not self._select_object_client.wait_for_service(timeout_sec=self._service_wait_timeout):
+            self.get_logger().warning(
+                "select_object service unavailable; cannot refresh panel after action completion"
+            )
+            return
+        req = SelectObject.Request(instance_id=instance_id, perception_class=perception_class)
+        future = self._select_object_client.call_async(req)
+        future.add_done_callback(
+            lambda fut: self._on_select_object_response(
+                fut, instance_id, perception_class, silent=True
+            )
+        )
 
     def _handle_button_press(self, command: dict[str, Any]) -> None:
         button_id = command.get("button_id", "")
@@ -962,6 +1023,7 @@ class UiBridgeNode(Node):
             self._push_error_panel(resp.message or "deselect failed")
             return
         self._selected_instance_id = ""
+        self._selected_perception_class = ""
         self._selected_activations = []
         self._push_idle_panel()
 
