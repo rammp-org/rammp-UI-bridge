@@ -1,36 +1,31 @@
 """Thin rclpy bridge between an Unreal Engine touchscreen UI and the RAMMP
-Orchestrator's public ROS2 interface (``rammp_orchestrator_interfaces``), per
-``docs/NODE_INTERFACE.md``.
-
-This plays exactly the role ``rammp_orchestrator.mocks.ui_node.UINode`` plays
-in the Orchestrator's own test suite -- a client of
-``~/get_detected_objects``/``~/select_object``/
-``~/deselect``/``~/control``/``~/execute_action`` -- except driven by actual
-UE user input instead of a scripted demo, and it pushes every response back
-to UE instead of printing it.
+Orchestrator, per ``docs/NODE_INTERFACE.md``. Talks to the Orchestrator
+(and to engines) purely via ``rammp_ui_bridge_interfaces``'s generic
+``RequestUserInput``/``UpdateUserInputPanel`` mechanism -- it no longer
+depends on ``rammp_orchestrator_interfaces`` at all.
 
 **Governing principle (§5.1): UE only ever reports a tap.** UE sends exactly
 two command shapes -- ``select_object`` (tapped an object) and
-``button_press`` (tapped a button on the current ``InteractionPanel``) --
-never a domain command (``execute_action``/``control``/``deselect``)
-directly. This node owns the mapping from an opaque, bridge-assigned
-``button_id`` to the Orchestrator call (plus params) it represents, rebuilt
-every time a new panel is pushed (see ``_panel_buttons``).
+``button_press`` (tapped a button on the current ``InteractionPanel``).
+Every caller -- the Orchestrator's own always-open browse session and any
+engine running an action -- is a ``~/request_user_input``/
+``~/request_user_input/update`` caller; this bridge never originates
+Orchestrator calls (``select_object``/``deselect``/``control``/
+``execute_action``) on its own anymore. A tap is resolved purely against
+whichever ``RequestUserInput`` goal is currently active (see
+``_try_resolve_active_input_goal``); there is no other dispatch path.
 
-**Engine-driven user input (§3.3.2).** This node also serves
+**Engine-driven user input (§3.3.2).** This node serves
 ``~/request_user_input`` (``rammp_ui_bridge_interfaces/RequestUserInput``),
-called directly by an active engine node, bypassing the Orchestrator
-entirely, and gated by the same ``ui_control`` arbitration grant as the
-overlay camera below (a goal's ``token`` must match). A ``select_object``/
-``button_press`` tap is resolved against an active goal *first*, if the
-tapped id matches what that goal is offering; only otherwise does the
-normal Orchestrator-call dispatch below apply. Tapping an object never
-completes the goal by itself -- it's reported to the engine as feedback,
-and the engine may call ``~/request_user_input/update``
+called by whichever caller (Orchestrator or an active engine) currently
+holds the ``ui_control`` arbitration grant (a goal's ``token`` must match).
+Tapping an object never completes the goal by itself -- it's reported to
+the caller as feedback, and the caller may call
+``~/request_user_input/update``
 (``rammp_ui_bridge_interfaces/UpdateUserInputPanel``) any number of times
 while its goal is active to change the displayed panel/candidate
 list/highlighted selection in response. Only a button press (or the
-engine's own cancel) ends the goal.
+caller's own cancel) ends the goal.
 
 By design this node never talks to engines about anything but this one
 direct request/response exchange, and never duplicates Orchestrator logic --
@@ -86,7 +81,7 @@ import time
 from typing import Any
 
 import rclpy
-from rclpy.action import ActionClient, ActionServer, CancelResponse, GoalResponse
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -96,31 +91,12 @@ from std_msgs.msg import Bool
 
 from rammp_common_interfaces.msg import ControlStatus
 from rammp_common_interfaces.srv import AcquireControl, ReleaseControl
-from rammp_orchestrator_interfaces.action import ExecuteAction
-from rammp_orchestrator_interfaces.srv import (
-    Control,
-    Deselect,
-    GetDetectedObjects,
-    SelectObject,
-)
 from rammp_ui_bridge_interfaces.action import RequestUserInput
 from rammp_ui_bridge_interfaces.msg import EngineOverlayImage
 from rammp_ui_bridge_interfaces.srv import UpdateUserInputPanel
 
 from ramms_tools.streaming import StreamSender
 from ..unreal_remote_websocket import UnrealRemoteWebsocket
-
-_CONTROL_COMMANDS = {
-    "PAUSE": Control.Request.PAUSE,
-    "RESUME": Control.Request.RESUME,
-    "CANCEL": Control.Request.CANCEL,
-}
-
-_DESELECT_BUTTON_ID = "deselect"
-_DISMISS_BUTTON_ID = "dismiss"
-_PAUSE_BUTTON_ID = "control:pause"
-_RESUME_BUTTON_ID = "control:resume"
-_CANCEL_BUTTON_ID = "control:cancel"
 
 # §5.2.A base-layer camera stream: fixed RMSS channel numbers + stream IDs for
 # the scene camera's two layers (one bridge, one scene camera -- no per-robot
@@ -147,86 +123,11 @@ _UINT16_DEPTH_ENCODINGS = frozenset({"16UC1", "mono16"})
 # Pure JSON-shaping helpers -- no ROS2/UE dependency, unit tested directly.
 # ---------------------------------------------------------------------------
 
-def _object_record_to_dict(obj) -> dict[str, Any]:
-    """§5.2.D per-object shape. ``box``/``stream_id`` are the proposed
-    ``ObjectRecord`` extension (§3.1's get_detected_objects note) -- box is
-    an empty list when the object currently has no reported box."""
-    box = list(obj.box) if any(obj.box) else []
-    return {
-        "instance_id": obj.instance_id,
-        "perception_class": obj.perception_class,
-        "last_pose": json.loads(obj.last_pose_json) if obj.last_pose_json else {},
-        "location": obj.location,
-        "opened": obj.opened,
-        "last_seen": obj.last_seen,
-        "box": box,
-        "stream_id": obj.stream_id,
-    }
-
-
-def _activation_to_dict(activation) -> dict[str, Any]:
-    return {
-        "engine_id": activation.engine_id,
-        "availability": [
-            {
-                "action_id": av.action_id,
-                "available": av.available,
-                "reason": av.reason,
-                "suggested_params": json.loads(av.suggested_params_json)
-                if av.suggested_params_json
-                else {},
-            }
-            for av in activation.availability
-        ],
-    }
-
-
-def _result_to_dict(result) -> dict[str, Any]:
-    return {
-        "status": result.status,
-        "payload": json.loads(result.payload_json) if result.payload_json else {},
-        "error_code": result.error_code,
-        "recoverable": result.recoverable,
-        "suggestions": list(result.suggestions),
-    }
-
-
-def build_panel(
-    title: str = "",
-    message: str = "",
-    buttons: list[dict[str, str]] | None = None,
-    progress: dict[str, Any] | None = None,
-    style: str = "normal",
-) -> tuple[str, dict[str, dict[str, Any]]]:
-    """Builds one ``InteractionPanel`` (§5.2.C) JSON payload. Returns the
-    JSON string to push to UE, and a fresh ``button_id -> mapping`` dict the
-    caller should install as the new ``self._panel_buttons`` (replacing
-    whatever was there before -- every panel push fully replaces the prior
-    one, it's never a diff)."""
-    buttons = buttons or []
-    panel_buttons = []
-    mapping: dict[str, dict[str, Any]] = {}
-    for button_id, label, button_style, entry in buttons:
-        panel_buttons.append({"button_id": button_id, "label": label, "style": button_style})
-        mapping[button_id] = entry
-    payload: dict[str, Any] = {
-        "title": title,
-        "message": message,
-        "buttons": panel_buttons,
-    }
-    if progress is not None:
-        payload["progress"] = progress
-    if style != "normal":
-        payload["style"] = style
-    return json.dumps(payload), mapping
-
-
 def panel_button_ids(panel_json: str) -> frozenset[str]:
-    """Extracts the set of ``button_id``s an (engine-supplied, §3.3.2)
-    ``InteractionPanel`` JSON payload offers, for dispatch-priority matching
-    (§5.1) -- independent of this bridge's own ``_panel_buttons`` mapping,
-    since an engine's panel buttons resolve against its own
-    ``RequestUserInput`` goal, not an Orchestrator call."""
+    """Extracts the set of ``button_id``s a ``RequestUserInput`` caller's
+    (Orchestrator or engine, §5.1/§3.3.2) ``InteractionPanel`` JSON payload
+    offers, for matching against the active goal in
+    ``_try_resolve_active_input_goal``."""
     if not panel_json:
         return frozenset()
     try:
@@ -255,42 +156,6 @@ def parse_request_json(request_json: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def selection_panel_buttons(activations) -> list[tuple[str, str, str, dict[str, Any]]]:
-    """Builds the button list for a just-selected object: one button per
-    available action across every claiming engine (§3.1's ``EngineActivation``),
-    plus a ``deselect`` button. Label falls back to ``action_id`` -- see
-    §7's open TBD on ``ActionAvailability`` missing ``ActionSpec.label``."""
-    buttons: list[tuple[str, str, str, dict[str, Any]]] = []
-    for activation in activations:
-        for av in activation.availability:
-            if not av.available:
-                continue
-            button_id = f"action:{activation.engine_id}:{av.action_id}"
-            params = json.loads(av.suggested_params_json) if av.suggested_params_json else {}
-            buttons.append((
-                button_id,
-                av.action_id,
-                "normal",
-                {
-                    "kind": "execute_action",
-                    "engine_id": activation.engine_id,
-                    "action_id": av.action_id,
-                    "params": params,
-                },
-            ))
-    buttons.append((_DESELECT_BUTTON_ID, "Deselect", "normal", {"kind": "deselect"}))
-    return buttons
-
-
-def control_panel_buttons(pausable: bool) -> list[tuple[str, str, str, dict[str, Any]]]:
-    buttons: list[tuple[str, str, str, dict[str, Any]]] = []
-    if pausable:
-        buttons.append((_PAUSE_BUTTON_ID, "Pause", "normal", {"kind": "control", "command": "PAUSE"}))
-        buttons.append((_RESUME_BUTTON_ID, "Resume", "normal", {"kind": "control", "command": "RESUME"}))
-    buttons.append((_CANCEL_BUTTON_ID, "Cancel", "warning", {"kind": "control", "command": "CANCEL"}))
-    return buttons
-
-
 class UiBridgeNode(Node):
     """Bridges one UE instance to one Orchestrator instance.
 
@@ -303,24 +168,13 @@ class UiBridgeNode(Node):
     as long as the calling engine's goal is outstanding.
     """
 
-    # Must match OrchestratorNode._UI_OWNER_ID (rammp_orchestrator/ros/
-    # orchestrator_node.py) -- the owner_id the Orchestrator itself passes
-    # to AcquireControl.srv when it reclaims ui_control after an engine's
-    # action finishes executing. Used to tell "the Orchestrator just took
-    # control back" apart from "an engine just acquired it for its own
-    # progress/RequestUserInput session" in _on_ui_acquire_control.
-    _ORCHESTRATOR_OWNER_ID = "rammp_orchestrator"
-
     def __init__(self) -> None:
         super().__init__("ui_bridge_node")
 
         self.declare_parameter("ue_host", "127.0.0.1")
         self.declare_parameter("ue_ws_port", 30020)
         self.declare_parameter("ue_preset", "RAMMP")
-        self.declare_parameter("orchestrator_ns", "/rammp_orchestrator")
-        self.declare_parameter("detected_objects_poll_period", 0.5)
         self.declare_parameter("connection_publish_period", 1.0)
-        self.declare_parameter("service_wait_timeout", 5.0)
         # §3.2 Bridge <-> Camera: the scene camera's raw color/depth topics.
         # Depth's topic name depends on which scene_camera alternative a
         # given robot profile selects (see rammp-deployments'
@@ -355,22 +209,8 @@ class UiBridgeNode(Node):
         # hardcoded index layout -- see the module docstring.
         self.declare_parameter("arm_joint_states_topic", "/joint_states")
 
-        self._ns = self.get_parameter("orchestrator_ns").value
-        self._service_wait_timeout = (
-            self.get_parameter("service_wait_timeout").get_parameter_value().double_value
-        )
-
         self._cb_group = ReentrantCallbackGroup()
-        self._last_detected_ids: frozenset[str] = frozenset()
 
-        # -- panel/selection state ------------------------------------------------
-        # button_id -> {"kind": "execute_action"/"control"/"deselect"/"dismiss", ...}
-        # for whatever InteractionPanel this bridge itself most recently built
-        # (not an engine-supplied one, see _active_input_goal below).
-        self._panel_buttons: dict[str, dict[str, Any]] = {}
-        self._selected_instance_id: str = ""
-        self._selected_perception_class: str = ""
-        self._selected_activations: list = []
         # Set while a RequestUserInput goal from an engine is active; see
         # _on_request_user_input_execute. None when no engine is waiting on
         # user input right now. Guarded by _active_input_lock since it's
@@ -449,24 +289,6 @@ class UiBridgeNode(Node):
         )
         self._stream_reconnect_thread.start()
 
-        self._get_detected_objects_client = self.create_client(
-            GetDetectedObjects,
-            f"{self._ns}/get_detected_objects",
-            callback_group=self._cb_group,
-        )
-        self._select_object_client = self.create_client(
-            SelectObject, f"{self._ns}/select_object", callback_group=self._cb_group
-        )
-        self._deselect_client = self.create_client(
-            Deselect, f"{self._ns}/deselect", callback_group=self._cb_group
-        )
-        self._control_client = self.create_client(
-            Control, f"{self._ns}/control", callback_group=self._cb_group
-        )
-        self._execute_action_client = ActionClient(
-            self, ExecuteAction, f"{self._ns}/execute_action", callback_group=self._cb_group
-        )
-
         self._request_user_input_server = ActionServer(
             self,
             RequestUserInput,
@@ -517,11 +339,6 @@ class UiBridgeNode(Node):
             self.get_parameter("connection_publish_period").value,
             self._publish_connection_status,
         )
-        self.create_timer(
-            self.get_parameter("detected_objects_poll_period").value,
-            self._poll_detected_objects,
-            callback_group=self._cb_group,
-        )
 
         self.ue = UnrealRemoteWebsocket(
             host=self.get_parameter("ue_host").value,
@@ -559,11 +376,9 @@ class UiBridgeNode(Node):
             callback_group=self._cb_group,
         )
 
-        self._push_idle_panel()
-
         self.get_logger().info(
             f"rammp_ui_bridge ready; bridging UE at "
-            f"{self.get_parameter('ue_host').value} <-> Orchestrator at '{self._ns}'; "
+            f"{self.get_parameter('ue_host').value}; "
             f"scene camera color='{self.get_parameter('scene_camera_color_topic').value}' "
             f"depth='{self.get_parameter('scene_camera_depth_topic').value}' "
             f"engine overlay='{self.get_parameter('engine_overlay_topic').value}' "
@@ -741,15 +556,6 @@ class UiBridgeNode(Node):
             f"token {self._ui_token.hex()[:8]}..., generation {self._ui_generation})"
         )
         self._publish_ui_control_status()
-        if request.owner_id == self._ORCHESTRATOR_OWNER_ID:
-            # The Orchestrator reclaiming control marks "an engine's action
-            # just finished" (see OrchestratorNode._reclaim_ui_control) --
-            # whatever panel the engine last pushed is now stale, and even
-            # the cached activations from the original select_object tap
-            # may no longer reflect reality (e.g. a fridge's 'opened' flag
-            # just flipped), so re-fetch and re-push instead of leaving the
-            # UE showing the engine's last frame.
-            self._refresh_selected_activations()
         return response
 
     def _on_ui_release_control(
@@ -845,43 +651,33 @@ class UiBridgeNode(Node):
             self._stream_shutdown.wait(self._stream_reconnect_period)
 
     # ------------------------------------------------------------------
-    # UE -> Orchestrator / UE -> active engine: dispatch user-input commands
+    # UE -> active RequestUserInput caller (Orchestrator or engine):
+    # dispatch user-input commands
     # ------------------------------------------------------------------
     def _on_ue_user_input(self, raw: str) -> None:
         """Invoked (on the UE WebSocket's asyncio thread) whenever UE's
         "UserInput" preset property changes -- see §5.1 for the expected
         JSON command schema. Only ``select_object``/``button_press`` are
-        valid UE-originated commands; everything else (action execution,
-        pause/resume/cancel, deselect) is this bridge's own internal
-        button-mapping lookup (§5.1's "governing principle")."""
+        valid UE-originated commands. Every tap is resolved purely against
+        whichever ``RequestUserInput`` goal is currently active (the
+        Orchestrator's own always-open browse session, or an engine's,
+        while it runs an action) -- there is no other dispatch path."""
         try:
             command = json.loads(raw)
         except (TypeError, ValueError):
             self.get_logger().error(f"ignoring malformed UserInput (not JSON): {raw!r}")
-            self._push_error_panel(f"malformed UserInput: {raw!r}")
             return
 
         cmd = command.get("cmd")
-
-        # Dispatch priority (§5.1): an active engine input request wins
-        # first, if the tapped id matches something it's offering.
-        if self._active_input_goal is not None:
-            if self._try_resolve_active_input_goal(cmd, command):
-                return
-
-        handler = {
-            "select_object": self._handle_select_object,
-            "button_press": self._handle_button_press,
-        }.get(cmd)
-        if handler is None:
+        if cmd not in ("select_object", "button_press"):
             self.get_logger().error(f"ignoring UserInput with unknown cmd: {cmd!r}")
-            self._push_error_panel(f"unknown cmd: {cmd!r}")
             return
-        try:
-            handler(command)
-        except Exception as e:  # noqa: BLE001 -- isolate one bad command from the bridge
-            self.get_logger().error(f"error handling UserInput cmd '{cmd}': {e}")
-            self._push_error_panel(str(e))
+        if self._try_resolve_active_input_goal(cmd, command):
+            return
+        self.get_logger().warning(
+            f"dropped UserInput {command!r}: no active RequestUserInput goal "
+            "matched it (nobody is currently offering this tap)"
+        )
 
     def _try_resolve_active_input_goal(self, cmd: str, command: dict[str, Any]) -> bool:
         """Returns True if the tap matched the active ``RequestUserInput``
@@ -919,226 +715,6 @@ class UiBridgeNode(Node):
         goal_handle.publish_feedback(feedback)
         return True
 
-    def _handle_select_object(self, command: dict[str, Any]) -> None:
-        instance_id = command.get("instance_id", "")
-        # §6: a tap on an instance_id the bridge no longer recognizes must
-        # be reported, not silently forwarded or dropped.
-        if instance_id not in self._last_detected_ids:
-            self._push_error_panel(f"'{instance_id}' is no longer detected")
-            return
-        if not self._select_object_client.wait_for_service(
-            timeout_sec=self._service_wait_timeout
-        ):
-            self._report_service_unavailable("select_object")
-            return
-        perception_class = command.get("perception_class", "")
-        req = SelectObject.Request(
-            instance_id=instance_id,
-            perception_class=perception_class,
-        )
-        future = self._select_object_client.call_async(req)
-        future.add_done_callback(
-            lambda fut: self._on_select_object_response(fut, instance_id, perception_class)
-        )
-
-    def _on_select_object_response(
-        self, future, instance_id: str, perception_class: str, *, silent: bool = False
-    ) -> None:
-        resp = future.result()
-        if not resp.success:
-            if silent:
-                # Fired from a background re-select (see
-                # _refresh_selected_activations); the object may have
-                # dropped out of detection or its class may have changed
-                # since it was selected, so fall back to whatever panel
-                # currently reflects reality instead of surfacing an error
-                # for an action the user never took.
-                self._selected_instance_id = ""
-                self._selected_perception_class = ""
-                self._selected_activations = []
-                self._push_idle_panel()
-                return
-            self._push_error_panel(resp.message or f"could not select '{instance_id}'")
-            return
-        self._selected_instance_id = instance_id
-        self._selected_perception_class = perception_class
-        self._selected_activations = list(resp.activations)
-        self._push_selection_panel(instance_id, resp.activations, resp.message)
-
-    def _refresh_selected_activations(self) -> None:
-        # Re-runs select_object for whatever's currently selected so the
-        # panel reflects the live World State (e.g. a fridge's 'opened'
-        # flag flipping close/deselect into availability) instead of the
-        # activations cached from the original tap, which are stale after
-        # any action has executed. Called once the Orchestrator reclaims
-        # ui_control at the end of an engine's execution -- see
-        # _on_ui_acquire_control.
-        instance_id = self._selected_instance_id
-        perception_class = self._selected_perception_class
-        if not instance_id:
-            return
-        if not self._select_object_client.wait_for_service(timeout_sec=self._service_wait_timeout):
-            self.get_logger().warning(
-                "select_object service unavailable; cannot refresh panel after action completion"
-            )
-            return
-        req = SelectObject.Request(instance_id=instance_id, perception_class=perception_class)
-        future = self._select_object_client.call_async(req)
-        future.add_done_callback(
-            lambda fut: self._on_select_object_response(
-                fut, instance_id, perception_class, silent=True
-            )
-        )
-
-    def _handle_button_press(self, command: dict[str, Any]) -> None:
-        button_id = command.get("button_id", "")
-        mapping = self._panel_buttons.get(button_id)
-        if mapping is None:
-            # §6: a stale/unknown button_id (panel already changed) must be
-            # reported, not silently ignored or forwarded.
-            self._push_error_panel(f"'{button_id}' is no longer valid")
-            return
-        kind = mapping["kind"]
-        if kind == "execute_action":
-            self._start_execute_action(mapping["engine_id"], mapping["action_id"], mapping.get("params", {}))
-        elif kind == "control":
-            self._send_control(mapping["command"])
-        elif kind == "deselect":
-            self._send_deselect()
-        elif kind == "dismiss":
-            self._rebuild_idle_or_selected_panel()
-        else:
-            self.get_logger().error(f"unknown panel button kind {kind!r} for {button_id!r}")
-
-    def _send_deselect(self) -> None:
-        if not self._deselect_client.wait_for_service(timeout_sec=self._service_wait_timeout):
-            self._report_service_unavailable("deselect")
-            return
-        future = self._deselect_client.call_async(Deselect.Request())
-        future.add_done_callback(self._on_deselect_response)
-
-    def _on_deselect_response(self, future) -> None:
-        resp = future.result()
-        if not resp.success:
-            self._push_error_panel(resp.message or "deselect failed")
-            return
-        self._selected_instance_id = ""
-        self._selected_perception_class = ""
-        self._selected_activations = []
-        self._push_idle_panel()
-
-    def _send_control(self, command_name: str) -> None:
-        if not self._control_client.wait_for_service(timeout_sec=self._service_wait_timeout):
-            self._report_service_unavailable("control")
-            return
-        req = Control.Request(command=_CONTROL_COMMANDS[command_name])
-        future = self._control_client.call_async(req)
-
-        def on_response(fut):
-            resp = fut.result()
-            if not resp.accepted:
-                self._push_error_panel(resp.message or f"'{command_name}' not accepted")
-
-        future.add_done_callback(on_response)
-
-    def _start_execute_action(self, engine_id: str, action_id: str, params: dict[str, Any]) -> None:
-        if not self._execute_action_client.wait_for_server(
-            timeout_sec=self._service_wait_timeout
-        ):
-            self._report_service_unavailable("execute_action")
-            return
-        goal = ExecuteAction.Goal(
-            engine_id=engine_id,
-            action_id=action_id,
-            params_json=json.dumps(params),
-        )
-
-        def on_feedback(feedback_msg):
-            # Per the project's decision that an engine now owns its own
-            # live progress panel for the whole action (acquiring
-            # ui_control once and pushing it directly via
-            # RequestUserInput/UpdateUserInputPanel -- see
-            # ENGINE_UI_INTEGRATION_GUIDE.md's "held progress session"
-            # section), this feedback is no longer rendered here: it would
-            # otherwise race the engine's own panel pushes and show stale
-            # Orchestrator-relayed control:pause/control:cancel buttons that
-            # the engine isn't listening for. Kept purely as a log line --
-            # ExecuteAction's feedback still exists for the Orchestrator's
-            # own internal progress tracking.
-            p = feedback_msg.feedback.progress
-            self.get_logger().debug(
-                f"{engine_id}: {action_id} progress (orchestrator-internal) "
-                f"{p.phase} {p.pct:.0%} -- {p.message}"
-            )
-
-        send_future = self._execute_action_client.send_goal_async(
-            goal, feedback_callback=on_feedback
-        )
-        send_future.add_done_callback(
-            lambda fut: self._on_execute_action_accepted(fut, engine_id, action_id)
-        )
-
-    def _on_execute_action_accepted(self, future, engine_id: str, action_id: str) -> None:
-        goal_handle = future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            self._push_error_panel(f"'{engine_id}/{action_id}' goal rejected")
-            return
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(
-            lambda fut: self._on_execute_action_result(fut, engine_id, action_id)
-        )
-
-    def _on_execute_action_result(self, future, engine_id: str, action_id: str) -> None:
-        result = _result_to_dict(future.result().result.result)
-        status_label = {0: "Success", 1: "Failed", 2: "Cancelled"}.get(result["status"], "Unknown")
-        panel_json, mapping = build_panel(
-            title=f"{engine_id}: {action_id} -- {status_label}",
-            message=result["error_code"] or status_label,
-            buttons=[(_DESELECT_BUTTON_ID, "Deselect", "normal", {"kind": "deselect"})],
-            style="normal" if result["status"] == 0 else "error",
-        )
-        self._panel_buttons = mapping
-        self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
-
-    def _report_service_unavailable(self, name: str) -> None:
-        self.get_logger().error(f"Orchestrator service '{name}' is not available")
-        self._push_error_panel(f"'{name}' service unavailable")
-
-    # ------------------------------------------------------------------
-    # InteractionPanel (§5.2.C) push helpers
-    # ------------------------------------------------------------------
-    def _push_idle_panel(self) -> None:
-        panel_json, mapping = build_panel(
-            title="", message="Select an object or action to begin."
-        )
-        self._panel_buttons = mapping
-        self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
-
-    def _push_selection_panel(self, instance_id: str, activations, message: str) -> None:
-        panel_json, mapping = build_panel(
-            title=instance_id,
-            message=message,
-            buttons=selection_panel_buttons(activations),
-        )
-        self._panel_buttons = mapping
-        self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
-
-    def _push_error_panel(self, message: str) -> None:
-        panel_json, mapping = build_panel(
-            title="Error",
-            message=message,
-            buttons=[(_DISMISS_BUTTON_ID, "Dismiss", "error", {"kind": "dismiss"})],
-            style="error",
-        )
-        self._panel_buttons = mapping
-        self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
-
-    def _rebuild_idle_or_selected_panel(self) -> None:
-        if self._selected_instance_id:
-            self._push_selection_panel(self._selected_instance_id, self._selected_activations, "")
-        else:
-            self._push_idle_panel()
-
     # ------------------------------------------------------------------
     # §3.3.2: engine-initiated, Orchestrator-bypassing user input requests
     # ------------------------------------------------------------------
@@ -1167,14 +743,18 @@ class UiBridgeNode(Node):
         return GoalResponse.ACCEPT
 
     def _push_engine_objects(
-        self, engine_id: str, objects: list[dict[str, Any]], selected_instance_id: str
+        self, objects: list[dict[str, Any]], selected_instance_id: str
     ) -> None:
         """Pushes an engine's ``RequestUserInput`` candidate objects to UE's
-        ``UpdateDetectedObjects`` channel, tagged with that engine's own
-        overlay ``stream_id`` and the currently-highlighted selection (if
-        any) -- shared by the goal's initial push and every subsequent
-        ``_on_update_user_input_panel`` call. ``objects`` is already a list
-        of plain dicts (parsed from ``request_json``), not ROS messages."""
+        ``UpdateDetectedObjects`` channel, along with the currently-
+        highlighted selection (if any) -- shared by the goal's initial push
+        and every subsequent ``_on_update_user_input_panel`` call.
+        ``objects`` is already a list of plain dicts (parsed from
+        ``request_json``), not ROS messages. Each object's own ``source``
+        key (``"scene"``/``"overlay"``, caller-supplied) is passed through
+        as-is so UE knows which video channel the box's pixel coordinates
+        are relative to -- the bridge does not infer or default this from
+        ``engine_id``, since one goal's objects can mix both sources."""
         self.ue.call_function(
             "UpdateDetectedObjects",
             {
@@ -1183,7 +763,7 @@ class UiBridgeNode(Node):
                         "instance_id": o.get("instance_id", ""),
                         "perception_class": o.get("perception_class", ""),
                         "box": list(o.get("box", (0.0, 0.0, 0.0, 0.0))),
-                        "stream_id": engine_id,
+                        "source": o.get("source", ""),
                     }
                     for o in objects
                 ],
@@ -1218,7 +798,7 @@ class UiBridgeNode(Node):
         if panel_json:
             self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
         if objects:
-            self._push_engine_objects(goal.engine_id, objects, selected_instance_id)
+            self._push_engine_objects(objects, selected_instance_id)
 
         try:
             while not done_event.is_set():
@@ -1241,10 +821,11 @@ class UiBridgeNode(Node):
         finally:
             with self._active_input_lock:
                 self._active_input_goal = None
-            # Whatever panel/objects this goal pushed on the engine's
-            # behalf is now stale -- revert to the normal Orchestrator-
-            # driven state (§5.2.C's "Engine-driven override" note).
-            self._rebuild_idle_or_selected_panel()
+            # Whatever panel/objects this goal pushed is now stale, but
+            # it's not this node's job to decide what replaces it -- the
+            # next caller (the Orchestrator's own browse session reopening
+            # after a handoff, or nothing at all) pushes its own panel via
+            # a fresh RequestUserInput goal.
 
     def _on_update_user_input_panel(
         self, request: UpdateUserInputPanel.Request, response: UpdateUserInputPanel.Response
@@ -1280,48 +861,17 @@ class UiBridgeNode(Node):
                 state["object_ids"] = frozenset(o.get("instance_id", "") for o in objects)
             if update_selected:
                 state["selected_instance_id"] = update["selected_instance_id"]
-            engine_id = state["engine_id"]
             objects = state["objects"]
             selected_instance_id = state["selected_instance_id"]
 
         if update_panel:
             self.ue.call_function("UpdatePanel", {"PanelJson": update["panel_json"]})
         if update_objects or update_selected:
-            self._push_engine_objects(engine_id, objects, selected_instance_id)
+            self._push_engine_objects(objects, selected_instance_id)
 
         response.accepted = True
         response.message = ""
         return response
-
-    # ------------------------------------------------------------------
-    # Orchestrator -> UE: polled push of detected objects
-    # ------------------------------------------------------------------
-    def _poll_detected_objects(self) -> None:
-        # Polled (and logged) regardless of UE connection -- mirrors the
-        # scene-camera subscription's "log always, forward to UE only if
-        # connected" pattern, so detection changes are visible in this
-        # node's own log without needing a real/fake UE client attached.
-        if not self._get_detected_objects_client.service_is_ready():
-            return
-        future = self._get_detected_objects_client.call_async(GetDetectedObjects.Request())
-        future.add_done_callback(self._on_detected_objects_response)
-
-    def _on_detected_objects_response(self, future) -> None:
-        resp = future.result()
-        ids = frozenset(o.instance_id for o in resp.objects)
-        if ids == self._last_detected_ids:
-            return  # same set of visible instances as last push
-        self._last_detected_ids = ids
-        if ids:
-            self.get_logger().info(f"detected objects now: {sorted(ids)}")
-        else:
-            self.get_logger().info("detected objects now: (none)")
-        if not self.ue.is_connected():
-            return
-        self.ue.call_function(
-            "UpdateDetectedObjects",
-            {"Objects": [_object_record_to_dict(o) for o in resp.objects]},
-        )
 
     def _publish_connection_status(self) -> None:
         msg = Bool()

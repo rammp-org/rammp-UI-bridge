@@ -88,10 +88,10 @@ Bridge behavior while a `RequestUserInput` goal is active:
    made -- see §7.3 and `docs/NODE_INTERFACE.md` §5.2.C's "Engine-driven
    override" note.
 2. If `request_json`'s `objects` is non-empty, push them to UE's
-   `UpdateDetectedObjects` channel tagged with the engine's own overlay
-   `stream_id` and the current `selected_instance_id`, exactly like any
-   other detected-objects push -- tappable the same way base-layer objects
-   are.
+   `UpdateDetectedObjects` channel along with the current
+   `selected_instance_id`, exactly like any other detected-objects push --
+   tappable the same way base-layer objects are. Each object's own
+   `source` key (§3) tells UE which video channel it's tappable against.
 3. **An object tap does not complete the goal.** The user may tap several
    different candidates in a row while deciding; each tap is reported to
    the engine as an `{"event_type": "object_tapped", ...}` feedback message
@@ -118,18 +118,27 @@ Bridge behavior while a `RequestUserInput` goal is active:
 
 ```jsonc
 {
-  "instance_id": "string",         // opaque, unique within this one goal/stream
+  "instance_id": "string",         // opaque, unique within this one goal
   "perception_class": "string",    // e.g. "cup", "food" -- engine-defined, opaque to UE
-  "box": [0.0, 0.0, 0.0, 0.0]        // [x_min, y_min, x_max, y_max] in the engine's own
-                                   // camera/overlay's pixel space
+  "box": [0.0, 0.0, 0.0, 0.0],       // [x_min, y_min, x_max, y_max] in the pixel space of
+                                   // whichever video channel `source` names
+  "source": "scene" | "overlay"    // which video channel `box` is relative to --
+                                   // "scene" (the shared scene/RGBD camera, §3.2) or
+                                   // "overlay" (the calling engine's own camera stream, §3.3.1)
 }
 ```
 
 This is the minimum UE needs to render and hit-test a tappable box -- it is
-**not** `ObjectRecord` (an Orchestrator/world-state concept) and has no
-`stream_id` field of its own, since every object in one goal implicitly
-belongs to the calling engine's own overlay stream -- the bridge tags them
-all with that engine's known `stream_id` when forwarding to UE.
+**not** `ObjectRecord` (an Orchestrator/world-state concept). `source` lets
+a single goal mix objects from both video channels (though in practice
+each caller today always uses one consistently -- the Orchestrator's own
+browse session always sends `"scene"`, since its objects come from
+Perception/World State; an engine's own `ObjectChoice`s default to
+`"overlay"`, since that's the common case of tapping on the engine's own
+camera, but an engine may send `"scene"` per-object instead if it's
+reusing World State boxes rather than publishing its own camera). `source`
+is omitted/`""` only on objects a caller failed to tag -- UE should treat
+that as "unknown, don't render" rather than guessing.
 
 (This shape used to be its own ROS message, `ObjectCandidate.msg` -- retired
 now that `objects` travels as plain JSON inside `request_json` instead of a

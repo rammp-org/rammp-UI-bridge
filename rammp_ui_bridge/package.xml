@@ -4,16 +4,17 @@
   <name>rammp_ui_bridge</name>
   <version>0.1.0</version>
   <description>
-    Bridges an Unreal Engine touchscreen UI to the RAMMP Orchestrator's public
-    ROS2 interface (rammp_orchestrator_interfaces). Translates UE user-input
-    events into Orchestrator service/action calls (select_object, deselect,
-    control, execute_action) and pushes world-state/detected-object/
-    InteractionPanel updates back to UE over its Remote Control WebSocket API.
-    Also serves rammp_ui_bridge_interfaces/RequestUserInput, letting an active
-    engine ask the user for input directly, bypassing the Orchestrator, and
-    runs its own rammp_common_interfaces arbitration server (AcquireControl/
-    ReleaseControl/ControlStatus) gating the shared engine-overlay-camera
-    topic so only the currently-active engine's frames reach UE.
+    Bridges an Unreal Engine touchscreen UI to the RAMMP Orchestrator.
+    Serves rammp_ui_bridge_interfaces/RequestUserInput and
+    /UpdateUserInputPanel, the single generic mechanism every caller (the
+    Orchestrator's own always-open browse session, or an active engine)
+    uses to push a panel/candidate-object list to UE and receive taps back,
+    and pushes world-state/InteractionPanel updates to UE over its Remote
+    Control WebSocket API. Runs its own rammp_common_interfaces arbitration
+    server (AcquireControl/ReleaseControl/ControlStatus) gating both the
+    shared engine-overlay-camera topic and who currently holds the
+    RequestUserInput goal, so only the currently-active caller's frames/
+    input requests reach UE.
   </description>
   <maintainer email="guo@assistivetech.dev">Liyun Guo</maintainer>
   <license>Proprietary</license>
@@ -22,7 +23,6 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>rammp_common_interfaces</exec_depend>
-  <exec_depend>rammp_orchestrator_interfaces</exec_depend>
   <exec_depend>rammp_ui_bridge_interfaces</exec_depend>
   <exec_depend>python3-websockets</exec_depend>
   <exec_depend>launch</exec_depend>

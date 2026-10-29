@@ -180,14 +180,15 @@ loop needed for this case.
 **Case B -- tappable objects on your own camera stream**, e.g. "which of
 these 3 detected cups": build one candidate-object dict per cup (its
 `instance_id`/`perception_class`/`box` in *your own camera's* pixel space --
-typically what your perception step already produced), and let the user
-tap directly on them:
+typically what your perception step already produced, with `"source":
+"overlay"` to tell UE those boxes are relative to your overlay video, not
+the base scene camera), and let the user tap directly on them:
 
 ```python
 objects = [
-    {"instance_id": "cup_1", "perception_class": "cup", "box": [10, 20, 90, 180]},
-    {"instance_id": "cup_2", "perception_class": "cup", "box": [120, 30, 210, 190]},
-    {"instance_id": "cup_3", "perception_class": "cup", "box": [230, 15, 320, 175]},
+    {"instance_id": "cup_1", "perception_class": "cup", "box": [10, 20, 90, 180], "source": "overlay"},
+    {"instance_id": "cup_2", "perception_class": "cup", "box": [120, 30, 210, 190], "source": "overlay"},
+    {"instance_id": "cup_3", "perception_class": "cup", "box": [230, 15, 320, 175], "source": "overlay"},
 ]
 panel_json = json.dumps({
     "title": "Pick a cup",
@@ -205,9 +206,11 @@ If you also publish your own overlay video (so the user sees a live camera
 feed with these boxes drawn on it, not just a static frame), publish
 `EngineOverlayImage` (`image`, same `token`) to `engine_overlay_topic`
 (default `/engine_overlay/image_raw`) for as long as this goal is active.
-This is optional -- `request_json`'s `objects` key works against
-whatever's currently on screen (the base scene camera or your overlay),
-UE just needs *a* box to hit-test against.
+This is optional, but if you *don't* publish your own camera and instead
+want to reuse boxes against the base scene camera (e.g. your perception
+step consumes the shared scene feed rather than a wrist cam), tag those
+objects `"source": "scene"` instead so UE knows to hit-test/draw them
+against the base layer, not the (in that case non-existent) overlay.
 
 Send the goal (async, since you'll be reacting to feedback while it runs):
 
@@ -315,9 +318,9 @@ All in `rammp-interfaces-ros2`:
   that aspect, an absent key leaves it unchanged), response (`accepted`,
   `message`).
 - Candidate object shape (inside `request_json`'s `objects[]`, no longer
-  its own ROS message): `{instance_id, perception_class, box}` --
-  `box` is `[x_min, y_min, x_max, y_max]` in your camera's own pixel
-  space.
+  its own ROS message): `{instance_id, perception_class, box, source}` --
+  `box` is `[x_min, y_min, x_max, y_max]` in the pixel space of whichever
+  video channel `source` (`"scene"` or `"overlay"`) names.
 - `rammp_ui_bridge_interfaces/msg/EngineOverlayImage` -- `image`
   (`sensor_msgs/Image`), `token`.
 - `rammp_common_interfaces/srv/{AcquireControl,ReleaseControl}` and

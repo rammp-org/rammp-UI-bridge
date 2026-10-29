@@ -28,16 +28,6 @@ def generate_launch_description():
                 description="UE Remote Control preset name to register against",
             ),
             DeclareLaunchArgument(
-                "orchestrator_ns",
-                default_value="/rammp_orchestrator",
-                description="Node namespace the Orchestrator's services/action are advertised under",
-            ),
-            DeclareLaunchArgument(
-                "detected_objects_poll_period",
-                default_value="0.5",
-                description="Seconds between ~/get_detected_objects polls",
-            ),
-            DeclareLaunchArgument(
                 "scene_camera_color_topic",
                 default_value="/scene_camera/color/image_raw",
                 description="Scene camera's raw color image topic (§3.2)",
@@ -74,10 +64,6 @@ def generate_launch_description():
                         "ue_ws_port": LaunchConfiguration("ue_ws_port"),
                         "ue_stream_port": LaunchConfiguration("ue_stream_port"),
                         "ue_preset": LaunchConfiguration("ue_preset"),
-                        "orchestrator_ns": LaunchConfiguration("orchestrator_ns"),
-                        "detected_objects_poll_period": LaunchConfiguration(
-                            "detected_objects_poll_period"
-                        ),
                         "scene_camera_color_topic": LaunchConfiguration(
                             "scene_camera_color_topic"
                         ),
