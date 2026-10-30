@@ -50,6 +50,13 @@ hypothetical future one as earlier drafts of this doc framed it), which
 makes it the most concrete argument for using C++ -- specifically for that
 channel, not necessarily the whole node.
 
+**Status: implemented as a dedicated node, per the Recommendation below.**
+`rammp_ui_bridge_streaming`'s `camera_stream_node` is a C++, wire-compatible
+reimplementation of this one channel's forwarding (`ramms_tools.streaming`'s
+RMSS protocol); `ui_bridge_node` keeps doing the forwarding itself by
+default (`use_python_camera_streaming:=true`) so this is purely additive --
+see `docs/NODE_INTERFACE.md` §5.2.A's "Optional C++ forwarder" note.
+
 ## Cost side of a full C++ rewrite
 
 - The Gen1 prototype's `UnrealRemoteWebsocket` client (`websockets` +

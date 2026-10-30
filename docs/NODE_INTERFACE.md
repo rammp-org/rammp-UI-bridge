@@ -738,6 +738,19 @@ engine's wrist-camera output, since no real engine publishes to
 UE post-process) are also still undecided. §3.1.1's `objects[].box`
 already covers the detection *semantics* independent of either.
 
+**Optional C++ forwarder.** `rammp_ui_bridge_streaming`'s `camera_stream_node`
+is a byte-for-byte wire-compatible C++ reimplementation of this channel's
+forwarding (both layers) -- see `LANGUAGE_DECISION.md`'s "Where C++ would
+actually help" section for the rationale (this is the one genuinely
+CPU/memory-bandwidth-bound part of the bridge). It knows nothing about
+`ui_control` arbitration; `ui_bridge_node` remains the arbitration server
+and republishes already-validated overlay frames (plain `sensor_msgs/Image`,
+token stripped) on `validated_engine_overlay_topic` for it to subscribe to.
+Run `ui_bridge_node` with `use_python_camera_streaming:=false` alongside it
+to avoid forwarding every frame to UE twice -- both are off by default
+(`use_python_camera_streaming` defaults `true`, so `ui_bridge_node` alone
+reproduces today's behaviour unchanged).
+
 
 #### B. System status (robot proprioception)
 

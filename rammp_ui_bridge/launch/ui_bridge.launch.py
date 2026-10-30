@@ -51,6 +51,24 @@ def generate_launch_description():
                     "can hold execution resources at a time"
                 ),
             ),
+            DeclareLaunchArgument(
+                "use_python_camera_streaming",
+                default_value="true",
+                description=(
+                    "Set false when a separate rammp_ui_bridge_streaming "
+                    "(camera_stream_node, C++) is running instead, to avoid "
+                    "forwarding every frame to UE twice"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "validated_engine_overlay_topic",
+                default_value="~/validated_engine_overlay",
+                description=(
+                    "Post-arbitration, token-stripped republish of EngineOverlayImage "
+                    "frames -- rammp_ui_bridge_streaming's camera_stream_node "
+                    "subscribes to this instead of the raw, token-gated topic"
+                ),
+            ),
             Node(
                 package="rammp_ui_bridge",
                 executable="ui_bridge_node",
@@ -72,6 +90,12 @@ def generate_launch_description():
                         ),
                         "engine_overlay_topic": LaunchConfiguration(
                             "engine_overlay_topic"
+                        ),
+                        "use_python_camera_streaming": LaunchConfiguration(
+                            "use_python_camera_streaming"
+                        ),
+                        "validated_engine_overlay_topic": LaunchConfiguration(
+                            "validated_engine_overlay_topic"
                         ),
                     }
                 ],

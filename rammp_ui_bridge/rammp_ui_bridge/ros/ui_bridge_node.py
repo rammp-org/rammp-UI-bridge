@@ -198,6 +198,23 @@ class UiBridgeNode(Node):
         # socket from the Remote Control WebSocket above).
         self.declare_parameter("ue_stream_port", 30030)
         self.declare_parameter("ue_stream_reconnect_period", 3.0)
+        # When False, this node stops forwarding frames to UE itself (the
+        # three _forward_* methods below become no-ops) -- set False when a
+        # separate rammp_ui_bridge_streaming (C++) node is running instead,
+        # to avoid sending every frame to UE twice. Everything else (topic
+        # subscriptions, frame-count logging, ui_control arbitration/token
+        # checking) keeps running unchanged either way, since the C++ node
+        # relies on this node's validated_engine_overlay_topic republish
+        # (see _on_engine_overlay_frame) for the overlay layer rather than
+        # re-implementing arbitration itself. Default True: zero behaviour
+        # change out of the box.
+        self.declare_parameter("use_python_camera_streaming", True)
+        # Plain (token-stripped) republish of engine-overlay frames that
+        # already passed this node's ui_control arbitration check -- the
+        # C++ streaming node (if running) subscribes to this instead of the
+        # raw EngineOverlayImage topic, so it never needs to know about
+        # arbitration tokens at all (see _on_engine_overlay_frame).
+        self.declare_parameter("validated_engine_overlay_topic", "~/validated_engine_overlay")
         # §3.4 Bridge <-> Hardware node / §5.2.B system status: the arm
         # driver's (or its mock's) sensor_msgs/msg/JointState topic, covering
         # every arm joint -- see sheppy's `arm` node (rammp-deployments'
@@ -220,6 +237,13 @@ class UiBridgeNode(Node):
         # action's own execute-callback thread.
         self._active_input_lock = threading.Lock()
         self._active_input_goal: dict[str, Any] | None = None
+
+        # See use_python_camera_streaming above -- when False, a separate
+        # rammp_ui_bridge_streaming (C++) node is forwarding frames to UE
+        # instead, so this node's own _forward_* methods become no-ops.
+        self._use_python_streaming = bool(
+            self.get_parameter("use_python_camera_streaming").value
+        )
 
         # -- scene camera state (§3.2) ----------------------------------------
         # Latest frame from each topic, forwarded to UE as the §5.2.A base
@@ -368,6 +392,16 @@ class UiBridgeNode(Node):
             qos_profile_sensor_data,
             callback_group=self._cb_group,
         )
+        # Plain (token-stripped) republish of overlay frames that already
+        # passed ui_control arbitration -- see validated_engine_overlay_topic
+        # above and _on_engine_overlay_frame below. Published unconditionally
+        # (cheap, and useful for anyone else wanting a validated feed), not
+        # gated by use_python_camera_streaming.
+        self._validated_overlay_publisher = self.create_publisher(
+            Image,
+            self.get_parameter("validated_engine_overlay_topic").value,
+            qos_profile_sensor_data,
+        )
         self._arm_joint_states_sub = self.create_subscription(
             JointState,
             self.get_parameter("arm_joint_states_topic").value,
@@ -383,7 +417,9 @@ class UiBridgeNode(Node):
             f"depth='{self.get_parameter('scene_camera_depth_topic').value}' "
             f"engine overlay='{self.get_parameter('engine_overlay_topic').value}' "
             f"arm joint states='{self.get_parameter('arm_joint_states_topic').value}' -> "
-            f"UE stream port {self.get_parameter('ue_stream_port').value}"
+            f"UE stream port {self.get_parameter('ue_stream_port').value} "
+            f"(python camera streaming "
+            f"{'enabled' if self._use_python_streaming else 'disabled -- external streamer expected'})"
         )
 
     # ------------------------------------------------------------------
@@ -422,7 +458,7 @@ class UiBridgeNode(Node):
         self._forward_scene_camera_depth(msg)
 
     def _forward_scene_camera_color(self, msg: Image) -> None:
-        if not self._stream_sender.is_connected():
+        if not self._use_python_streaming or not self._stream_sender.is_connected():
             return
         try:
             self._stream_sender.send_image(
@@ -440,7 +476,7 @@ class UiBridgeNode(Node):
             self.get_logger().warning(f"failed to forward scene camera color frame to UE: {exc}")
 
     def _forward_scene_camera_depth(self, msg: Image) -> None:
-        if not self._stream_sender.is_connected():
+        if not self._use_python_streaming or not self._stream_sender.is_connected():
             return
         try:
             if msg.encoding in _UINT16_DEPTH_ENCODINGS:
@@ -614,10 +650,14 @@ class UiBridgeNode(Node):
                 f"engine overlay camera: frame #{count} ({image.width}x{image.height}, "
                 f"encoding={image.encoding})"
             )
+        # Republish token-stripped, post-arbitration, for the optional C++
+        # streaming node (or any other consumer) to forward without needing
+        # to know about ui_control arbitration tokens at all.
+        self._validated_overlay_publisher.publish(image)
         self._forward_engine_overlay_color(image)
 
     def _forward_engine_overlay_color(self, msg: Image) -> None:
-        if not self._stream_sender.is_connected():
+        if not self._use_python_streaming or not self._stream_sender.is_connected():
             return
         try:
             self._stream_sender.send_image(
