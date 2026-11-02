@@ -174,6 +174,10 @@ class UiBridgeNode(Node):
         self.declare_parameter("ue_host", "127.0.0.1")
         self.declare_parameter("ue_ws_port", 30020)
         self.declare_parameter("ue_preset", "RAMMP")
+        # Confirmed with the UI team: their Blueprint exposes inbound
+        # command JSON through a preset property labeled "LastUIEventJSON"
+        # (not this bridge's originally-documented "UserInput").
+        self.declare_parameter("ue_user_input_property_label", "LastUIEventJSON")
         self.declare_parameter("connection_publish_period", 1.0)
         # §3.2 Bridge <-> Camera: the scene camera's raw color/depth topics.
         # Depth's topic name depends on which scene_camera alternative a
@@ -369,6 +373,7 @@ class UiBridgeNode(Node):
             ws_port=self.get_parameter("ue_ws_port").get_parameter_value().integer_value,
             preset=self.get_parameter("ue_preset").value,
             user_input_callback=self._on_ue_user_input,
+            user_input_property_label=self.get_parameter("ue_user_input_property_label").value,
         )
 
         self._scene_color_sub = self.create_subscription(
@@ -717,19 +722,23 @@ class UiBridgeNode(Node):
     # ------------------------------------------------------------------
     def _on_ue_user_input(self, raw: str) -> None:
         """Invoked (on the UE WebSocket's asyncio thread) whenever UE's
-        "UserInput" preset property changes -- see §5.1 for the expected
-        JSON command schema. Only ``select_object``/``button_press`` are
-        valid UE-originated commands. Every tap is resolved purely against
-        whichever ``RequestUserInput`` goal is currently active (the
-        Orchestrator's own always-open browse session, or an engine's,
-        while it runs an action) -- there is no other dispatch path."""
+        "LastUIEventJSON" preset property changes -- see §5.1 for the
+        expected JSON command schema. Only ``select_object``/
+        ``button_press`` are valid UE-originated commands. Every tap is
+        resolved purely against whichever ``RequestUserInput`` goal is
+        currently active (the Orchestrator's own always-open browse
+        session, or an engine's, while it runs an action) -- there is no
+        other dispatch path."""
         try:
             command = json.loads(raw)
         except (TypeError, ValueError):
             self.get_logger().error(f"ignoring malformed UserInput (not JSON): {raw!r}")
             return
 
-        cmd = command.get("cmd")
+        # UE's Blueprint keys the command type as "event_type" (confirmed
+        # with the UI team); "cmd" is kept as a fallback for compatibility
+        # with this bridge's originally-documented schema.
+        cmd = command.get("event_type", command.get("cmd"))
         if cmd not in ("select_object", "button_press"):
             self.get_logger().error(f"ignoring UserInput with unknown cmd: {cmd!r}")
             return

@@ -15,18 +15,21 @@ needs updating):
 - Pushes from the bridge arrive as
   ``{"MessageName": "http", "Parameters": {"Url":
   "/remote/preset/<preset>/function/<FunctionName>", "Verb": "PUT", "Body":
-  {"parameters": {...}}}}``. Recognized ``FunctionName``\\ s: ``UpdatePanel``,
+  {"Parameters": {...}, "GenerateTransaction": false}}}``. Recognized
+  ``FunctionName``\\ s: ``UpdatePanel``,
   ``UpdateDetectedObjects``, ``UpdateWorldState``, ``UpdateArmJointStates``
   -- see ``MockUEServer._on_function_call``. Anything else is still logged
   (not dropped silently) so a newly-added bridge function shows up here.
 - "User input" flows the other way as an unsolicited
-  ``{"ChangedFields": [{"PropertyLabel": "UserInput", "PropertyValue":
+  ``{"ChangedFields": [{"PropertyLabel": "LastUIEventJSON", "PropertyValue":
   <json string>}]}`` message -- see ``docs/USER_INPUT_JSON_SCHEMA.md``
-  section 5 for the ``cmd`` schema this mock sends:
-  ``{"cmd": "select_object", "instance_id": ..., "perception_class": ...}``
+  section 5 for the ``event_type`` schema this mock sends (confirmed with
+  the UI team, superseding this bridge's originally-documented ``cmd``/
+  ``UserInput`` naming):
+  ``{"event_type": "select_object", "instance_id": ..., "perception_class": ...}``
   (both fields required -- the Orchestrator's ``select_object`` service
   rejects a mismatched/missing ``perception_class``) /
-  ``{"cmd": "button_press", "button_id": ...}``.
+  ``{"event_type": "button_press", "button_id": ...}``.
 
 Deliberately NOT implemented: the separate RMSS video-streaming TCP channel
 (``StreamSender`` in ``ui_bridge_node.py``) -- out of scope for this
@@ -137,7 +140,7 @@ class MockUEServer:
         params = msg.get("Parameters", {})
         url = params.get("Url", "")
         function_name = url.rsplit("/function/", 1)[-1] if "/function/" in url else ""
-        body_params = params.get("Body", {}).get("parameters", {})
+        body_params = params.get("Body", {}).get("Parameters", {})
         self._on_function_call(function_name, body_params)
 
     def _on_function_call(self, function_name: str, params: dict[str, Any]) -> None:
@@ -165,8 +168,8 @@ class MockUEServer:
         self.state.note(f"{function_name}({json.dumps(params)[:200]})")
 
     def send_user_input(self, command: dict[str, Any]) -> bool:
-        """Sends a ``UserInput`` ``ChangedFields`` event to whatever is
-        currently connected (the exact shape ``parse_value_changes`` in
+        """Sends a ``LastUIEventJSON`` ``ChangedFields`` event to whatever
+        is currently connected (the exact shape ``parse_value_changes`` in
         ``UnrealRemoteWebsocket`` expects). Returns False (and logs,
         instead of raising) if nothing is connected -- a browser button
         press with no bridge attached should fail soft."""
@@ -176,7 +179,7 @@ class MockUEServer:
             return False
         payload = {
             "ChangedFields": [
-                {"PropertyLabel": "UserInput", "PropertyValue": json.dumps(command)}
+                {"PropertyLabel": "LastUIEventJSON", "PropertyValue": json.dumps(command)}
             ]
         }
         asyncio.run_coroutine_threadsafe(ws.send(json.dumps(payload)), self.loop)
@@ -312,7 +315,7 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/select_object":
             self.server.mock.send_user_input(
                 {
-                    "cmd": "select_object",
+                    "event_type": "select_object",
                     "instance_id": body.get("instance_id", ""),
                     "perception_class": body.get("perception_class", ""),
                 }
@@ -320,7 +323,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": True})
         elif self.path == "/api/button_press":
             self.server.mock.send_user_input(
-                {"cmd": "button_press", "button_id": body.get("button_id", "")}
+                {"event_type": "button_press", "button_id": body.get("button_id", "")}
             )
             self._send_json({"ok": True})
         else:

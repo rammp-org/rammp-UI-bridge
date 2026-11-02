@@ -46,10 +46,16 @@ class UnrealRemoteWebsocket:
         preset: Optional[str] = None,
         timeout: float = 1.0,
         user_input_callback: Optional[UserInputCallback] = None,
+        user_input_property_label: str = "LastUIEventJSON",
     ):
         self.base_url = f"ws://{host}:{ws_port}"
         self.loop = asyncio.new_event_loop()
         self.preset = preset
+        # Name of the preset property UE's Blueprint exposes its inbound
+        # command JSON through. Confirmed with the UI team as
+        # "LastUIEventJSON" (not the bridge's originally-documented
+        # "UserInput") -- see docs/NODE_INTERFACE.md §5.1.
+        self.user_input_property_label = user_input_property_label
         self.ws_shutdown = False
         self.default_timeout = timeout
         self._response_queue = Queue()  # 1 response per request
@@ -158,8 +164,14 @@ class UnrealRemoteWebsocket:
         Parameters = {
             "Url": "/remote/preset/" + self.preset + "/function/" + function_name,
             "Verb": "PUT",
+            # Body shape matches UE's Remote Control HTTP API exactly as
+            # confirmed/tested by the UI team (capitalized "Parameters" +
+            # explicit "GenerateTransaction": false) -- this is the same
+            # body UE's WS "http" tunnel hands to its internal HTTP
+            # handler, so it must match a direct-HTTP PUT byte-for-byte.
             "Body": {
-                "parameters": function_parameters,
+                "Parameters": function_parameters,
+                "GenerateTransaction": False,
             },
         }
         try:
@@ -215,7 +227,7 @@ class UnrealRemoteWebsocket:
 
                 if (
                     "PropertyLabel" in changes_json and "PropertyValue" in changes_json
-                ) and changes_json.get("PropertyLabel") == "UserInput":
+                ) and changes_json.get("PropertyLabel") == self.user_input_property_label:
                     if self.user_input_callback is not None:
                         self.user_input_callback(changes_json.get("PropertyValue"))
                     # print(f"Userinput: {changes_json.get('PropertyValue')}")

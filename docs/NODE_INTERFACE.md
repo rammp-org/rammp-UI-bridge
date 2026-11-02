@@ -27,6 +27,7 @@ implementation-language question itself.
 | `ue_host` | string | `127.0.0.1` | IP/hostname of the UE instance |
 | `ue_ws_port` | int | `30020` | UE Remote Control WebSocket API port |
 | `ue_preset` | string | `RAMMP` | UE Remote Control preset name to register against |
+| `ue_user_input_property_label` | string | `LastUIEventJSON` | Preset property name the bridge watches for inbound UE command JSON (§5.1) |
 | `connection_publish_period` | double (seconds) | `1.0` | Interval between connection-status publishes |
 
 ## 3. ROS2-facing interfaces
@@ -626,11 +627,15 @@ Transport: UE's Remote Control WebSocket API
 (`ws://<ue_host>:<ue_ws_port>`), with the bridge registering `ue_preset` on
 every connect (including reconnects after a dropped connection).
 
-### 5.1 UE → bridge: `UserInput` command schema
+### 5.1 UE → bridge: `LastUIEventJSON` command schema
 
-The bridge watches the preset's `UserInput` string property for changes
-(delivered as a `ChangedFields` WebSocket event) and parses each new value
-as one JSON object.
+The bridge watches the preset's `LastUIEventJSON` string property
+(`ue_user_input_property_label` parameter, default `"LastUIEventJSON"` --
+confirmed with the UI team, superseding this doc's previous
+`UserInput`/`cmd` naming) for changes (delivered as a `ChangedFields`
+WebSocket event) and parses each new value as one JSON object, keyed by
+`event_type` (with `cmd` accepted as a fallback for compatibility with
+earlier mocks/tooling built against this doc's original naming).
 
 **Governing principle: UE only ever reports a tap -- it never sends a
 domain command directly.** UE has exactly two things a user can tap: an
@@ -653,9 +658,10 @@ command -- nobody is currently offering that tap, since exactly one
 caller (the Orchestrator or one executing engine) ever holds `ui_control`
 at a time (§3.1.1).
 
-Unknown `cmd` values, and values that don't parse as JSON at all, are
-logged and dropped the same way -- never forwarded to anyone -- so a
-UI/Blueprint bug is visible during development without crashing the node.
+Unknown `event_type`/`cmd` values, and values that don't parse as JSON at
+all, are logged and dropped the same way -- never forwarded to anyone --
+so a UI/Blueprint bug is visible during development without crashing the
+node.
 
 ### 5.2 bridge → UE: four channels
 
