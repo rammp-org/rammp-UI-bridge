@@ -565,6 +565,7 @@ class UiBridgeNode(Node):
     def _on_ui_acquire_control(
         self, request: AcquireControl.Request, response: AcquireControl.Response
     ) -> AcquireControl.Response:
+        aborted_goal = None
         with self._ui_control_lock:
             # AcquireControl.srv's "pre-generated key" field: a non-all-zero
             # request.token means the caller (by contract, the Orchestrator)
@@ -591,6 +592,26 @@ class UiBridgeNode(Node):
             f"({'minted a new' if minted_fresh else 'using orchestrator-supplied'} "
             f"token {self._ui_token.hex()[:8]}..., generation {self._ui_generation})"
         )
+        # A still-open RequestUserInput goal is now holding a token that no
+        # longer matches ui_control's current grant -- its owner will never
+        # get a button press or object tap again (UE now shows whatever
+        # panel/objects `request.owner_id` pushes next), so it would
+        # otherwise hang forever. Force it to end now with status
+        # "aborted" instead of leaving it an orphan (see
+        # RequestUserInput.action's result_json docs).
+        with self._active_input_lock:
+            if self._active_input_goal is not None and self._active_input_goal["engine_id"] != request.owner_id:
+                aborted_goal = self._active_input_goal
+                aborted_goal["result"] = {
+                    "status": "aborted",
+                    "reason": f"ui_control was reclaimed by '{request.owner_id}' before this goal ended",
+                }
+                aborted_goal["event"].set()
+        if aborted_goal is not None:
+            self.get_logger().warning(
+                f"aborting '{aborted_goal['engine_id']}'s still-open RequestUserInput goal: "
+                f"ui_control was just reclaimed by '{request.owner_id}'"
+            )
         self._publish_ui_control_status()
         return response
 
@@ -849,14 +870,22 @@ class UiBridgeNode(Node):
                     return result
                 time.sleep(0.02)
 
-            goal_handle.succeed()
             with self._active_input_lock:
                 state = self._active_input_goal["result"]
-                result = RequestUserInput.Result()
-                if state["status"] == "button":
-                    result.result_json = json.dumps({"status": "button", "button_id": state["button_id"]})
-                else:
-                    result.result_json = json.dumps({"status": "cancelled"})
+            result = RequestUserInput.Result()
+            if state["status"] == "button":
+                goal_handle.succeed()
+                result.result_json = json.dumps({"status": "button", "button_id": state["button_id"]})
+            elif state["status"] == "aborted":
+                # _on_ui_acquire_control force-ended this goal (ui_control
+                # was reclaimed by another owner before this engine's own
+                # button press or cancel) -- abort rather than succeed, so
+                # the engine can tell the two cases apart.
+                goal_handle.abort()
+                result.result_json = json.dumps({"status": "aborted", "reason": state["reason"]})
+            else:
+                goal_handle.succeed()
+                result.result_json = json.dumps({"status": "cancelled"})
             return result
         finally:
             with self._active_input_lock:
