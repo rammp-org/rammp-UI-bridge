@@ -173,11 +173,18 @@ class UiBridgeNode(Node):
 
         self.declare_parameter("ue_host", "127.0.0.1")
         self.declare_parameter("ue_ws_port", 30020)
-        self.declare_parameter("ue_preset", "RAMMP")
+        self.declare_parameter("ue_preset", "RCP_RammsBridge")
         # Confirmed with the UI team: their Blueprint exposes inbound
         # command JSON through a preset property labeled "LastUIEventJSON"
         # (not this bridge's originally-documented "UserInput").
         self.declare_parameter("ue_user_input_property_label", "LastUIEventJSON")
+        # 2026-11-04 UI-team design: UE buffers taps/button-presses behind a
+        # sequence counter instead of pushing them as property changes; the
+        # bridge polls for them via the "PollUIEvents" preset function at
+        # this rate (10-20Hz recommended by the UI team). The legacy
+        # property-watch path above is left running unchanged alongside
+        # this -- see UnrealRemoteWebsocket's docstring.
+        self.declare_parameter("ue_ui_event_poll_rate_hz", 15.0)
         self.declare_parameter("connection_publish_period", 1.0)
         # §3.2 Bridge <-> Camera: the scene camera's raw color/depth topics.
         # Depth's topic name depends on which scene_camera alternative a
@@ -376,6 +383,7 @@ class UiBridgeNode(Node):
             preset=self.get_parameter("ue_preset").value,
             user_input_callback=self._on_ue_user_input,
             user_input_property_label=self.get_parameter("ue_user_input_property_label").value,
+            ui_event_poll_rate_hz=self.get_parameter("ue_ui_event_poll_rate_hz").value,
         )
 
         self._scene_color_sub = self.create_subscription(
@@ -723,14 +731,17 @@ class UiBridgeNode(Node):
     # dispatch user-input commands
     # ------------------------------------------------------------------
     def _on_ue_user_input(self, raw: str) -> None:
-        """Invoked (on the UE WebSocket's asyncio thread) whenever UE's
-        "LastUIEventJSON" preset property changes -- see §5.1 for the
-        expected JSON command schema. Only ``select_object``/
-        ``button_press`` are valid UE-originated commands. Every tap is
-        resolved purely against whichever ``RequestUserInput`` goal is
-        currently active (the Orchestrator's own always-open browse
-        session, or an engine's, while it runs an action) -- there is no
-        other dispatch path."""
+        """Invoked (on the UE WebSocket's asyncio thread) whenever UE
+        reports a tap -- either via the legacy "LastUIEventJSON" property
+        push, or via the 2026-11-04 PollUIEvents polling design (see
+        UnrealRemoteWebsocket.poll_ui_events_loop) -- both funnel through
+        this same callback. Valid UE-originated commands are
+        ``select_object`` (legacy property-push naming) / ``object_tapped``
+        (PollUIEvents naming -- same meaning, same ``instance_id`` field)
+        and ``button_press``. Every tap is resolved purely against
+        whichever ``RequestUserInput`` goal is currently active (the
+        Orchestrator's own always-open browse session, or an engine's,
+        while it runs an action) -- there is no other dispatch path."""
         try:
             command = json.loads(raw)
         except (TypeError, ValueError):
@@ -741,7 +752,7 @@ class UiBridgeNode(Node):
         # with the UI team); "cmd" is kept as a fallback for compatibility
         # with this bridge's originally-documented schema.
         cmd = command.get("event_type", command.get("cmd"))
-        if cmd not in ("select_object", "button_press"):
+        if cmd not in ("select_object", "object_tapped", "button_press"):
             self.get_logger().error(f"ignoring UserInput with unknown cmd: {cmd!r}")
             return
         if self._try_resolve_active_input_goal(cmd, command):
@@ -754,10 +765,10 @@ class UiBridgeNode(Node):
     def _try_resolve_active_input_goal(self, cmd: str, command: dict[str, Any]) -> bool:
         """Returns True if the tap matched the active ``RequestUserInput``
         goal and was consumed by it (the normal dispatch table must not
-        also run for it). A matched ``select_object`` does NOT end the
-        goal -- the user may tap several different objects in a row while
-        deciding -- it's reported to the engine as feedback instead
-        (``feedback_json``'s ``event_type: "object_tapped"``), and
+        also run for it). A matched ``select_object``/``object_tapped``
+        does NOT end the goal -- the user may tap several different objects
+        in a row while deciding -- it's reported to the engine as feedback
+        instead (``feedback_json``'s ``event_type: "object_tapped"``), and
         ``_active_input_goal``'s own ``selected_instance_id`` is updated so
         a freshly-pushed panel/objects (e.g. from
         ``_on_update_user_input_panel``) reflects it. Only a matched
@@ -766,7 +777,7 @@ class UiBridgeNode(Node):
             goal_state = self._active_input_goal
             if goal_state is None:
                 return False
-            if cmd == "select_object":
+            if cmd in ("select_object", "object_tapped"):
                 instance_id = command.get("instance_id", "")
                 if instance_id not in goal_state["object_ids"]:
                     return False
