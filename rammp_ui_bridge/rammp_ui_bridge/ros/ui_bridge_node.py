@@ -825,6 +825,17 @@ class UiBridgeNode(Node):
             return GoalResponse.REJECT
         return GoalResponse.ACCEPT
 
+    @staticmethod
+    def _object_centroid(o: dict[str, Any], box: list[float]) -> list[float]:
+        """Pixel-space centroid of ``box`` -- [(x_min+x_max)/2,
+        (y_min+y_max)/2] -- so UE doesn't have to compute it itself just to
+        place a tap marker. Uses the caller-supplied ``"centroid"`` key if
+        present, otherwise derives it from ``box`` (e.g. for an older
+        engine not yet updated to send one explicitly)."""
+        if "centroid" in o:
+            return list(o["centroid"])
+        return [(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0]
+
     def _push_engine_objects(
         self, objects: list[dict[str, Any]], selected_instance_id: str
     ) -> None:
@@ -838,18 +849,20 @@ class UiBridgeNode(Node):
         as-is so UE knows which video channel the box's pixel coordinates
         are relative to -- the bridge does not infer or default this from
         ``engine_id``, since one goal's objects can mix both sources."""
+        def _to_ue_object(o: dict[str, Any]) -> dict[str, Any]:
+            box = list(o.get("box", (0.0, 0.0, 0.0, 0.0)))
+            return {
+                "instance_id": o.get("instance_id", ""),
+                "perception_class": o.get("perception_class", ""),
+                "box": box,
+                "centroid": self._object_centroid(o, box),
+                "source": o.get("source", ""),
+            }
+
         self.ue.call_function(
             "UpdateDetectedObjects",
             {
-                "Objects": [
-                    {
-                        "instance_id": o.get("instance_id", ""),
-                        "perception_class": o.get("perception_class", ""),
-                        "box": list(o.get("box", (0.0, 0.0, 0.0, 0.0))),
-                        "source": o.get("source", ""),
-                    }
-                    for o in objects
-                ],
+                "Objects": [_to_ue_object(o) for o in objects],
                 "SelectedInstanceId": selected_instance_id,
             },
         )
