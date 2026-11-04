@@ -852,7 +852,7 @@ infrequent JSON payload rather than bulk pixel data:
 
 | Function | Parameters | Pushed when |
 |---|---|---|
-| `UpdateDetectedObjects` | `Objects`: array of `{instance_id, perception_class, box, source}` | The currently active `RequestUserInput` goal's `objects` list changes (§3.1.1's goal open, or any `UpdateUserInputPanel` call carrying an `objects` key) |
+| `UpdateDetectedObjects` | `ObjectsJson`: JSON-encoded string of an array of `{instance_id, perception_class, box, centroid, source}`; `SelectedInstanceId`: plain string | The currently active `RequestUserInput` goal's `objects` list changes (§3.1.1's goal open, or any `UpdateUserInputPanel` call carrying an `objects` key) |
 
 Mechanics (`_push_engine_objects` in the reference implementation):
 
@@ -872,9 +872,20 @@ Mechanics (`_push_engine_objects` in the reference implementation):
    render"). The bridge does **not** fill in or infer `source` itself
    (e.g. from the goal's `engine_id`) -- it's purely caller-supplied per
    object, since a single goal's objects can mix both video channels
-   (§3.1.1).
-4. `SelectedInstanceId` is sent alongside `Objects` on every push,
+   (§3.1.1). `centroid` is `[(x_min+x_max)/2, (y_min+y_max)/2]` in the
+   same pixel space as `box` -- the caller-supplied value if present,
+   otherwise derived from `box` by the bridge itself.
+4. `SelectedInstanceId` is sent alongside `ObjectsJson` on every push,
    reflecting the goal's current `selected_instance_id` (§3.1.1).
+5. `Objects` is JSON-encoded into a single `ObjectsJson` **string**
+   parameter rather than sent as a native nested struct/array, mirroring
+   `UpdatePanel`'s `PanelJson` convention (§5.2.B) -- UE's Remote Control
+   function parameters are matched by name against the Blueprint
+   function's own signature, and the `UpdateDetectedObjects` Blueprint
+   expects (and itself JSON-parses) one string parameter, not a
+   structured `Objects` array -- confirmed by UE's own debug log line
+   (`[Bridge] UpdateDetectedObjects (...): <ObjectsJson content>`) coming
+   through empty when the bridge previously sent a bare `Objects` key.
 
 `box`+`source` together are UE's **sole** tap-to-select overlay mechanism
 (§3.1.1's box note explains why a mask-based precise hit-test was dropped:

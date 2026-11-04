@@ -859,10 +859,19 @@ class UiBridgeNode(Node):
                 "source": o.get("source", ""),
             }
 
+        # UE's UpdatePanel takes a pre-serialized JSON *string* (PanelJson),
+        # not a native struct -- its Blueprint parses it itself (and logs it
+        # raw, which is how we noticed "UpdateDetectedObjects (MAP_UI): "
+        # was being logged empty: the previous "Objects"/"SelectedInstanceId"
+        # keys were being sent as a nested dict/list, which doesn't match a
+        # Blueprint function expecting a single JSON-string parameter).
+        # UpdateDetectedObjects follows the same convention: the objects
+        # array is JSON-encoded into one "ObjectsJson" string parameter,
+        # consistent with "PanelJson".
         self.ue.call_function(
             "UpdateDetectedObjects",
             {
-                "Objects": [_to_ue_object(o) for o in objects],
+                "ObjectsJson": json.dumps([_to_ue_object(o) for o in objects]),
                 "SelectedInstanceId": selected_instance_id,
             },
         )
