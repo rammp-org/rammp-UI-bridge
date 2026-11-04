@@ -859,20 +859,40 @@ class UiBridgeNode(Node):
                 "source": o.get("source", ""),
             }
 
-        # UE's UpdatePanel takes a pre-serialized JSON *string* (PanelJson),
-        # not a native struct -- its Blueprint parses it itself (and logs it
-        # raw, which is how we noticed "UpdateDetectedObjects (MAP_UI): "
-        # was being logged empty: the previous "Objects"/"SelectedInstanceId"
-        # keys were being sent as a nested dict/list, which doesn't match a
-        # Blueprint function expecting a single JSON-string parameter).
-        # UpdateDetectedObjects follows the same convention: the objects
-        # array is JSON-encoded into one "ObjectsJson" string parameter,
-        # consistent with "PanelJson".
+        ue_objects = [_to_ue_object(o) for o in objects]
+        # If every object shares one source, surface it as the top-level
+        # stream_id too (UE's RammsBridgeSubsystem::OnDetectedObjectsJson
+        # delegate is documented as firing with a single
+        # {stream_id, selected_instance_id, objects} JSON payload -- there
+        # is no per-push notion of "mixed streams" on UE's side). Left ""
+        # when objects mix sources or there are none; each object's own
+        # "source" key is still included for forward-compatibility.
+        sources = {o["source"] for o in ue_objects if o["source"]}
+        stream_id = sources.pop() if len(sources) == 1 else ""
+
+        # UE's UpdatePanel/UpdateDetectedObjects functions
+        # (RammsBridgeReceiver.h) each take exactly one FString parameter
+        # that the Blueprint/C++ side itself JSON-decodes -- confirmed from
+        # the real UE project source (ramms-sim):
+        #   void UpdatePanel(const FString& PanelJSON);
+        #   void UpdateDetectedObjects(const FString& DetectedObjectsJSON);
+        # Sending "Objects"/"SelectedInstanceId" as separate Remote Control
+        # parameters (as we previously did) doesn't match this signature at
+        # all -- RC parameter names are matched against the UFUNCTION's own
+        # parameter names, so UE had nothing to bind and logged the string
+        # empty. The payload itself is the documented
+        # {stream_id, selected_instance_id, objects} shape (see
+        # RammsBridgeSubsystem.h's OnDetectedObjectsJson comment).
         self.ue.call_function(
             "UpdateDetectedObjects",
             {
-                "ObjectsJson": json.dumps([_to_ue_object(o) for o in objects]),
-                "SelectedInstanceId": selected_instance_id,
+                "DetectedObjectsJSON": json.dumps(
+                    {
+                        "stream_id": stream_id,
+                        "selected_instance_id": selected_instance_id,
+                        "objects": ue_objects,
+                    }
+                ),
             },
         )
 

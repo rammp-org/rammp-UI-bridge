@@ -852,7 +852,7 @@ infrequent JSON payload rather than bulk pixel data:
 
 | Function | Parameters | Pushed when |
 |---|---|---|
-| `UpdateDetectedObjects` | `ObjectsJson`: JSON-encoded string of an array of `{instance_id, perception_class, box, centroid, source}`; `SelectedInstanceId`: plain string | The currently active `RequestUserInput` goal's `objects` list changes (§3.1.1's goal open, or any `UpdateUserInputPanel` call carrying an `objects` key) |
+| `UpdateDetectedObjects` | `DetectedObjectsJSON`: JSON-encoded string of `{stream_id, selected_instance_id, objects}`, where each object is `{instance_id, perception_class, box, centroid, source}` | The currently active `RequestUserInput` goal's `objects` list changes (§3.1.1's goal open, or any `UpdateUserInputPanel` call carrying an `objects` key) |
 
 Mechanics (`_push_engine_objects` in the reference implementation):
 
@@ -875,17 +875,27 @@ Mechanics (`_push_engine_objects` in the reference implementation):
    (§3.1.1). `centroid` is `[(x_min+x_max)/2, (y_min+y_max)/2]` in the
    same pixel space as `box` -- the caller-supplied value if present,
    otherwise derived from `box` by the bridge itself.
-4. `SelectedInstanceId` is sent alongside `ObjectsJson` on every push,
-   reflecting the goal's current `selected_instance_id` (§3.1.1).
-5. `Objects` is JSON-encoded into a single `ObjectsJson` **string**
-   parameter rather than sent as a native nested struct/array, mirroring
-   `UpdatePanel`'s `PanelJson` convention (§5.2.B) -- UE's Remote Control
-   function parameters are matched by name against the Blueprint
-   function's own signature, and the `UpdateDetectedObjects` Blueprint
-   expects (and itself JSON-parses) one string parameter, not a
-   structured `Objects` array -- confirmed by UE's own debug log line
-   (`[Bridge] UpdateDetectedObjects (...): <ObjectsJson content>`) coming
-   through empty when the bridge previously sent a bare `Objects` key.
+4. `selected_instance_id` is sent inside the same JSON payload as
+   `objects` on every push, reflecting the goal's current
+   `selected_instance_id` (§3.1.1).
+5. `stream_id` is the top-level source of the whole push -- `"scene"`/
+   `"overlay"` when every object in the push shares one source, `""` if
+   they're mixed or there are none. UE's `OnDetectedObjectsJson` delegate
+   has no per-object notion of source, only this single top-level field
+   -- each object's own `source` key is still included too, for forward
+   compatibility, but UE's current widget only needs the top-level one.
+6. The whole payload is JSON-encoded into a single `DetectedObjectsJSON`
+   **string** parameter rather than sent as separate native Remote
+   Control parameters, mirroring `UpdatePanel`'s `PanelJson` convention
+   (§5.2.B) -- UE's Remote Control function parameters are matched by
+   name against the actual `UFUNCTION`'s own C++ signature
+   (`RammsBridgeReceiver.h`: `void UpdateDetectedObjects(const FString&
+   DetectedObjectsJSON)`), which takes exactly one string parameter that
+   it JSON-decodes itself, not a structured `Objects`/`SelectedInstanceId`
+   pair -- confirmed by UE's own debug log line (`[Bridge]
+   UpdateDetectedObjects (...): <DetectedObjectsJSON content>`) coming
+   through empty when the bridge previously sent the wrong parameter
+   name/shape.
 
 `box`+`source` together are UE's **sole** tap-to-select overlay mechanism
 (§3.1.1's box note explains why a mask-based precise hit-test was dropped:
