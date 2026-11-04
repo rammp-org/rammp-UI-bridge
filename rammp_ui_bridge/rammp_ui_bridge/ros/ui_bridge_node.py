@@ -816,6 +816,9 @@ class UiBridgeNode(Node):
     # §3.3.2: engine-initiated, Orchestrator-bypassing user input requests
     # ------------------------------------------------------------------
     def _on_request_user_input_goal(self, goal_request) -> GoalResponse:
+        self.get_logger().info(
+            f"RequestUserInput goal received from '{goal_request.engine_id}'"
+        )
         with self._ui_control_lock:
             granted = bool(self._ui_owner_id) and bytes(goal_request.token) == self._ui_token
         if not granted:
