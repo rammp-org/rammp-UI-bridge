@@ -43,6 +43,25 @@ class UnrealRemoteError(Exception):
 UserInputCallback = Callable[[str], None]
 
 
+def _is_empty_poll_events_response(command: dict) -> bool:
+    """True if ``command`` is a PollUIEvents response shaped like
+    ``{"ResponseBody": {"ReturnedValues": [{"LatestSequence": N, "Events": []}]}}``
+    with no new events -- i.e. a routine, nothing-happened poll result. Used
+    to silence the generic WS traffic logging for these (they fire at
+    ``ui_event_poll_rate_hz``, ~15/sec, and would otherwise drown out
+    everything else in the logs)."""
+    body = command.get("ResponseBody")
+    if not isinstance(body, dict):
+        return False
+    returned_values = body.get("ReturnedValues")
+    if not returned_values or not isinstance(returned_values, list):
+        return False
+    result = returned_values[0]
+    if not isinstance(result, dict) or "LatestSequence" not in result:
+        return False
+    return not result.get("Events")
+
+
 class UnrealRemoteWebsocket:
     """
     Client for the Unreal Engine Remote Control webSocket API.
@@ -131,13 +150,20 @@ class UnrealRemoteWebsocket:
                     await self.register_preset()  # Register preset on connect
                     print("Preset registration sent.")
                     async for message in ws:
-                        logger.debug(f"WS <- {message}")
                         command = json.loads(message)
+                        # Routine "nothing happened" PollUIEvents responses
+                        # fire at ui_event_poll_rate_hz (~15/sec) -- don't
+                        # log those, only log when SinceSequence actually
+                        # advanced with new events (or for any other kind
+                        # of message/response).
+                        if not _is_empty_poll_events_response(command):
+                            logger.debug(f"WS <- {message}")
                         if "ResponseCode" in command:
-                            logger.debug(
-                                f"WS response: code={command.get('ResponseCode')} "
-                                f"body={command.get('ResponseBody')}"
-                            )
+                            if not _is_empty_poll_events_response(command):
+                                logger.debug(
+                                    f"WS response: code={command.get('ResponseCode')} "
+                                    f"body={command.get('ResponseBody')}"
+                                )
                             await self._response_queue.put(command)
                         if "ChangedFields" in command:
                             await self._value_change_queue.put(
@@ -211,7 +237,11 @@ class UnrealRemoteWebsocket:
             # return resp
 
     async def call_function_and_wait(
-        self, function_name: str, function_parameters: dict[str, Any], timeout=None
+        self,
+        function_name: str,
+        function_parameters: dict[str, Any],
+        timeout=None,
+        quiet: bool = False,
     ) -> dict:
         """Same tunneled HTTP call as ``call_function``, but actually waits
         for and returns UE's response -- used by the PollUIEvents poller,
@@ -224,6 +254,12 @@ class UnrealRemoteWebsocket:
         aren't reliably correlated by request ID (see ``send_and_wait``'s
         comment), we could dequeue a response meant for a concurrent
         ``call_function`` fire-and-forget call instead of our own.
+
+        ``quiet=True`` (used by ``poll_ui_events_loop``) skips the "WS ->"
+        request log -- the poller calls this at ``ui_event_poll_rate_hz``
+        (~15/sec), and logging every single poll request would drown out
+        everything else; the response is still logged by
+        ``ws_client_handler`` whenever it actually carries new events.
         """
         if self.ws_client is None:
             raise RuntimeError("WebSocket is not open")
@@ -244,7 +280,8 @@ class UnrealRemoteWebsocket:
             # those instead of our own.
             while not self._response_queue.empty():
                 self._response_queue.get_nowait()
-            logger.debug(f"WS -> {payload}")
+            if not quiet:
+                logger.debug(f"WS -> {payload}")
             await self.ws_client.send(json.dumps(payload))
             try:
                 resp = await asyncio.wait_for(
@@ -282,6 +319,7 @@ class UnrealRemoteWebsocket:
                 resp = await self.call_function_and_wait(
                     self.ui_event_poll_function,
                     {"SinceSequence": self._ui_event_since_sequence},
+                    quiet=True,
                 )
             except Exception as e:
                 logger.debug(f"PollUIEvents error: {e!r}")
