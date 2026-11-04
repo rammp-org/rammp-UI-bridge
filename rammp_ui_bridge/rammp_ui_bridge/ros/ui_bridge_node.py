@@ -199,7 +199,9 @@ class UiBridgeNode(Node):
         # below and _on_engine_overlay_frame.
         self.declare_parameter("engine_overlay_topic", "/engine_overlay/image_raw")
         # §5.2.A base layer: UE's RMSS streaming server port (separate TCP
-        # socket from the Remote Control WebSocket above).
+        # socket from the Remote Control WebSocket above). Must match the
+        # launch files' default (ui_bridge.launch.py,
+        # camera_stream.launch.py) -- 30030, not the RC WebSocket's 30020.
         self.declare_parameter("ue_stream_port", 30030)
         self.declare_parameter("ue_stream_reconnect_period", 3.0)
         # When False, this node stops forwarding frames to UE itself (the
