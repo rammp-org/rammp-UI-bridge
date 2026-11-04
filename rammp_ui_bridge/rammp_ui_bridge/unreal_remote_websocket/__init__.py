@@ -19,6 +19,19 @@ import threading
 from asyncio import Lock, Queue
 
 logger = logging.getLogger(__name__)
+# Debug-level traffic logging (every outbound command + every raw inbound
+# message/response from UE) is only useful if something actually emits it --
+# this module runs on its own background thread inside ui_bridge_node, which
+# never configures Python's stdlib logging itself, so without a handler here
+# these .debug() calls would be silently dropped by the logging module's
+# WARNING-level "handler of last resort". Attach our own handler + force
+# DEBUG so this traffic is visible by default when running the bridge.
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
+    logger.addHandler(_handler)
+    logger.propagate = False
+logger.setLevel(logging.DEBUG)
 
 
 class UnrealRemoteError(Exception):
@@ -87,9 +100,13 @@ class UnrealRemoteWebsocket:
                     await self.register_preset()  # Register preset on connect
                     print("Preset registration sent.")
                     async for message in ws:
+                        logger.debug(f"WS <- {message}")
                         command = json.loads(message)
-                        # print(f"Received command from UE: {json.dumps(command)}")
                         if "ResponseCode" in command:
+                            logger.debug(
+                                f"WS response: code={command.get('ResponseCode')} "
+                                f"body={command.get('ResponseBody')}"
+                            )
                             await self._response_queue.put(command)
                         if "ChangedFields" in command:
                             await self._value_change_queue.put(
@@ -98,7 +115,6 @@ class UnrealRemoteWebsocket:
                             print(
                                 f"Received value change from UE: {command['ChangedFields'][0]}"
                             )
-                        # print(f"Received command from Ethernet GUI: {command}")
                         if self.ws_shutdown:
                             break
             except Exception as e:
@@ -106,6 +122,7 @@ class UnrealRemoteWebsocket:
                     await self._response_queue.put(
                         {"_error": str(e)}
                     )  # Unblock any waiting send_and_wait calls
+                    logger.debug(f"WS receive loop error: {e!r}")
                     if not self._disconnected_logged:
                         print(f"GUI connection error: {e}")
             finally:
@@ -130,6 +147,7 @@ class UnrealRemoteWebsocket:
                 "PresetName": self.preset,
             },
         }
+        logger.debug(f"WS -> {command}")
         await self.ws_client.send(json.dumps(command))
 
     async def send_and_wait(self, parameters, timeout=None):
@@ -146,6 +164,7 @@ class UnrealRemoteWebsocket:
             "Parameters": parameters,
         }
         async with self._send_lock:
+            logger.debug(f"WS -> {payload}")
             await self.ws_client.send(json.dumps(payload))
             # try:
             #     resp = await asyncio.wait_for(
@@ -174,6 +193,7 @@ class UnrealRemoteWebsocket:
                 "GenerateTransaction": False,
             },
         }
+        logger.debug(f"call_function({function_name!r}, {function_parameters})")
         try:
             asyncio.run_coroutine_threadsafe(self.send_and_wait(Parameters), self.loop)
             # resp = asyncio.run_coroutine_threadsafe(
