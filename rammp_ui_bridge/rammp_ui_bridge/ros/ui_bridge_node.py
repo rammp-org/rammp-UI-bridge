@@ -622,6 +622,20 @@ class UiBridgeNode(Node):
                     "reason": f"ui_control was reclaimed by '{request.owner_id}' before this goal ended",
                 }
                 aborted_goal["event"].set()
+                # Clear the slot synchronously instead of waiting for
+                # _on_request_user_input_execute's polling loop to notice
+                # the event (up to its 0.02s poll period) and clear it
+                # itself -- otherwise a new RequestUserInput goal from
+                # `request.owner_id` arriving immediately after this
+                # acquire_control (as happens when an engine requests user
+                # input right after being handed control) would be
+                # rejected by _on_request_user_input_goal with "another
+                # engine's goal is already active", even though the old
+                # goal is already doomed to abort. The aborted execute
+                # callback still finishes/returns via its own `goal_state`
+                # local reference to this same dict, so it's unaffected by
+                # clearing the slot here.
+                self._active_input_goal = None
         if aborted_goal is not None:
             self.get_logger().warning(
                 f"aborting '{aborted_goal['engine_id']}'s still-open RequestUserInput goal: "
@@ -905,20 +919,21 @@ class UiBridgeNode(Node):
         button_ids = panel_button_ids(panel_json)
         object_ids = frozenset(o.get("instance_id", "") for o in objects)
         done_event = threading.Event()
+        goal_state = {
+            "engine_id": goal.engine_id,
+            "goal_handle": goal_handle,
+            "button_ids": button_ids,
+            "object_ids": object_ids,
+            "objects": list(objects),
+            "selected_instance_id": selected_instance_id,
+            "event": done_event,
+            "result": {
+                "status": "cancelled",
+                "button_id": "",
+            },
+        }
         with self._active_input_lock:
-            self._active_input_goal = {
-                "engine_id": goal.engine_id,
-                "goal_handle": goal_handle,
-                "button_ids": button_ids,
-                "object_ids": object_ids,
-                "objects": list(objects),
-                "selected_instance_id": selected_instance_id,
-                "event": done_event,
-                "result": {
-                    "status": "cancelled",
-                    "button_id": "",
-                },
-            }
+            self._active_input_goal = goal_state
 
         if panel_json:
             self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
@@ -934,8 +949,12 @@ class UiBridgeNode(Node):
                     return result
                 time.sleep(0.02)
 
-            with self._active_input_lock:
-                state = self._active_input_goal["result"]
+            # Read from our own local `goal_state` reference, not
+            # `self._active_input_goal` -- _on_ui_acquire_control may have
+            # already cleared that slot (to let a new goal in immediately)
+            # once it force-aborted us, so re-reading it here could see
+            # None or a newer goal's state instead of our own result.
+            state = goal_state["result"]
             result = RequestUserInput.Result()
             if state["status"] == "button":
                 goal_handle.succeed()
@@ -953,7 +972,13 @@ class UiBridgeNode(Node):
             return result
         finally:
             with self._active_input_lock:
-                self._active_input_goal = None
+                # Only clear the slot if it's still pointing at our own
+                # goal -- _on_ui_acquire_control's abort path may have
+                # already cleared it (or, in principle, a newer goal could
+                # already occupy it), so a blind unconditional clear here
+                # could wipe out a different, still-active goal.
+                if self._active_input_goal is goal_state:
+                    self._active_input_goal = None
             # Whatever panel/objects this goal pushed is now stale, but
             # it's not this node's job to decide what replaces it -- the
             # next caller (the Orchestrator's own browse session reopening
