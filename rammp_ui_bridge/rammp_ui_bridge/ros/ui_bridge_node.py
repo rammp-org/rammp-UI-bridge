@@ -769,6 +769,7 @@ class UiBridgeNode(Node):
         if cmd not in ("select_object", "object_tapped", "button_press"):
             self.get_logger().error(f"ignoring UserInput with unknown cmd: {cmd!r}")
             return
+        self.get_logger().info(f"user input received: {command!r}")
         if self._try_resolve_active_input_goal(cmd, command):
             return
         self.get_logger().warning(
@@ -803,7 +804,12 @@ class UiBridgeNode(Node):
                     return False
                 goal_state["result"]["status"] = "button"
                 goal_state["result"]["button_id"] = button_id
+                engine_id = goal_state["engine_id"]
                 goal_state["event"].set()
+                self.get_logger().info(
+                    f"button_press '{button_id}' matched active goal from "
+                    f"'{engine_id}'; ending it"
+                )
                 return True
             else:
                 return False
@@ -962,6 +968,10 @@ class UiBridgeNode(Node):
             if state["status"] == "button":
                 goal_handle.succeed()
                 result.result_json = json.dumps({"status": "button", "button_id": state["button_id"]})
+                self.get_logger().info(
+                    f"RequestUserInput goal from '{goal.engine_id}' ended: "
+                    f"button '{state['button_id']}' pressed"
+                )
             elif state["status"] == "aborted":
                 # _on_ui_acquire_control force-ended this goal (ui_control
                 # was reclaimed by another owner before this engine's own
