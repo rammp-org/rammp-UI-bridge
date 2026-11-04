@@ -30,6 +30,7 @@ setup(
         'console_scripts': [
             'ui_bridge_node = rammp_ui_bridge.ros.ui_bridge_node:main',
             'mock_ue = rammp_ui_bridge.mocks.mock_ue:main',
+            'test_request_user_input_node = rammp_ui_bridge.mocks.test_request_user_input_node:main',
         ],
     },
 )
