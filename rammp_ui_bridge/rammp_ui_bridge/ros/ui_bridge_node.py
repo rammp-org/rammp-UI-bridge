@@ -615,7 +615,15 @@ class UiBridgeNode(Node):
         # "aborted" instead of leaving it an orphan (see
         # RequestUserInput.action's result_json docs).
         with self._active_input_lock:
-            if self._active_input_goal is not None and self._active_input_goal["engine_id"] != request.owner_id:
+            # Compare tokens, not owner names: every acquire_control call
+            # mints a fresh token regardless of who asks (even the same
+            # owner_id as before, e.g. after that engine/node process
+            # restarted), so an owner-name comparison alone fails to catch
+            # a same-named-but-actually-stale goal left behind by a dead
+            # process -- it would stay in `_active_input_goal` forever,
+            # permanently rejecting that owner's every future goal with
+            # "another engine's goal is already active".
+            if self._active_input_goal is not None and self._active_input_goal["token"] != self._ui_token:
                 aborted_goal = self._active_input_goal
                 aborted_goal["result"] = {
                     "status": "aborted",
@@ -930,6 +938,7 @@ class UiBridgeNode(Node):
         done_event = threading.Event()
         goal_state = {
             "engine_id": goal.engine_id,
+            "token": bytes(goal.token),
             "goal_handle": goal_handle,
             "button_ids": button_ids,
             "object_ids": object_ids,
