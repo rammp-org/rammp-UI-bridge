@@ -122,6 +122,9 @@ Bridge behavior while a `RequestUserInput` goal is active:
   "perception_class": "string",    // e.g. "cup", "food" -- engine-defined, opaque to UE
   "box": [0.0, 0.0, 0.0, 0.0],       // [x_min, y_min, x_max, y_max] in the pixel space of
                                    // whichever video channel `source` names
+  "centroid": [0.0, 0.0],           // optional -- [x, y] tap-marker point in the same pixel
+                                   // space as `box`; omit to let the bridge derive it as
+                                   // [(x_min+x_max)/2, (y_min+y_max)/2] (see below)
   "source": "scene" | "overlay"    // which video channel `box` is relative to --
                                    // "scene" (the shared scene/RGBD camera, §3.2) or
                                    // "overlay" (the calling engine's own camera stream, §3.3.1)
@@ -139,6 +142,36 @@ camera, but an engine may send `"scene"` per-object instead if it's
 reusing World State boxes rather than publishing its own camera). `source`
 is omitted/`""` only on objects a caller failed to tag -- UE should treat
 that as "unknown, don't render" rather than guessing.
+
+**Key presence/defaults, concretely (`_push_engine_objects`/`_object_centroid`
+in `ui_bridge_node.py`):**
+
+| Key | Required? | Default if absent |
+|---|---|---|
+| `instance_id` | no | `""` |
+| `perception_class` | no | `""` |
+| `box` | no | `[0.0, 0.0, 0.0, 0.0]` |
+| `centroid` | no | derived from `box` as `[(x_min+x_max)/2, (y_min+y_max)/2]` |
+| `source` | no | `""` (UE treats this as "unknown, don't render") |
+
+Every key is parsed leniently (missing keys fall back to the defaults
+above rather than rejecting the whole object/goal) -- the bridge only
+rejects a goal outright if **both** `panel_json` and `objects` are
+entirely absent/empty (§2). `centroid` exists as an explicit key (rather
+than always deriving it) so a caller whose tappable region isn't a simple
+box-center (e.g. an irregular/asymmetric object) can supply a more
+accurate marker position; most callers can omit it and get the sane
+box-center default.
+
+Note: when this same shape reaches UE over the `UpdateDetectedObjects`
+Remote Control function (`docs/NODE_INTERFACE.md` §5.2.D), `box` and
+`centroid` are **not** sent as these bare `[...]` arrays -- the bridge
+re-encodes each as a JSON object (`{"X":.., "Y":.., "Z":.., "W":..}` /
+`{"X":.., "Y":..}`) because UE's `FJsonObjectConverter` only accepts a
+JSON string or object (never a bare array) into its built-in
+`FVector4`/`FVector2D` struct properties. That re-encoding is purely a
+UE-facing wire detail -- the engine-facing schema documented here (plain
+arrays) is unaffected.
 
 (This shape used to be its own ROS message, `ObjectCandidate.msg` -- retired
 now that `objects` travels as plain JSON inside `request_json` instead of a
@@ -284,6 +317,24 @@ goal / `UpdateUserInputPanel` calls, one push per step:
 Only ever present in an engine-pushed panel while it's running its own
 live-progress session; absent on the bridge's own idle/selection/error
 panels, which never set this field.
+
+**Known, documented exception to the 0.0-1.0 convention:** `fridge_ui_demo`
+(`rammp-orchestrator`'s `mocks/engines/fridge_ui_demo.py`) yields `pct` on a
+**0.0-100.0** scale instead, because the specific UE panel widget driving
+that demo binds `pct` to a `Percent (0-100)` field rather than a
+`UProgressBar::Percent` (0.0-1.0) one. Neither `engine_node.py` nor the
+bridge rescales/validates `pct` -- whatever float a script yields is
+forwarded as-is all the way to `panel_json`, so this is a per-engine,
+script-local choice, not something the wire schema itself enforces. A
+future engine author copying an existing script as a template should check
+which scale the specific UE widget it targets expects, rather than
+assuming 0.0-1.0 universally. `engine_node.py`'s own CLI-log line
+(`_publish_paced_progress`) is the one place that has to special-case
+this: it treats any `pct > 1.0` as already being on a 0-100 scale purely
+for its own human-readable log formatting, and this detection is a
+one-off heuristic for that log line only -- it is **not** forwarded into
+`panel_json` or otherwise propagated, so UE itself never sees a rescaled
+value, only whatever the engine's script originally yielded.
 
 ---
 

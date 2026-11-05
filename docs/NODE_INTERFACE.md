@@ -156,6 +156,29 @@ the current token is the sole caller allowed to open/update a
   `rejected_count`, for anyone who wants to observe arbitration state
   without racing to acquire it themselves.
 
+  | Field | Type | Meaning |
+  |---|---|---|
+  | `arbitration_enabled` | bool | `false` only if the bridge was launched with tokens disabled (a launch-time parameter) -- when `false`, every caller is admitted regardless of token |
+  | `estopped` | bool | latched; `true` once an e-stop has engaged -- nothing is admitted while set |
+  | `owned` | bool | whether anyone currently holds `ui_control` |
+  | `owner_id` | string | the current holder's id, `""` if `owned` is `false` |
+  | `generation` | uint64 | bumps on every grant (`AcquireControl` success); **resets to a low number each time `ui_bridge_node` restarts**, since it's purely an in-memory counter -- see below |
+  | `rejected_count` | uint64 | commands refused since the bridge process started (diagnostic only) |
+
+  **Consumer-side use beyond simple display (`rammp-orchestrator`'s
+  `ui_bridge_client.py`, `_BridgeRestartWatcher`):** because `generation`
+  can only ever increase for the lifetime of one bridge process, a client
+  that observes it go **backwards** knows for certain it's now talking to
+  a brand-new process -- any goal/token it was holding against the old
+  process is dead and will never get a response. Every ui_control client
+  class (`UiBridgeBrowseSession`/`UiBridgeProgressSession`/
+  `UiBridgeInputClient`) subscribes to this topic purely to catch that
+  transition and discard stale local state immediately, rather than
+  waiting (forever, in the browse session's case) on a result that will
+  never arrive. See `rammp-orchestrator`'s `docs/RUNTIME_FLOWS.md`,
+  "Recovery from a `ui_bridge_node` crash/restart", for the full
+  root-cause writeup.
+
 Once a caller holds a valid token, it uses that same token on every
 `RequestUserInput`/`UpdateUserInputPanel` call below -- these two
 interfaces are not described per-caller (Orchestrator vs. engine) because
@@ -184,6 +207,8 @@ string request_json
 #                                # session, or on the calling engine's own overlay stream,
 #                                # §3.3.1); omitted/[] if this request is panel-only
 #       {"instance_id": str, "perception_class": str, "box": [x_min, y_min, x_max, y_max],
+#        "centroid": [x, y],     # optional -- tap-marker point; derived from box's center
+#                                # if omitted, see docs/USER_INPUT_JSON_SCHEMA.md §3
 #        "source": str}         # "scene" or "overlay" -- which video channel `box` is
 #                                # relative to, see §5.2.D
 #     ],
@@ -222,7 +247,7 @@ string request_json
 #     "panel_json": str,          # replaces the current panel entirely, iff present
 #     "objects": [                # replaces the current candidate list entirely, iff present
 #       {"instance_id": str, "perception_class": str, "box": [x_min, y_min, x_max, y_max],
-#        "source": str}
+#        "centroid": [x, y], "source": str}
 #     ],
 #     "selected_instance_id": str  # highlight this instance_id ("" clears), iff present
 #   }
@@ -492,8 +517,8 @@ endpoints:
   its own `hibernate`. Refused (token mismatch) if called by anyone else.
 - `~/ui_control/status` (`rammp_common_interfaces/ControlStatus`, published
   latched/transient-local) -- current `owner_id`/`generation`/`owned`/
-  `rejected_count`, for anyone who wants to observe arbitration state
-  without racing to acquire it themselves.
+  `rejected_count`; see §3.1.1 above for the full per-field table and the
+  `generation` restart-detection convention.
 
 Every `EngineOverlayImage` frame an engine publishes carries the token it
 was granted (`EngineOverlayImage.token`). `_on_engine_overlay_frame`
