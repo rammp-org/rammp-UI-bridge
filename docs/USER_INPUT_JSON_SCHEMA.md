@@ -5,10 +5,11 @@ carried by `rammp_ui_bridge_interfaces`'s `RequestUserInput.action` and
 `UpdateUserInputPanel.srv` -- every field inside `request_json`,
 `result_json`, and `feedback_json`, including the candidate-object shape
 and the currently-selected-instance field -- reconciled with what
-`ui_bridge_node.py` (`parse_request_json()`, `build_panel()`,
-`panel_button_ids()`, `_push_engine_objects`,
-`_try_resolve_active_input_goal`) actually sends and parses. It supersedes/
-finalizes the "Open/TBD" items left in `NODE_INTERFACE.md` §5.2.C.
+`ui_bridge_node.py` (`parse_request_json()`, `panel_button_ids()`,
+`_on_request_user_input_execute()`/`_on_update_user_input_panel()`,
+`_push_engine_objects`, `_try_resolve_active_input_goal`) actually sends
+and parses. It supersedes/finalizes the "Open/TBD" items left in
+`NODE_INTERFACE.md` §5.2.C.
 
 (This file was previously named `INTERACTION_PANEL_SCHEMA.md` and only
 covered `panel_json`'s own shape; it has been renamed and expanded to cover
@@ -42,15 +43,21 @@ service-response pair.
 
 **Transport for the `panel_json` value:** a Remote Control function call,
 `UpdatePanel({"PanelJson": "<json string>"})` -- not the streaming channel.
-Confirmed in `ui_bridge_node.py` (every `build_panel()` call site ends with
-`self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})`); panels
-are small/sporadic enough that this was never revisited.
+Confirmed in `ui_bridge_node.py` (both `_on_request_user_input_execute()`
+and `_on_update_user_input_panel()` end with
+`self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})` whenever
+a `panel_json` key is present); panels are small/sporadic enough that this
+was never revisited. Note the bridge never constructs this string itself --
+it relays whatever `panel_json` the caller (Orchestrator or engine)
+supplied verbatim; see §6.2 for who actually builds panel content.
 
 **Full-replace semantics:** every push replaces the entire panel/candidate
 list/selection it targets -- there is no diffing/patching. The bridge's own
-`_panel_buttons` button-id-to-action mapping is likewise fully replaced
-(`build_panel()` returns a fresh mapping, never merged with the previous
-one).
+`_active_input_goal["button_ids"]` tracking (used to validate a later
+`button_press`/`object_tapped` feedback against the panel actually shown)
+is likewise fully replaced on each push, from `panel_button_ids()`'s fresh
+extraction of whatever new `panel_json` was supplied -- never merged with
+the previous one.
 
 ---
 
@@ -243,10 +250,30 @@ either interface) is itself a JSON string holding this object:
 
 ### 6.2 Who produces each panel
 
+**Correction (2026-11-05): there is no `build_panel()` in `ui_bridge_node.py`.**
+The bridge itself never builds panel *content* -- it only relays/validates
+whatever `panel_json` a caller supplies and pushes it to UE as-is. Panel
+content is built entirely on the `rammp-orchestrator` side, by two
+different functions depending on panel kind:
+
 | Panel kind | Producer |
 |---|---|
-| Orchestrator-driven panels (idle/selection/progress/result/error) | `ui_bridge_node.py`'s `build_panel()`, from Orchestrator service responses |
-| Engine-driven panels (via `RequestUserInput`/`UpdateUserInputPanel`) | the active engine itself (already `InteractionPanel`-shaped); the bridge pushes it as-is to UE |
+| Idle panel (nothing selected) / selection panel (object selected, showing its actions) | `rammp-orchestrator`'s `orchestrator_node.py`: `_build_idle_panel()`/`_build_selected_panel()`, pushed via the Orchestrator's own `UiBridgeBrowseSession` |
+| Progress panel (while an engine's `execute_action` is running) | `rammp-orchestrator`'s `engine_node.py`: `_progress_panel()`, pushed by the executing engine's own `EngineNode` wrapper via `UiBridgeProgressSession` -- see §6.4 |
+| Engine-driven custom panels (an engine's own `RequestUserInput`/`UpdateUserInputPanel` goal, e.g. a confirm-before-action prompt) | the engine's own script/node, already `InteractionPanel`-shaped |
+
+There is **no dedicated "result" or "error" panel** in the current
+implementation (contrary to what earlier revisions of this doc implied --
+see the correction note on the worked examples in §7). When an
+`execute_action` run ends, `engine_node.py` simply ends its
+`UiBridgeProgressSession` (`ui_session.finish()`), which releases
+`ui_control` back to the Orchestrator; `_on_ui_acquire_control`'s reclaim
+then re-runs `select_object` for whatever's still selected and pushes a
+fresh idle/selection panel (`docs/NODE_INTERFACE.md` §3.1.1) -- there is no
+separate "SUCCEEDED"/"FAILED" panel shown in between. An engine is free to
+push its own custom result/error panel via its own `RequestUserInput` goal
+if it wants that UX, but no current engine (including the mock ones) does
+so today.
 
 ### 6.3 `buttons[]` -- `Button` object
 
@@ -261,15 +288,35 @@ either interface) is itself a JSON string holding this object:
 - `button_id` is **opaque to UE** -- it's a free-form string UE must echo
   back verbatim in a `button_press` event (§5.1 of `NODE_INTERFACE.md`); UE
   attaches no meaning to its contents.
-- Unlike the panel-level `style`, the per-button `style` is **always
-  included**, even when `"normal"` (see `build_panel()`: every button dict
-  always has all three keys).
+- Per-button `style` is **not actually always present** (correcting an
+  earlier claim here): `engine_node.py`'s `_progress_panel()` buttons
+  (Pause/Resume/Cancel) always include it, but
+  `orchestrator_node.py`'s `_build_selected_panel()` buttons
+  (`action:...`/`deselect`) omit `style` entirely -- UE should treat an
+  absent per-button `style` the same as an absent panel-level `style`:
+  default to `"normal"`.
 - There is no `disabled`/`icon`/`subtitle`/similar per-button field today --
   not implemented, not currently needed by any existing panel.
 
 #### 6.3.1 `button_id` conventions (bridge-internal, not UE-visible semantics)
 
-These are the actual `button_id` values the bridge itself generates today.
+**Correction (2026-11-05):** the table below previously listed
+`control:pause`/`control:resume`/`control:cancel`/`dismiss` as real,
+currently-generated `button_id`s -- they are not. `orchestrator_node.py`'s
+`_browse_on_button()` (the only handler for buttons on the Orchestrator's
+own idle/selection panels) only ever recognizes `action:<engine_id>:<action_id>`
+and `deselect`; anything else logs `unknown button_id` and falls back to
+the idle panel. Pause/Resume/Cancel buttons are instead generated and
+resolved entirely by the *executing engine itself* while it owns a live
+progress panel (`engine_node.py`'s `_progress_panel()`/`poll_button()`),
+using the bare ids `pause`/`resume`/`cancel` -- not the `control:`-prefixed
+form -- and are resolved by calling the engine's own
+`pause()`/`resume()`/`cancel()` directly, not via the Orchestrator's
+`~/control` service. `~/control` still exists as an Orchestrator service
+(e.g. for a non-UI/CLI caller), but no UI-bridge button press currently
+routes through it. There is also no current `dismiss`/error-panel button,
+since no error panel is produced today (§6.2).
+
 An engine's own `panel_json` (via `RequestUserInput`) is free to use
 whatever `button_id` strings it wants -- they only need to be unique within
 that one panel and are resolved against that engine's own goal, never
@@ -277,16 +324,23 @@ against this table.
 
 | `button_id` | Meaning | Resolved as |
 |---|---|---|
-| `action:<engine_id>:<action_id>` | one specific available action on the currently selected object | `execute_action(engine_id, action_id, params)` |
-| `deselect` | "back"/deselect the current object | `deselect()` |
-| `control:pause` | pause the in-progress action | `control(PAUSE)` |
-| `control:resume` | resume a paused action | `control(RESUME)` |
-| `control:cancel` | cancel the in-progress action | `control(CANCEL)` |
-| `dismiss` | purely client-side acknowledgement of an error panel | no Orchestrator call at all |
+| `action:<engine_id>:<action_id>` | one specific available action on the currently selected object | `orchestrator_node.py`'s `_browse_on_button()` -> `execute_action(engine_id, action_id, params)` |
+| `deselect` | "back"/deselect the current object | `orchestrator_node.py`'s `_browse_on_button()` -> `deselect()` |
+| `pause` | pause the in-progress action (while the executing engine owns the live progress panel) | `engine_node.py`'s pacing loop, via the engine's own `pause()` -- not an Orchestrator RPC |
+| `resume` | resume a paused action (same context as `pause`) | the engine's own `resume()` |
+| `cancel` | cancel the in-progress action (same context as `pause`) | the engine's own `cancel()` (mirrors what `~/control` CANCEL would do, but called directly) |
 
-The bridge keeps a parallel, JSON-external `button_id -> {kind, ...params}`
-mapping (`self._panel_buttons`) to resolve these on tap -- **this mapping is
-never part of `panel_json`/sent to UE**, it's rebuilt bridge-side every push.
+For `action:...`/`deselect`, the Orchestrator keeps a parallel,
+JSON-external `button_id -> (engine_id, action_id, suggested_params)`
+mapping (`orchestrator_node.py`'s `_browse_action_buttons`, built
+alongside each `_build_selected_panel()` call) to resolve a tap -- **this
+mapping is never part of `panel_json`/sent to UE**, it's rebuilt
+Orchestrator-side on every panel push. For `pause`/`resume`/`cancel`,
+there is no separate mapping at all -- a button press always ends the
+goal (reported via `result_json`'s `{"status": "button", "button_id": ...}`,
+§4), and `UiBridgeProgressSession`/`engine_node.py`'s `poll_button()`
+interpret those three literal strings directly, reopening a fresh goal
+afterward to keep the live progress panel showing.
 
 ### 6.4 `progress` object (optional)
 
@@ -357,51 +411,53 @@ value, only whatever the engine's script originally yielded.
 }
 ```
 
-### 7.3 In-progress action panel (with pause/resume/cancel + progress)
+### 7.3 In-progress action panel (with pause/cancel + progress)
+
+Built by `engine_node.py`'s `_progress_panel()` (§6.2/§6.3.1) -- note the
+real `button_id`s are bare `pause`/`resume`/`cancel` (not `control:`-
+prefixed), and only `Pause`+`Cancel` are shown while running (`Resume`
+replaces `Pause` only once actually paused -- see `_progress_panel`'s
+`paused` branch):
+
 ```json
 {
   "title": "fridge_ui_demo: open",
   "message": "opening door",
   "buttons": [
-    {"button_id": "control:pause", "label": "Pause", "style": "normal"},
-    {"button_id": "control:resume", "label": "Resume", "style": "normal"},
-    {"button_id": "control:cancel", "label": "Cancel", "style": "warning"}
+    {"button_id": "pause", "label": "Pause", "style": "normal"},
+    {"button_id": "cancel", "label": "Cancel", "style": "warning"}
   ],
   "progress": {"phase": "opening", "pct": 0.4, "message": "opening door", "pausable": true}
 }
 ```
 
-### 7.4 Result panel (action completed, success)
-```json
-{
-  "title": "fridge_ui_demo: open -- SUCCEEDED",
-  "message": "SUCCEEDED",
-  "buttons": [{"button_id": "deselect", "label": "Deselect", "style": "normal"}]
-}
-```
-(`style` key omitted -- `"normal"` is the default.)
+### 7.4 What the user actually sees after the action ends
 
-### 7.5 Result panel (action completed, failure)
+**Correction (2026-11-05): there is no distinct "result" or "error"
+panel in the current implementation** -- §7.4-§7.6 in earlier revisions
+of this doc showed hypothetical `"... -- SUCCEEDED"`/`"... -- FAILED"`/
+`"Error"` panels that no code currently produces (see §6.2). What
+actually happens: the engine's `UiBridgeProgressSession.finish()` releases
+`ui_control`; the Orchestrator reclaims it and re-runs `_build_selected_panel()`
+(or `_build_idle_panel()` if nothing is selected / the object is no
+longer selectable), which is exactly the same shape as §7.2, e.g.:
+
 ```json
-{
-  "title": "fridge_ui_demo: open -- FAILED",
-  "message": "grasp_failed",
-  "buttons": [{"button_id": "deselect", "label": "Deselect", "style": "normal"}],
-  "style": "error"
-}
+{"title": "fridge_1", "message": "select an action", "buttons": [{"button_id": "deselect", "label": "Deselect"}]}
 ```
 
-### 7.6 Error panel (e.g. an Orchestrator service unavailable)
-```json
-{
-  "title": "Error",
-  "message": "'/rammp_orchestrator/execute_action' service unavailable",
-  "buttons": [{"button_id": "dismiss", "label": "Dismiss", "style": "error"}],
-  "style": "error"
-}
-```
+If `fridge_1`'s `open` action is no longer available after opening
+(because the manifest only offers `open` while closed), that button is
+simply absent from the refreshed panel -- there is no separate
+success/failure indicator shown to the user today beyond that action
+list changing. An engine that wants an explicit result/error panel (e.g.
+a "SUCCEEDED"/"FAILED" message, or an `"error"`-styled panel with a
+`dismiss` button) is free to push one via its own `RequestUserInput`
+goal before releasing `ui_control` -- the shape would be an ordinary
+`InteractionPanel` per §6 -- but no current engine (including the mock
+ones) does this.
 
-### 7.7 Engine-driven custom panel, panel-only (`RequestUserInput.Goal.request_json`, confirm-before-action)
+### 7.5 Engine-driven custom panel, panel-only (`RequestUserInput.Goal.request_json`, confirm-before-action)
 
 Shown unescaped, i.e. as Python/JSON values before `json.dumps()` is
 applied at each string-field boundary (`request_json` itself, and its
@@ -423,10 +479,12 @@ nested `panel_json` string):
 }
 ```
 (`title` omitted entirely here -- the schema treats a missing `title`/
-`message` key the same as an empty string; `build_panel()` always includes
-both explicitly, but engine-authored JSON isn't required to.)
+`message` key the same as an empty string; the Orchestrator/engine-side
+panel builders (`_build_idle_panel()`/`_build_selected_panel()`/
+`_progress_panel()`, §6.2) always include both explicitly, but
+engine-authored JSON isn't required to.)
 
-### 7.8 Engine-driven panel + tappable objects (`RequestUserInput.Goal.request_json`, pick-place UI demo)
+### 7.6 Engine-driven panel + tappable objects (`RequestUserInput.Goal.request_json`, pick-place UI demo)
 ```jsonc
 // request_json, unescaped for readability:
 {
@@ -439,12 +497,12 @@ both explicitly, but engine-authored JSON isn't required to.)
 }
 ```
 
-### 7.9 `feedback_json` -- user taps `apple_1`
+### 7.7 `feedback_json` -- user taps `apple_1`
 ```json
 {"event_type": "object_tapped", "instance_id": "apple_1"}
 ```
 
-### 7.10 `UpdateUserInputPanel.Request.request_json` -- reflect that tap back (panel + selection, objects unchanged)
+### 7.8 `UpdateUserInputPanel.Request.request_json` -- reflect that tap back (panel + selection, objects unchanged)
 ```jsonc
 {
   "panel_json": "{\"message\": \"apple_1 selected -- press Confirm to continue.\", \"buttons\": [{\"button_id\": \"confirm\", \"label\": \"Confirm\", \"style\": \"normal\"}, {\"button_id\": \"cancel\", \"label\": \"Cancel\", \"style\": \"warning\"}]}",
@@ -454,12 +512,12 @@ both explicitly, but engine-authored JSON isn't required to.)
 (`objects` key omitted entirely -- the candidate list stays as it was;
 only `panel_json`/`selected_instance_id` are being replaced here.)
 
-### 7.11 `result_json` -- user presses Confirm
+### 7.9 `result_json` -- user presses Confirm
 ```json
 {"status": "button", "button_id": "confirm"}
 ```
 
-### 7.12 `result_json` -- goal cancelled instead
+### 7.10 `result_json` -- goal cancelled instead
 ```json
 {"status": "cancelled"}
 ```
@@ -497,14 +555,14 @@ schema questions, so out of scope for this doc):
   scheme -- **no**, per §5.2.D, they remain a separate `UpdateDetectedObjects`
   call, keyed by its own change-triggered cadence rather than the
   task/button-dialog lifecycle.
-- `ActionSpec` has no `label` field yet, so `selection_panel_buttons()`
-  falls back to the raw `action_id` as the button label (§7 of
-  `NODE_INTERFACE.md`) -- a real UX label field is a future
+- `ActionSpec` has no `label` field yet, so `orchestrator_node.py`'s
+  `_build_selected_panel()` falls back to the raw `action_id` as the
+  button label (§6.2) -- a real UX label field is a future
   `CapabilityManifest` change, not a `panel_json` schema change.
 - The overlay-camera / engine-driven panel path (§3.3.2 of
   `NODE_INTERFACE.md`) is implemented and now exercised by a mock engine
   too (`pick_place_ui_demo.py`'s `pick` action sends `request_json` with a
-  non-empty `objects` list, §7.8), but still not exercised against a
+  non-empty `objects` list, §7.6), but still not exercised against a
   **real** engine -- functionally orthogonal to this schema, which is
   already fully exercised via the engine-driven `panel_json`-only case
   (fridge UI demo) and the `panel_json` + `objects` case (pick-place UI
@@ -515,15 +573,22 @@ schema questions, so out of scope for this doc):
 ## 10. Source references
 
 - `rammp-UI-bridge/rammp_ui_bridge/rammp_ui_bridge/ros/ui_bridge_node.py`:
-  `parse_request_json()` (request_json parser), `build_panel()` (panel
-  builder), `panel_button_ids()` (panel button-id parser),
-  `selection_panel_buttons()`/`control_panel_buttons()` (button-list
-  builders), `_push_engine_objects` (objects[] -> UE forwarder),
-  `_try_resolve_active_input_goal`/`_on_request_user_input_execute`/
-  `_on_update_user_input_panel` (goal/feedback/result/update handling),
-  `_push_idle_panel`/`_push_selection_panel`/`_push_error_panel`/ the
-  progress and result panel call sites (every panel this bridge actually
-  produces).
+  `parse_request_json()` (request_json parser), `panel_button_ids()`
+  (panel button-id parser), `_push_engine_objects` (objects[] -> UE
+  forwarder), `_try_resolve_active_input_goal`/
+  `_on_request_user_input_goal`/`_on_request_user_input_execute`/
+  `_on_update_user_input_panel` (goal/feedback/result/update handling) --
+  note this file only **relays** `panel_json`, it does not build panel
+  content (§6.2).
+- `rammp-orchestrator/rammp_orchestrator/rammp_orchestrator/ros/orchestrator_node.py`:
+  `_build_idle_panel()`/`_build_selected_panel()` (idle/selection panel
+  builders), `_browse_on_button()` (button-press dispatch), the
+  `UiBridgeBrowseSession` usage around `_browse_show_idle`/
+  `_browse_on_object_tapped`.
+- `rammp-orchestrator/rammp_orchestrator/rammp_orchestrator/ros/engine_node.py`:
+  `_progress_panel()` (live progress panel builder), `_publish_paced_progress`
+  (pacing + button polling), the `UiBridgeProgressSession` usage around
+  `_on_execute_action`.
 - `rammp-interfaces-ros2/rammp_ui_bridge_interfaces/action/RequestUserInput.action`,
   `rammp-interfaces-ros2/rammp_ui_bridge_interfaces/srv/UpdateUserInputPanel.srv`
   -- the wire fields this document describes.
