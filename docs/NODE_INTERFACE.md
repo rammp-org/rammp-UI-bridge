@@ -852,7 +852,7 @@ infrequent JSON payload rather than bulk pixel data:
 
 | Function | Parameters | Pushed when |
 |---|---|---|
-| `UpdateDetectedObjects` | `DetectedObjectsJSON`: JSON-encoded string of `{stream_id, selected_instance_id, objects}`, where each object is `{instance_id, perception_class, box, centroid, source}` | The currently active `RequestUserInput` goal's `objects` list changes (§3.1.1's goal open, or any `UpdateUserInputPanel` call carrying an `objects` key) |
+| `UpdateDetectedObjects` | `DetectedObjectsJSON`: JSON-encoded string of `{stream_id, selected_instance_id, objects}`, where each object is `{instance_id, perception_class, box: {X,Y,Z,W}, centroid, source}` | The currently active `RequestUserInput` goal's `objects` list changes (§3.1.1's goal open, or any `UpdateUserInputPanel` call carrying an `objects` key) |
 
 Mechanics (`_push_engine_objects` in the reference implementation):
 
@@ -865,16 +865,25 @@ Mechanics (`_push_engine_objects` in the reference implementation):
 2. Every push sends the **full current list**, not a diff -- UE always
    receives a complete, self-consistent payload rather than incremental
    patches to reconcile.
-3. Per-object JSON shape: `instance_id`/`perception_class`/`box`/`source`
-   pass through as-is from whatever the caller supplied (`box` empty/
-   omitted when the object currently has no known pixel position;
-   `source`, `""` when the caller omitted it, meaning "unknown -- don't
-   render"). The bridge does **not** fill in or infer `source` itself
-   (e.g. from the goal's `engine_id`) -- it's purely caller-supplied per
-   object, since a single goal's objects can mix both video channels
-   (§3.1.1). `centroid` is `[(x_min+x_max)/2, (y_min+y_max)/2]` in the
-   same pixel space as `box` -- the caller-supplied value if present,
-   otherwise derived from `box` by the bridge itself.
+3. Per-object JSON shape: `instance_id`/`perception_class`/`source` pass
+   through as-is from whatever the caller supplied (`source` is `""`
+   when the caller omitted it, meaning "unknown -- don't render"). The
+   bridge does **not** fill in or infer `source` itself (e.g. from the
+   goal's `engine_id`) -- it's purely caller-supplied per object, since a
+   single goal's objects can mix both video channels (§3.1.1). `box` and
+   `centroid` are each sent as a JSON **object** with `X`/`Y`(/`Z`/`W`)
+   keys -- `box: {"X": x_min, "Y": y_min, "Z": x_max, "W": y_max}`,
+   `centroid: {"X": x, "Y": y}` -- rather than a bare JSON array, because
+   UE's `FDetectedObject.box`/`.centroid` are built-in `FVector4`/
+   `FVector2D` properties and UE's JSON struct converter
+   (`FJsonObjectConverter`) special-cases these core math structs to only
+   accept a JSON string (`ImportText`) or a JSON object with named
+   components -- a plain array is rejected outright (confirmed live
+   against a real UE instance: `"Unable to import JSON value that is
+   neither string nor object into Vector4 property box"`). `centroid` is
+   `{"X": (x_min+x_max)/2, "Y": (y_min+y_max)/2}` in the same pixel space
+   as `box` -- the caller-supplied value if present, otherwise derived
+   from `box` by the bridge itself.
 4. `selected_instance_id` is sent inside the same JSON payload as
    `objects` on every push, reflecting the goal's current
    `selected_instance_id` (§3.1.1).

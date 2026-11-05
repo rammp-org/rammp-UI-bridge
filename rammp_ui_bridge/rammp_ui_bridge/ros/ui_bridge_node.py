@@ -885,8 +885,23 @@ class UiBridgeNode(Node):
             return {
                 "instance_id": o.get("instance_id", ""),
                 "perception_class": o.get("perception_class", ""),
-                "box": box,
-                "centroid": self._object_centroid(o, box),
+                # UE's FDetectedObject.box is a built-in FVector4 property.
+                # UE's JSON struct converter (FJsonObjectConverter) special-
+                # cases FVector4 (like FVector/FRotator/FColor/etc.) to only
+                # accept a JSON *string* (ImportText) or a JSON *object*
+                # with named components -- a plain JSON array is rejected
+                # outright ("Unable to import JSON value that is neither
+                # string nor object into Vector4 property box", confirmed
+                # live against a real UE instance). Sent as an object with
+                # X/Y/Z/W keys (mapping x_min/y_min/x_max/y_max
+                # positionally) instead of a bare [x_min, y_min, x_max,
+                # y_max] array to match that requirement.
+                "box": {"X": box[0], "Y": box[1], "Z": box[2], "W": box[3]},
+                # Same FVector4/FVector2D-class struct-import restriction
+                # applies to FDetectedObject.centroid (an FVector2D) --
+                # sent as {"X":.., "Y":..} rather than a bare [x, y] array
+                # for the same reason as box above.
+                "centroid": dict(zip("XY", self._object_centroid(o, box))),
                 "source": o.get("source", ""),
             }
 
