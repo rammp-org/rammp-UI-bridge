@@ -8,14 +8,7 @@ and the currently-selected-instance field -- reconciled with what
 `ui_bridge_node.py` (`parse_request_json()`, `panel_button_ids()`,
 `_on_request_user_input_execute()`/`_on_update_user_input_panel()`,
 `_push_engine_objects`, `_try_resolve_active_input_goal`) actually sends
-and parses. It supersedes/finalizes the "Open/TBD" items left in
-`NODE_INTERFACE.md` §5.2.C.
-
-(This file was previously named `INTERACTION_PANEL_SCHEMA.md` and only
-covered `panel_json`'s own shape; it has been renamed and expanded to cover
-the full `request_json`/`result_json`/`feedback_json` envelope now that
-those are the actual wire fields -- `panel_json` is one key inside
-`request_json`, not a field of its own.)
+and parses.
 
 All three (`request_json`, `result_json`, `feedback_json`) are JSON
 **strings** (not nested messages) -- ROS2 messages don't support
@@ -180,10 +173,6 @@ JSON string or object (never a bare array) into its built-in
 UE-facing wire detail -- the engine-facing schema documented here (plain
 arrays) is unaffected.
 
-(This shape used to be its own ROS message, `ObjectCandidate.msg` -- retired
-now that `objects` travels as plain JSON inside `request_json` instead of a
-typed array field.)
-
 ---
 
 ## 4. `result_json` -- `RequestUserInput` result
@@ -239,22 +228,21 @@ either interface) is itself a JSON string holding this object:
   entirely rather than sent as `null`, so UE-side code can use simple key
   existence checks.
 - `style` is **only present when not `"normal"`** -- i.e. absence of the key
-  means `"normal"`. Today only `"normal"` and `"error"` are actually
-  produced by the bridge itself (result panels and error panels); `"warning"`
-  is reserved/valid at the schema level (same enum as per-button `style`,
-  §6.3) but not yet emitted by any bridge code path. An engine's own
-  `panel_json` may use it directly if useful.
+  means `"normal"`. `"warning"` and `"error"` are reserved/valid at the
+  schema level (same enum as per-button `style`, §6.3); no current
+  Orchestrator/engine code path emits `"warning"`, and `"error"` is only
+  available for an engine's own custom `panel_json` to use directly (§6.2)
+  since no Orchestrator-built panel sets a style today.
 - No panel-level `version`/`schema_version` field exists today. Not adding
   one preemptively -- see §8 for how additive-only evolution is handled
   instead.
 
 ### 6.2 Who produces each panel
 
-**Correction (2026-11-05): there is no `build_panel()` in `ui_bridge_node.py`.**
-The bridge itself never builds panel *content* -- it only relays/validates
-whatever `panel_json` a caller supplies and pushes it to UE as-is. Panel
-content is built entirely on the `rammp-orchestrator` side, by two
-different functions depending on panel kind:
+`ui_bridge_node.py` itself never builds panel *content* -- it only
+relays/validates whatever `panel_json` a caller supplies and pushes it to
+UE as-is. Panel content is built entirely on the `rammp-orchestrator`
+side, by two different functions depending on panel kind:
 
 | Panel kind | Producer |
 |---|---|
@@ -263,10 +251,8 @@ different functions depending on panel kind:
 | Engine-driven custom panels (an engine's own `RequestUserInput`/`UpdateUserInputPanel` goal, e.g. a confirm-before-action prompt) | the engine's own script/node, already `InteractionPanel`-shaped |
 
 There is **no dedicated "result" or "error" panel** in the current
-implementation (contrary to what earlier revisions of this doc implied --
-see the correction note on the worked examples in §7). When an
-`execute_action` run ends, `engine_node.py` simply ends its
-`UiBridgeProgressSession` (`ui_session.finish()`), which releases
+implementation. When an `execute_action` run ends, `engine_node.py` simply
+ends its `UiBridgeProgressSession` (`ui_session.finish()`), which releases
 `ui_control` back to the Orchestrator; `_on_ui_acquire_control`'s reclaim
 then re-runs `select_object` for whatever's still selected and pushes a
 fresh idle/selection panel (`docs/NODE_INTERFACE.md` §3.1.1) -- there is no
@@ -288,9 +274,8 @@ so today.
 - `button_id` is **opaque to UE** -- it's a free-form string UE must echo
   back verbatim in a `button_press` event (§5.1 of `NODE_INTERFACE.md`); UE
   attaches no meaning to its contents.
-- Per-button `style` is **not actually always present** (correcting an
-  earlier claim here): `engine_node.py`'s `_progress_panel()` buttons
-  (Pause/Resume/Cancel) always include it, but
+- Per-button `style` is **not always present**: `engine_node.py`'s
+  `_progress_panel()` buttons (Pause/Resume/Cancel) always include it, but
   `orchestrator_node.py`'s `_build_selected_panel()` buttons
   (`action:...`/`deselect`) omit `style` entirely -- UE should treat an
   absent per-button `style` the same as an absent panel-level `style`:
@@ -300,22 +285,20 @@ so today.
 
 #### 6.3.1 `button_id` conventions (bridge-internal, not UE-visible semantics)
 
-**Correction (2026-11-05):** the table below previously listed
-`control:pause`/`control:resume`/`control:cancel`/`dismiss` as real,
-currently-generated `button_id`s -- they are not. `orchestrator_node.py`'s
-`_browse_on_button()` (the only handler for buttons on the Orchestrator's
-own idle/selection panels) only ever recognizes `action:<engine_id>:<action_id>`
-and `deselect`; anything else logs `unknown button_id` and falls back to
-the idle panel. Pause/Resume/Cancel buttons are instead generated and
-resolved entirely by the *executing engine itself* while it owns a live
-progress panel (`engine_node.py`'s `_progress_panel()`/`poll_button()`),
-using the bare ids `pause`/`resume`/`cancel` -- not the `control:`-prefixed
-form -- and are resolved by calling the engine's own
-`pause()`/`resume()`/`cancel()` directly, not via the Orchestrator's
-`~/control` service. `~/control` still exists as an Orchestrator service
-(e.g. for a non-UI/CLI caller), but no UI-bridge button press currently
-routes through it. There is also no current `dismiss`/error-panel button,
-since no error panel is produced today (§6.2).
+`orchestrator_node.py`'s `_browse_on_button()` (the only handler for
+buttons on the Orchestrator's own idle/selection panels) only ever
+recognizes `action:<engine_id>:<action_id>` and `deselect`; anything else
+logs `unknown button_id` and falls back to the idle panel.
+Pause/Resume/Cancel buttons are instead generated and resolved entirely by
+the *executing engine itself* while it owns a live progress panel
+(`engine_node.py`'s `_progress_panel()`/`poll_button()`), using the bare
+ids `pause`/`resume`/`cancel` -- not a `control:`-prefixed form -- and are
+resolved by calling the engine's own `pause()`/`resume()`/`cancel()`
+directly, not via the Orchestrator's `~/control` service. `~/control`
+still exists as an Orchestrator service (e.g. for a non-UI/CLI caller),
+but no UI-bridge button press currently routes through it. There is also
+no current `dismiss`/error-panel button, since no error panel is produced
+today (§6.2).
 
 An engine's own `panel_json` (via `RequestUserInput`) is free to use
 whatever `button_id` strings it wants -- they only need to be unique within
@@ -433,14 +416,12 @@ replaces `Pause` only once actually paused -- see `_progress_panel`'s
 
 ### 7.4 What the user actually sees after the action ends
 
-**Correction (2026-11-05): there is no distinct "result" or "error"
-panel in the current implementation** -- §7.4-§7.6 in earlier revisions
-of this doc showed hypothetical `"... -- SUCCEEDED"`/`"... -- FAILED"`/
-`"Error"` panels that no code currently produces (see §6.2). What
-actually happens: the engine's `UiBridgeProgressSession.finish()` releases
-`ui_control`; the Orchestrator reclaims it and re-runs `_build_selected_panel()`
-(or `_build_idle_panel()` if nothing is selected / the object is no
-longer selectable), which is exactly the same shape as §7.2, e.g.:
+There is no distinct "result" or "error" panel in the current
+implementation (see §6.2). What actually happens: the engine's
+`UiBridgeProgressSession.finish()` releases `ui_control`; the Orchestrator
+reclaims it and re-runs `_build_selected_panel()` (or `_build_idle_panel()`
+if nothing is selected / the object is no longer selectable), which is
+exactly the same shape as §7.2, e.g.:
 
 ```json
 {"title": "fridge_1", "message": "select an action", "buttons": [{"button_id": "deselect", "label": "Deselect"}]}
