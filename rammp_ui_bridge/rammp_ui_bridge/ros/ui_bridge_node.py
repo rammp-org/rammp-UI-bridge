@@ -929,8 +929,14 @@ class UiBridgeNode(Node):
         # empty. The payload itself is the documented
         # {stream_id, selected_instance_id, objects} shape (see
         # RammsBridgeSubsystem.h's OnDetectedObjectsJson comment).
+        #
+        # UE's Remote Control preset route resolves the function name
+        # against the exposed field's Label/DisplayName ("Update Detected
+        # Objects"), not the bare UFUNCTION name ("UpdateDetectedObjects")
+        # -- but the argument name is still matched against the UFUNCTION's
+        # own parameter name ("DetectedObjectsJSON"), not its DisplayName.
         self.ue.call_function(
-            "UpdateDetectedObjects",
+            "Update Detected Objects",
             {
                 "DetectedObjectsJSON": json.dumps(
                     {
@@ -969,7 +975,10 @@ class UiBridgeNode(Node):
             self._active_input_goal = goal_state
 
         if panel_json:
-            self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})
+            # "Update Panel" is the RC Label (DisplayName, with a space);
+            # "PanelJSON" is still the bare UFUNCTION parameter name (no
+            # space) -- see the matching call_function above.
+            self.ue.call_function("Update Panel", {"PanelJSON": panel_json})
         if objects:
             self._push_engine_objects(objects, selected_instance_id)
 
@@ -1060,7 +1069,9 @@ class UiBridgeNode(Node):
             selected_instance_id = state["selected_instance_id"]
 
         if update_panel:
-            self.ue.call_function("UpdatePanel", {"PanelJson": update["panel_json"]})
+            # "Update Panel" is the RC Label (DisplayName), while
+            # "PanelJSON" is still the bare UFUNCTION parameter name.
+            self.ue.call_function("Update Panel", {"PanelJSON": update["panel_json"]})
         if update_objects or update_selected:
             self._push_engine_objects(objects, selected_instance_id)
 

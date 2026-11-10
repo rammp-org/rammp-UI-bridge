@@ -49,7 +49,11 @@ class UnrealRemoteWebsocket:
         user_input_property_label: str = "LastUIEventJSON",
         poll_ui_events: bool = True,
         ui_event_poll_rate_hz: float = 15.0,
-        ui_event_poll_function: str = "PollUIEvents",
+        # "Poll UIEvents" is the exposed field's Label (UE's Remote Control
+        # preset routes resolve a function call against the field's
+        # Label/DisplayName, not its bare UFUNCTION name -- see the
+        # matching call_function() fixes in ui_bridge_node.py).
+        ui_event_poll_function: str = "Poll UIEvents",
     ):
         self.base_url = f"ws://{host}:{ws_port}"
         self.loop = asyncio.new_event_loop()
