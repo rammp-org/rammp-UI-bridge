@@ -74,6 +74,7 @@ for a bridge-owned resource instead.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import threading
@@ -97,6 +98,23 @@ from rammp_ui_bridge_interfaces.srv import UpdateUserInputPanel
 
 from ramms_tools.streaming import StreamSender
 from ..unreal_remote_websocket import UnrealRemoteWebsocket
+
+# ramms_tools.streaming (StreamSender) uses plain stdlib logging and never
+# configures a handler itself -- same silent-drop issue
+# unreal_remote_websocket had before its own fix: without a handler here,
+# its logger.info("StreamSender connected to ...")/logger.warning("StreamSender
+# send error: ...") calls would be invisible. Attach a handler so connect/
+# disconnect/send-error events from the vendored streaming client actually
+# show up in this node's log.
+_stream_logger = logging.getLogger("ramms_tools.streaming")
+if not _stream_logger.handlers:
+    _stream_handler = logging.StreamHandler()
+    _stream_handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+    )
+    _stream_logger.addHandler(_stream_handler)
+    _stream_logger.propagate = False
+_stream_logger.setLevel(logging.DEBUG)
 
 # §5.2.A base-layer camera stream: fixed RMSS channel numbers + stream IDs for
 # the scene camera's two layers (one bridge, one scene camera -- no per-robot
@@ -321,6 +339,13 @@ class UiBridgeNode(Node):
             self.get_parameter("ue_stream_reconnect_period").get_parameter_value().double_value
         )
         self._stream_shutdown = threading.Event()
+        # Rate-limits the "not connected, dropping frame" warning in
+        # _stream_ready() (one log per 50 drops, not once per frame) and the
+        # connect-failure warning in _stream_reconnect_loop (one per 10
+        # attempts) -- otherwise either would spam at full camera/reconnect
+        # rate for as long as UE's streaming server stays unreachable.
+        self._stream_drop_count = 0
+        self._stream_connect_fail_count = 0
         self._stream_reconnect_thread = threading.Thread(
             target=self._stream_reconnect_loop, name="ui_bridge-stream-reconnect", daemon=True
         )
@@ -465,15 +490,38 @@ class UiBridgeNode(Node):
             self._latest_scene_depth = msg
             self._scene_depth_frame_count += 1
             count = self._scene_depth_frame_count
-        if count == 1 or count % 100 == 0:
+        if count == 1 or count % 2 == 0:
             self.get_logger().info(
                 f"scene camera depth: frame #{count} ({msg.width}x{msg.height}, "
                 f"encoding={msg.encoding})"
             )
         self._forward_scene_camera_depth(msg)
 
+    def _stream_ready(self, frame_kind: str) -> bool:
+        """True if python-side camera streaming is enabled and the TCP
+        connection to UE's RMSS streaming server is currently up.
+
+        When not, logs a rate-limited warning (first drop, then every 50th)
+        instead of silently discarding the frame forever -- previously this
+        was a bare early-return with no log at all, making "UE streaming
+        server never came up"/"connection dropped mid-session" indistinguishable
+        from "nothing to forward yet"."""
+        if not self._use_python_streaming:
+            return False
+        if self._stream_sender.is_connected():
+            return True
+        self._stream_drop_count += 1
+        if self._stream_drop_count == 1 or self._stream_drop_count % 50 == 0:
+            host = self.get_parameter("ue_host").value
+            port = self.get_parameter("ue_stream_port").value
+            self.get_logger().warning(
+                f"dropping {frame_kind} frame: not connected to UE streaming "
+                f"server at {host}:{port} (drop #{self._stream_drop_count})"
+            )
+        return False
+
     def _forward_scene_camera_color(self, msg: Image) -> None:
-        if not self._use_python_streaming or not self._stream_sender.is_connected():
+        if not self._stream_ready("scene camera color"):
             return
         try:
             self._stream_sender.send_image(
@@ -491,7 +539,7 @@ class UiBridgeNode(Node):
             self.get_logger().warning(f"failed to forward scene camera color frame to UE: {exc}")
 
     def _forward_scene_camera_depth(self, msg: Image) -> None:
-        if not self._use_python_streaming or not self._stream_sender.is_connected():
+        if not self._stream_ready("scene camera depth"):
             return
         try:
             if msg.encoding in _UINT16_DEPTH_ENCODINGS:
@@ -715,7 +763,7 @@ class UiBridgeNode(Node):
         self._forward_engine_overlay_color(image)
 
     def _forward_engine_overlay_color(self, msg: Image) -> None:
-        if not self._use_python_streaming or not self._stream_sender.is_connected():
+        if not self._stream_ready("engine overlay color"):
             return
         try:
             self._stream_sender.send_image(
@@ -739,14 +787,33 @@ class UiBridgeNode(Node):
         reconnect loop for the Remote Control WebSocket, just thread-based
         instead of asyncio-based since ``StreamSender`` is a plain blocking
         TCP client."""
+        host = self.get_parameter("ue_host").value
+        port = self.get_parameter("ue_stream_port").value
         while not self._stream_shutdown.is_set():
             if not self._stream_sender.is_connected():
                 try:
                     self._stream_sender.connect()
-                    self.get_logger().info("connected to UE streaming server")
+                    self.get_logger().info(f"connected to UE streaming server at {host}:{port}")
+                    self._stream_connect_fail_count = 0
+                    self._stream_drop_count = 0
                 except OSError as exc:
-                    self.get_logger().debug(f"UE streaming server connect failed: {exc}")
+                    self._stream_connect_fail_count += 1
+                    # First attempt and every 10th thereafter get a visible
+                    # WARNING (reconnect runs every ue_stream_reconnect_period
+                    # seconds, default 3s, so this would otherwise log a
+                    # failure line forever at that rate while UE's streaming
+                    # server is unreachable).
+                    if self._stream_connect_fail_count == 1 or self._stream_connect_fail_count % 10 == 0:
+                        self.get_logger().warning(
+                            f"UE streaming server connect failed (attempt "
+                            f"#{self._stream_connect_fail_count}) to {host}:{port}: {exc!r}"
+                        )
+                    else:
+                        self.get_logger().debug(
+                            f"UE streaming server connect failed: {exc!r}"
+                        )
             self._stream_shutdown.wait(self._stream_reconnect_period)
+
 
     # ------------------------------------------------------------------
     # UE -> active RequestUserInput caller (Orchestrator or engine):
