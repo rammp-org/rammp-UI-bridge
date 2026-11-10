@@ -115,6 +115,12 @@ class UnrealRemoteWebsocket:
         # a connection actually succeeds, so the next genuine disconnect is
         # still reported.
         self._disconnected_logged = False
+        # Dedup state so a persistent error condition (e.g. "preset not
+        # found" while UE hasn't registered it yet) logs once instead of
+        # spamming one line per WS message/poll tick (~15/sec) until it
+        # resolves. Reset to None as soon as a 200 response is seen again.
+        self._last_logged_error_response = None
+        self._last_poll_error_response = None
 
         # -- PollUIEvents (2026-11-04 UI-team design) --------------------
         # UE no longer pushes individual taps as unsolicited property
@@ -153,21 +159,37 @@ class UnrealRemoteWebsocket:
                     self._disconnected_logged = False
                     await self.register_preset()  # Register preset on connect
                     print("Preset registration sent.")
+                    asyncio.create_task(self.list_presets())
                     async for message in ws:
                         command = json.loads(message)
+                        response_code = command.get("ResponseCode")
                         # Routine "nothing happened" PollUIEvents responses
                         # fire at ui_event_poll_rate_hz (~15/sec) -- don't
                         # log those, only log when SinceSequence actually
                         # advanced with new events (or for any other kind
-                        # of message/response).
-                        if not _is_empty_poll_events_response(command):
+                        # of message/response). Likewise, a persistent error
+                        # (e.g. "preset not found" while UE hasn't
+                        # registered it yet) would otherwise re-log the same
+                        # line every poll tick until it resolves -- only log
+                        # it once, on first occurrence or when it changes.
+                        is_routine_poll = _is_empty_poll_events_response(command)
+                        is_repeated_error = (
+                            response_code is not None
+                            and response_code != 200
+                            and command == self._last_logged_error_response
+                        )
+                        should_log = not is_routine_poll and not is_repeated_error
+                        if should_log:
                             logger.debug(f"WS <- {message}")
                         if "ResponseCode" in command:
-                            if not _is_empty_poll_events_response(command):
+                            if should_log:
                                 logger.debug(
-                                    f"WS response: code={command.get('ResponseCode')} "
+                                    f"WS response: code={response_code} "
                                     f"body={command.get('ResponseBody')}"
                                 )
+                            self._last_logged_error_response = (
+                                command if response_code != 200 else None
+                            )
                             await self._response_queue.put(command)
                         if "ChangedFields" in command:
                             await self._value_change_queue.put(
@@ -210,6 +232,41 @@ class UnrealRemoteWebsocket:
         }
         logger.debug(f"WS -> {command}")
         await self.ws_client.send(json.dumps(command))
+
+    async def list_presets(self):
+        """GET /remote/presets via the WS "http" tunnel, logged once right
+        after connecting (and scheduled as its own task rather than awaited
+        inline, since ``ws_client_handler``'s own ``async for`` receive loop
+        hasn't started yet at that point and is the thing that actually
+        fulfils this request/response round trip).
+
+        Purely diagnostic: lets a "preset not found"/404 error from
+        ``register_preset`` or the ``PollUIEvents`` poller be compared
+        against what UE's Remote Control plugin actually has registered at
+        that moment (e.g. a typo'd preset name, or UE not having loaded the
+        map/preset yet)."""
+        if self.ws_client is None:
+            return
+        parameters = {"Url": "/remote/presets", "Verb": "GET"}
+        payload = {"MessageName": "http", "Parameters": parameters}
+        async with self._send_lock:
+            while not self._response_queue.empty():
+                self._response_queue.get_nowait()
+            await self.ws_client.send(json.dumps(payload))
+            try:
+                resp = await asyncio.wait_for(
+                    self._response_queue.get(), self.default_timeout
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timed out listing UE Remote Control presets")
+                return
+
+        if resp.get("ResponseCode", 0) != 200:
+            logger.warning(f"Failed to list UE Remote Control presets: {resp}")
+            return
+        presets = resp.get("ResponseBody", {}).get("Presets", [])
+        names = [p.get("Name") for p in presets]
+        logger.info(f"UE Remote Control presets available: {names}")
 
     async def send_and_wait(self, parameters, timeout=None):
         """
@@ -331,9 +388,12 @@ class UnrealRemoteWebsocket:
                 continue
 
             if resp.get("ResponseCode", 0) != 200:
-                logger.debug(f"PollUIEvents non-200 response: {resp}")
+                if resp != self._last_poll_error_response:
+                    logger.debug(f"PollUIEvents non-200 response: {resp}")
+                    self._last_poll_error_response = resp
                 await asyncio.sleep(period)
                 continue
+            self._last_poll_error_response = None
 
             returned_values = resp.get("ResponseBody", {}).get("ReturnedValues", [])
             result = returned_values[0] if returned_values else {}
