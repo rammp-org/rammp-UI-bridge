@@ -86,7 +86,13 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, qos_profile_sensor_data
+from rclpy.qos import (
+    DurabilityPolicy,
+    HistoryPolicy,
+    QoSProfile,
+    ReliabilityPolicy,
+    qos_profile_sensor_data,
+)
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Bool
 
@@ -135,6 +141,21 @@ _OVERLAY_STREAM_GROUP = "overlay"
 # ROS sensor_msgs/Image depth encodings this bridge knows how to forward
 # as-is (uint16 mm, no conversion) -- see StreamSender.send_depth_uint16.
 _UINT16_DEPTH_ENCODINGS = frozenset({"16UC1", "mono16"})
+
+# qos_profile_sensor_data (BEST_EFFORT) has been observed to silently stop
+# delivering samples in unicast-only/multicast-disabled DDS setups (e.g. some
+# CycloneDDS configs used for WSL/dev testing) when matched against a
+# RELIABLE publisher -- the subscription matches at discovery time but no
+# data ever arrives after the first sample. RELIABLE is safe to use against
+# both RELIABLE and BEST_EFFORT publishers and isn't vulnerable to this, at
+# the cost of slightly more retransmission/backpressure overhead on lossy
+# networks. Used for all inbound sensor-ish topics below.
+_RELIABLE_SENSOR_DATA_QOS = QoSProfile(
+    history=qos_profile_sensor_data.history,
+    depth=qos_profile_sensor_data.depth,
+    reliability=ReliabilityPolicy.RELIABLE,
+    durability=qos_profile_sensor_data.durability,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -415,21 +436,21 @@ class UiBridgeNode(Node):
             Image,
             self.get_parameter("scene_camera_color_topic").value,
             self._on_scene_camera_color,
-            qos_profile_sensor_data,
+            _RELIABLE_SENSOR_DATA_QOS,
             callback_group=self._cb_group,
         )
         self._scene_depth_sub = self.create_subscription(
             Image,
             self.get_parameter("scene_camera_depth_topic").value,
             self._on_scene_camera_depth,
-            qos_profile_sensor_data,
+            _RELIABLE_SENSOR_DATA_QOS,
             callback_group=self._cb_group,
         )
         self._engine_overlay_sub = self.create_subscription(
             EngineOverlayImage,
             self.get_parameter("engine_overlay_topic").value,
             self._on_engine_overlay_frame,
-            qos_profile_sensor_data,
+            _RELIABLE_SENSOR_DATA_QOS,
             callback_group=self._cb_group,
         )
         # Plain (token-stripped) republish of overlay frames that already
@@ -446,7 +467,7 @@ class UiBridgeNode(Node):
             JointState,
             self.get_parameter("arm_joint_states_topic").value,
             self._on_arm_joint_states,
-            qos_profile_sensor_data,
+            _RELIABLE_SENSOR_DATA_QOS,
             callback_group=self._cb_group,
         )
 
@@ -522,6 +543,7 @@ class UiBridgeNode(Node):
 
     def _forward_scene_camera_color(self, msg: Image) -> None:
         if not self._stream_ready("scene camera color"):
+            self.get_logger().info("Scene camera color frame dropped: stream not ready.")
             return
         try:
             self._stream_sender.send_image(
@@ -540,6 +562,7 @@ class UiBridgeNode(Node):
 
     def _forward_scene_camera_depth(self, msg: Image) -> None:
         if not self._stream_ready("scene camera depth"):
+            self.get_logger().info("Scene camera depth frame dropped: stream not ready.")
             return
         try:
             if msg.encoding in _UINT16_DEPTH_ENCODINGS:
