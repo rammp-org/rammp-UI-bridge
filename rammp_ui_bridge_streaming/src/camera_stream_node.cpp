@@ -35,7 +35,7 @@ constexpr uint16_t kOverlayColorChannel = 2;
 const char kSceneColorStreamId[] = "camera/scene/color";
 const char kSceneDepthStreamId[] = "camera/scene/depth";
 const char kOverlayColorStreamId[] = "camera/wrist/color";
-const char kSceneGroup[] = "scene";
+const char kSceneGroup[] = "camera/scene";
 const char kOverlayGroup[] = "overlay";
 
 bool is_uint16_depth_encoding(const std::string & encoding)
