@@ -32,9 +32,9 @@ constexpr uint16_t kSceneColorChannel = 0;
 constexpr uint16_t kSceneDepthChannel = 1;
 constexpr uint16_t kOverlayColorChannel = 2;
 
-const char kSceneColorStreamId[] = "scene/color";
-const char kSceneDepthStreamId[] = "scene/depth";
-const char kOverlayColorStreamId[] = "engine/overlay";
+const char kSceneColorStreamId[] = "camera/scene/color";
+const char kSceneDepthStreamId[] = "camera/scene/depth";
+const char kOverlayColorStreamId[] = "camera/wrist/color";
 const char kSceneGroup[] = "scene";
 const char kOverlayGroup[] = "overlay";
 

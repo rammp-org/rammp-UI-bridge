@@ -127,15 +127,15 @@ _stream_logger.setLevel(logging.DEBUG)
 # channel negotiation needed yet).
 _SCENE_COLOR_CHANNEL = 0
 _SCENE_DEPTH_CHANNEL = 1
-_SCENE_COLOR_STREAM_ID = "camera/wrist/color"
-_SCENE_DEPTH_STREAM_ID = "camera/wrist/depth"
+_SCENE_COLOR_STREAM_ID = "camera/scene/color"
+_SCENE_DEPTH_STREAM_ID = "camera/scene/depth"
 _SCENE_STREAM_GROUP = "camera/scene"
 
 # §5.2.A overlay layer (§3.3.1): a single shared RMSS channel/stream_id for
 # whichever engine is currently active's own camera -- see
 # engine_overlay_topic below for why this is one topic, not per-engine.
 _OVERLAY_COLOR_CHANNEL = 2
-_OVERLAY_COLOR_STREAM_ID = "engine/overlay"
+_OVERLAY_COLOR_STREAM_ID = "camera/wrist/color"
 _OVERLAY_STREAM_GROUP = "overlay"
 
 # ROS sensor_msgs/Image depth encodings this bridge knows how to forward

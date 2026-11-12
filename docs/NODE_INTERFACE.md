@@ -528,7 +528,7 @@ with a throttled warning log) any frame whose token doesn't match --
 including frames from a stale/already-released owner. Only frames with a
 matching token are forwarded (`_forward_engine_overlay_color`) to UE,
 unconditionally, on fixed channel 2, `group="overlay"`,
-`stream_id="engine/overlay"` -- exactly the same shape as the base
+`stream_id="camera/wrist/color"` -- exactly the same shape as the base
 layer's forwarding, just one channel number up. An engine's expected
 lifecycle is: call `acquire_control` once it starts needing the UI,
 publish `EngineOverlayImage` frames (and/or call `~/request_user_input`,
@@ -731,8 +731,9 @@ not two interchangeable sources:
   separately (§5.2.D), not in-band. **Implemented**:
   `_forward_scene_camera_color`/`_forward_scene_camera_depth` push every
   frame landed by §3.2's subscriptions straight through to UE, on fixed
-  channels 0 (color)/1 (depth), `group="scene"`, `stream_id="scene/color"`/
-  `"scene/depth"`. Depth is sent via `send_depth_uint16` for `16UC1`/
+  channels 0 (color)/1 (depth), `group="camera/scene"`,
+  `stream_id="camera/scene/color"`/`"camera/scene/depth"`. Depth is sent
+  via `send_depth_uint16` for `16UC1`/
   `mono16` encodings (native camera mm depth, no conversion); any other
   depth encoding (e.g. `32FC1`) falls back to generic `send_image` with
   `fmt` set to the ROS encoding string, pending a real depth source to
@@ -753,7 +754,7 @@ not two interchangeable sources:
   detected-object semantics. **Implemented**: `_on_engine_overlay_color`/
   `_forward_engine_overlay_color` subscribe to the single shared
   `engine_overlay_topic` (§3.3.1) and push every frame through to UE on
-  channel 2, `group="overlay"`, `stream_id="engine/overlay"` -- but no
+  channel 2, `group="overlay"`, `stream_id="camera/wrist/color"` -- but no
   real engine publishes to it yet, so this has only been exercised with
   synthetic test traffic, not a real wrist camera.
 
@@ -954,7 +955,8 @@ Mechanics (`_push_engine_objects` in the reference implementation):
 (§3.1.1's box note explains why a mask-based precise hit-test was dropped:
 the freshest box may come from an engine's own camera, not a single
 shared Perception mask) -- `source` tells UE which of its two video
-channels (`scene/color`, the §5.2.A base layer; or `engine/overlay`, the
+channels (`camera/scene/color`, the §5.2.A base layer; or
+`camera/wrist/color`, the
 §5.2.A overlay layer) to draw/hit-test `box` against, since the two
 channels are independent video feeds that can have different resolutions/
 framings. It's acceptable for `box` to lag slightly behind the live video
