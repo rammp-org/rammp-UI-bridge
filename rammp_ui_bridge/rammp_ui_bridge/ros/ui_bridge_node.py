@@ -100,7 +100,7 @@ from rammp_common_interfaces.msg import ControlStatus
 from rammp_common_interfaces.srv import AcquireControl, ReleaseControl
 from rammp_ui_bridge_interfaces.action import RequestUserInput
 from rammp_ui_bridge_interfaces.msg import EngineOverlayImage
-from rammp_ui_bridge_interfaces.srv import UpdateUserInputPanel
+from rammp_ui_bridge_interfaces.srv import SetEngineOverlayVisible, UpdateUserInputPanel
 
 from ramms_tools.streaming import StreamSender
 from ..unreal_remote_websocket import UnrealRemoteWebsocket
@@ -127,9 +127,9 @@ _stream_logger.setLevel(logging.DEBUG)
 # channel negotiation needed yet).
 _SCENE_COLOR_CHANNEL = 0
 _SCENE_DEPTH_CHANNEL = 1
-_SCENE_COLOR_STREAM_ID = "scene/color"
-_SCENE_DEPTH_STREAM_ID = "scene/depth"
-_SCENE_STREAM_GROUP = "scene"
+_SCENE_COLOR_STREAM_ID = "camera/wrist/color"
+_SCENE_DEPTH_STREAM_ID = "camera/wrist/depth"
+_SCENE_STREAM_GROUP = "camera/scene"
 
 # §5.2.A overlay layer (§3.3.1): a single shared RMSS channel/stream_id for
 # whichever engine is currently active's own camera -- see
@@ -347,6 +347,13 @@ class UiBridgeNode(Node):
         self._ui_token: bytes = bytes(16)
         self._ui_generation = 0
         self._ui_rejected_count = 0
+        # Whether frames on engine_overlay_topic are currently forwarded to
+        # UE's streaming server -- toggled via ~/engine_overlay/set_visible
+        # (see _on_set_engine_overlay_visible). Reset to visible whenever
+        # ui_control changes hands (_on_ui_acquire_control/_on_ui_release_control)
+        # so a new owner always starts visible rather than inheriting
+        # whatever the previous owner last left it as.
+        self._engine_overlay_visible = True
 
         # §5.2.A: TCP client of UE's RMSS streaming server. Connection is
         # managed by a dedicated reconnect-loop thread (_stream_reconnect_loop)
@@ -404,6 +411,12 @@ class UiBridgeNode(Node):
             ReleaseControl,
             "~/ui_control/release_control",
             self._on_ui_release_control,
+            callback_group=self._cb_group,
+        )
+        self._set_engine_overlay_visible_server = self.create_service(
+            SetEngineOverlayVisible,
+            "~/engine_overlay/set_visible",
+            self._on_set_engine_overlay_visible,
             callback_group=self._cb_group,
         )
         self._ui_control_status_publisher = self.create_publisher(
@@ -669,6 +682,7 @@ class UiBridgeNode(Node):
                 minted_fresh = True
             self._ui_owner_id = request.owner_id
             self._ui_generation += 1
+            self._engine_overlay_visible = True
             response.accepted = True
             response.token = list(self._ui_token)
             response.generation = self._ui_generation
@@ -731,6 +745,7 @@ class UiBridgeNode(Node):
                 owner = self._ui_owner_id
                 self._ui_owner_id = ""
                 self._ui_token = bytes(16)
+                self._engine_overlay_visible = True
                 response.released = True
                 response.message = ""
             else:
@@ -741,6 +756,25 @@ class UiBridgeNode(Node):
         if owner is not None:
             self.get_logger().info(f"ui control released by '{owner}'")
             self._publish_ui_control_status()
+        return response
+
+    def _on_set_engine_overlay_visible(
+        self, request: SetEngineOverlayVisible.Request, response: SetEngineOverlayVisible.Response
+    ) -> SetEngineOverlayVisible.Response:
+        with self._ui_control_lock:
+            granted = bool(self._ui_owner_id) and bytes(request.token) == self._ui_token
+            if granted:
+                self._engine_overlay_visible = request.visible
+                owner_id = self._ui_owner_id
+        if not granted:
+            response.accepted = False
+            response.message = "token doesn't match the current ui_control grant"
+            return response
+        response.accepted = True
+        response.message = ""
+        self.get_logger().info(
+            f"engine overlay {'shown' if request.visible else 'hidden'} by '{owner_id}'"
+        )
         return response
 
     def _publish_ui_control_status(self) -> None:
@@ -761,6 +795,8 @@ class UiBridgeNode(Node):
             if not granted:
                 self._ui_rejected_count += 1
                 rejected = self._ui_rejected_count
+            else:
+                visible = self._engine_overlay_visible
         if not granted:
             if rejected == 1 or rejected % 100 == 0:
                 self.get_logger().warning(
@@ -781,9 +817,13 @@ class UiBridgeNode(Node):
             )
         # Republish token-stripped, post-arbitration, for the optional C++
         # streaming node (or any other consumer) to forward without needing
-        # to know about ui_control arbitration tokens at all.
+        # to know about ui_control arbitration tokens at all -- sent
+        # regardless of engine_overlay visibility (see
+        # ~/engine_overlay/set_visible), which only gates the UE-bound
+        # RMSS stream below.
         self._validated_overlay_publisher.publish(image)
-        self._forward_engine_overlay_color(image)
+        if visible:
+            self._forward_engine_overlay_color(image)
 
     def _forward_engine_overlay_color(self, msg: Image) -> None:
         if not self._stream_ready("engine overlay color"):

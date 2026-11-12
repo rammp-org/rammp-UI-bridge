@@ -527,19 +527,32 @@ compares the incoming token against the one most recently granted
 with a throttled warning log) any frame whose token doesn't match --
 including frames from a stale/already-released owner. Only frames with a
 matching token are forwarded (`_forward_engine_overlay_color`) to UE,
-unconditionally, on fixed channel 2, `group="overlay"`,
-`stream_id="engine/overlay"` -- exactly the same shape as the base
-layer's forwarding, just one channel number up. An engine's expected
-lifecycle is: call `acquire_control` once it starts needing the UI,
-publish `EngineOverlayImage` frames (and/or call `~/request_user_input`,
-§3.3.2) stamped with that token while active, and call `release_control`
-(or just let its holding goal end) when done -- at which point the
-Orchestrator reclaims control per the bullet above. Every grant/mint is
-logged (`ui control acquired by '<owner_id>' (minted a new/using
-orchestrator-supplied token ..., generation N)`) so it's visible in the
-node's log which owner holds the UI and when it changed hands. UE's own
-receive-timeout still handles falling back to the base-layer-only view if
-nothing is forwarded for a while (see §5.2.A).
+subject to the visibility toggle below, on fixed channel 2,
+`group="overlay"`, `stream_id="engine/overlay"` -- exactly the same shape
+as the base layer's forwarding, just one channel number up. An engine's
+expected lifecycle is: call `acquire_control` once it starts needing the
+UI, publish `EngineOverlayImage` frames (and/or call
+`~/request_user_input`, §3.3.2) stamped with that token while active, and
+call `release_control` (or just let its holding goal end) when done -- at
+which point the Orchestrator reclaims control per the bullet above. Every
+grant/mint is logged (`ui control acquired by '<owner_id>' (minted a
+new/using orchestrator-supplied token ..., generation N)`) so it's visible
+in the node's log which owner holds the UI and when it changed hands. UE's
+own receive-timeout still handles falling back to the base-layer-only view
+if nothing is forwarded for a while (see §5.2.A).
+
+- `~/engine_overlay/set_visible`
+  (`rammp_ui_bridge_interfaces/SetEngineOverlayVisible`) -- lets the
+  current `ui_control` holder show/hide its overlay stream (`bool
+  visible`) without releasing control, stopping its camera publisher, or
+  losing any RMSS stream state: when hidden, incoming `EngineOverlayImage`
+  frames are still accepted/arbitrated (so the token stays warm and
+  `_latest_engine_overlay` stays current), just not forwarded to UE until
+  `visible` is set back to `true`. Refused (`accepted=false`) on a token
+  mismatch, same check as everything else in this section. Resets to
+  `visible=true` on every fresh `acquire_control`/`release_control`, so a
+  new owner (or the Orchestrator reclaiming control) never inherits a
+  previous owner's hidden state.
 
 **Not yet decided:** whether this resource also needs a `RevokeControl`
 (operator-override, no-token) path for a hard crash-recovery case -- not
@@ -638,6 +651,7 @@ unimplemented.
 | `~/ui_control/acquire_control` | `rammp_common_interfaces/AcquireControl` (§3.1.1) | server | Seizes the `ui_control` grant for a new `owner_id` |
 | `~/ui_control/release_control` | `rammp_common_interfaces/ReleaseControl` (§3.1.1) | server | Releases the grant, if called by its current holder |
 | `~/ui_control/status` | `rammp_common_interfaces/ControlStatus` (§3.1.1) | published (latched) | Current `ui_control` owner/generation/rejection-count |
+| `~/engine_overlay/set_visible` | `rammp_ui_bridge_interfaces/SetEngineOverlayVisible` (§3.3.1) | server | Called by the current `ui_control` holder to show/hide its overlay stream without releasing control |
 
 No other services, actions, or topics advertised to ROS2 clients besides
 those listed above; all UI interaction besides them happens over the UE
