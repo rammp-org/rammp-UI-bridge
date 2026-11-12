@@ -12,6 +12,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nlohmann_json REQUIRED)
+find_package(rammp_ui_bridge_interfaces REQUIRED)
 
 include_directories(include)
 
@@ -28,7 +29,7 @@ target_link_libraries(stream_sender PUBLIC rmss_protocol nlohmann_json::nlohmann
 
 add_executable(camera_stream_node src/camera_stream_node.cpp)
 target_link_libraries(camera_stream_node PRIVATE stream_sender)
-ament_target_dependencies(camera_stream_node PUBLIC rclcpp sensor_msgs)
+ament_target_dependencies(camera_stream_node PUBLIC rclcpp sensor_msgs rammp_ui_bridge_interfaces)
 
 install(TARGETS
   rmss_protocol
