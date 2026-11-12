@@ -551,7 +551,13 @@ nothing is forwarded for a while (see §5.2.A).
   UE's Remote Control `"Open Camera Feed"` (`visible=true`) or
   `"Close Camera Feed"` (`visible=false`) UFUNCTION, no parameters --
   show/hide of the overlay widget/material is entirely UE-side logic, the
-  bridge is just the token-gated trigger for it.
+  bridge is just the token-gated trigger for it. The Orchestrator calls
+  this itself with `visible=false` right after every `execute_action`
+  finishes (success, failure, or cancel alike), using the fresh token it
+  reclaims at that point -- see `rammp-orchestrator`'s
+  `docs/RUNTIME_FLOWS.md` §5 -- so an engine doesn't need to hide its own
+  overlay before releasing `ui_control`; call this directly only to
+  show/hide it at some other specific moment mid-run.
 
 **Not yet decided:** whether this resource also needs a `RevokeControl`
 (operator-override, no-token) path for a hard crash-recovery case -- not

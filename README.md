@@ -126,7 +126,16 @@ endpoints (reusing `rammp_common_interfaces`' AcquireControl/
 ReleaseControl/ControlStatus protocol -- the same grant also gates
 `~/request_user_input`, since both represent the one currently-active
 engine's exclusive right to talk to the UI), so a stale/crashed publisher
-can't leak frames to UE. `rammp_orchestrator`'s `fridge_ui_demo` reference
+can't leak frames to UE. The overlay's visibility in UE is a separate,
+token-gated trigger -- `~/engine_overlay/set_visible`
+(`SetEngineOverlayVisible.srv`) -- that calls UE's own parameterless
+`Open Camera Feed`/`Close Camera Feed` Remote Control function regardless
+of whether frames are flowing; the Orchestrator calls it with
+`visible=False` automatically once every `execute_action` finishes (see
+`rammp-orchestrator`'s `docs/RUNTIME_FLOWS.md` §5), and an engine may call
+it itself (via `ctx.set_overlay_visible()` in
+`rammp-kitchen-capability-engines`) to show/hide it at some other specific
+moment -- live-verified end to end via `mock_ue`. `rammp_orchestrator`'s `fridge_ui_demo` reference
 engine now exercises `acquire_control`/`~/request_user_input`/
 `~/request_user_input/update` live (holding `ui_control` for its whole
 pausable/cancellable open/close run via its `UiBridgeProgressSession`

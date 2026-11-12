@@ -288,6 +288,43 @@ Orchestrator-driven state (selected object's action buttons, or idle) calls
 for once your goal ends -- you don't need to push anything to "clean up"
 the panel yourself.
 
+### 2.6 Showing/hiding your overlay camera view in UE
+
+If your engine publishes `EngineOverlayImage` frames (§2.2's optional
+overlay-video case), those frames keep flowing to UE unconditionally once
+you hold `ui_control` -- publishing them is **not** what makes the overlay
+view appear on screen. Whether UE actually shows that camera view is a
+separate, UE-side concept: `~/engine_overlay/set_visible`
+(`SetEngineOverlayVisible.srv`) tells the bridge to call UE's own
+parameterless Remote Control functions, `Open Camera Feed`/
+`Close Camera Feed`, which toggle the overlay widget/material in-engine.
+Gated by the same `ui_control` token as everything else in this section --
+acquire it first, same as §2.1.
+
+```python
+from rammp_ui_bridge_interfaces.srv import SetEngineOverlayVisible
+
+set_visible_client = node.create_client(SetEngineOverlayVisible, "/ui_bridge_node/engine_overlay/set_visible")
+set_visible_client.call(SetEngineOverlayVisible.Request(token=token, visible=True))   # show
+...
+set_visible_client.call(SetEngineOverlayVisible.Request(token=token, visible=False))  # hide
+```
+
+Capability-engine authors using `rammp-kitchen-capability-engines`'s
+`Engine`/`Context` base class don't need any of the above directly -- just
+call `ctx.set_overlay_visible(True)` / `ctx.set_overlay_visible(False)`,
+which wraps this exact call using the engine's own per-execution token
+(non-blocking, logs a warning on refusal instead of raising).
+
+You don't need to explicitly hide it before releasing `ui_control` at the
+end of your run (§2.5): the Orchestrator already calls
+`set_visible(visible=False)` itself right after every `execute_action`
+goal finishes (success, failure, or cancel alike) -- see
+`rammp-orchestrator/rammp_orchestrator/docs/RUNTIME_FLOWS.md` §5. Call it
+yourself mid-execution only if you want the overlay to appear/disappear
+at some other specific moment (e.g. only once your own perception step has
+something worth showing).
+
 ---
 
 ## 3. Combining both
@@ -323,6 +360,8 @@ All in `rammp-interfaces-ros2`:
   video channel `source` (`"scene"` or `"overlay"`) names.
 - `rammp_ui_bridge_interfaces/msg/EngineOverlayImage` -- `image`
   (`sensor_msgs/Image`), `token`.
+- `rammp_ui_bridge_interfaces/srv/SetEngineOverlayVisible` -- request
+  (`token`, `visible`), response (`accepted`, `message`); see §2.6.
 - `rammp_common_interfaces/srv/{AcquireControl,ReleaseControl}` and
   `msg/ControlStatus` -- the shared token-arbitration mechanism also used
   by `rammp_arm_interfaces/JointSetpoint` and
