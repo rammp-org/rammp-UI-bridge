@@ -259,10 +259,11 @@ class UiBridgeNode(Node):
         self.declare_parameter("ue_stream_port", 30030)
         self.declare_parameter("ue_stream_reconnect_period", 3.0)
         # When False, this node does not touch camera topics at all: it
-        # creates none of the scene-camera/engine-overlay subscriptions or
-        # the validated-overlay republish below (see their creation further
-        # down), not just a forwarding no-op. The C++ rammp_ui_bridge_streaming
-        # node runs independently and in parallel in that configuration --
+        # creates none of the scene-camera/engine-overlay subscriptions,
+        # nor the UE streaming-server TCP client/reconnect thread below
+        # (see their creation further down), not just a forwarding no-op.
+        # The C++ rammp_ui_bridge_streaming node runs independently and in
+        # parallel in that configuration --
         # it subscribes directly to the raw scene/overlay camera topics and
         # runs its own ui_control arbitration server (own acquire_control/
         # release_control, granted the same per-execution session token the
@@ -270,13 +271,6 @@ class UiBridgeNode(Node):
         # depending on this node for either the frames or the token check.
         # Default True: zero behaviour change out of the box.
         self.declare_parameter("use_python_camera_streaming", True)
-        # Plain (token-stripped) republish of engine-overlay frames that
-        # already passed this node's ui_control arbitration check -- only
-        # created/published while use_python_camera_streaming is True (see
-        # above); of no use to the C++ streaming node, which validates
-        # EngineOverlayImage frames itself instead (see that node's own
-        # acquire_control/release_control).
-        self.declare_parameter("validated_engine_overlay_topic", "~/validated_engine_overlay")
         # §3.4 Bridge <-> Hardware node / §5.2.B system status: the arm
         # driver's (or its mock's) sensor_msgs/msg/JointState topic, covering
         # every arm joint -- see sheppy's `arm` node (rammp-deployments'
@@ -362,25 +356,36 @@ class UiBridgeNode(Node):
         # managed by a dedicated reconnect-loop thread (_stream_reconnect_loop)
         # since StreamSender itself has no built-in retry -- mirrors how
         # UnrealRemoteWebsocket manages its own WebSocket reconnection.
-        self._stream_sender = StreamSender(
-            host=self.get_parameter("ue_host").value,
-            port=self.get_parameter("ue_stream_port").get_parameter_value().integer_value,
-        )
-        self._stream_reconnect_period = (
-            self.get_parameter("ue_stream_reconnect_period").get_parameter_value().double_value
-        )
+        # Only created when this node is actually responsible for
+        # forwarding camera frames to UE itself -- when
+        # use_python_camera_streaming is False, the independent C++
+        # rammp_ui_bridge_streaming node owns that TCP connection instead,
+        # so this node has no use for a StreamSender or its reconnect
+        # thread at all (see _stream_ready/destroy_node below, both of
+        # which are already no-ops/skip in that configuration).
+        self._stream_sender: StreamSender | None = None
+        self._stream_reconnect_thread: threading.Thread | None = None
         self._stream_shutdown = threading.Event()
-        # Rate-limits the "not connected, dropping frame" warning in
-        # _stream_ready() (one log per 50 drops, not once per frame) and the
-        # connect-failure warning in _stream_reconnect_loop (one per 10
-        # attempts) -- otherwise either would spam at full camera/reconnect
-        # rate for as long as UE's streaming server stays unreachable.
-        self._stream_drop_count = 0
-        self._stream_connect_fail_count = 0
-        self._stream_reconnect_thread = threading.Thread(
-            target=self._stream_reconnect_loop, name="ui_bridge-stream-reconnect", daemon=True
-        )
-        self._stream_reconnect_thread.start()
+        if self._use_python_streaming:
+            self._stream_sender = StreamSender(
+                host=self.get_parameter("ue_host").value,
+                port=self.get_parameter("ue_stream_port").get_parameter_value().integer_value,
+            )
+            self._stream_reconnect_period = (
+                self.get_parameter("ue_stream_reconnect_period").get_parameter_value().double_value
+            )
+            # Rate-limits the "not connected, dropping frame" warning in
+            # _stream_ready() (one log per 50 drops, not once per frame) and
+            # the connect-failure warning in _stream_reconnect_loop (one per
+            # 10 attempts) -- otherwise either would spam at full
+            # camera/reconnect rate for as long as UE's streaming server
+            # stays unreachable.
+            self._stream_drop_count = 0
+            self._stream_connect_fail_count = 0
+            self._stream_reconnect_thread = threading.Thread(
+                target=self._stream_reconnect_loop, name="ui_bridge-stream-reconnect", daemon=True
+            )
+            self._stream_reconnect_thread.start()
 
         self._request_user_input_server = ActionServer(
             self,
@@ -451,10 +456,9 @@ class UiBridgeNode(Node):
         self._scene_color_sub = None
         self._scene_depth_sub = None
         self._engine_overlay_sub = None
-        self._validated_overlay_publisher = None
         if self._use_python_streaming:
-            # Camera subscriptions/publisher are only created when this node
-            # is actually responsible for forwarding frames to UE itself --
+            # Camera subscriptions are only created when this node is
+            # actually responsible for forwarding frames to UE itself --
             # when use_python_camera_streaming is False, a separate
             # rammp_ui_bridge_streaming (C++) node subscribes to these same
             # topics directly and runs its own ui_control-token arbitration
@@ -481,16 +485,6 @@ class UiBridgeNode(Node):
                 self._on_engine_overlay_frame,
                 _RELIABLE_SENSOR_DATA_QOS,
                 callback_group=self._cb_group,
-            )
-            # Plain (token-stripped) republish of overlay frames that already
-            # passed ui_control arbitration -- see validated_engine_overlay_topic
-            # above and _on_engine_overlay_frame below. Published unconditionally
-            # whenever python streaming is enabled (cheap, and useful for
-            # anyone else wanting a validated feed).
-            self._validated_overlay_publisher = self.create_publisher(
-                Image,
-                self.get_parameter("validated_engine_overlay_topic").value,
-                qos_profile_sensor_data,
             )
         self._arm_joint_states_sub = self.create_subscription(
             JointState,
@@ -828,12 +822,6 @@ class UiBridgeNode(Node):
                 f"engine overlay camera: frame #{count} ({image.width}x{image.height}, "
                 f"encoding={image.encoding})"
             )
-        # Republish token-stripped, post-arbitration, for any other consumer
-        # wanting a validated feed without arbitration-token knowledge. Only
-        # created when use_python_camera_streaming is True (see __init__);
-        # this callback only runs in that same configuration.
-        if self._validated_overlay_publisher is not None:
-            self._validated_overlay_publisher.publish(image)
         self._forward_engine_overlay_color(image)
 
     def _forward_engine_overlay_color(self, msg: Image) -> None:
@@ -1228,8 +1216,9 @@ class UiBridgeNode(Node):
     # ------------------------------------------------------------------
     def destroy_node(self) -> None:
         self._stream_shutdown.set()
-        self._stream_reconnect_thread.join(timeout=5.0)
-        if self._stream_sender.is_connected():
+        if self._stream_reconnect_thread is not None:
+            self._stream_reconnect_thread.join(timeout=5.0)
+        if self._stream_sender is not None and self._stream_sender.is_connected():
             self._stream_sender.disconnect()
         self.ue.shutdown()
         ue_loop = getattr(self.ue, "loop", None)
