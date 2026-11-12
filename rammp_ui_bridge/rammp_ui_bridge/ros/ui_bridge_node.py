@@ -68,7 +68,15 @@ accepts a user-input goal) whose token matches the one it most recently
 granted (see ``_on_ui_acquire_control``/``_on_engine_overlay_frame``/
 ``_on_request_user_input_goal``). This is the same token-gating convention
 ``rammp_arm_interfaces``/``rammp_base_interfaces`` use for hardware, just
-for a bridge-owned resource instead.
+for a bridge-owned resource instead. This "ui_control" grant is only used
+here for the camera-overlay path when ``use_python_camera_streaming`` is
+True; the ``~/request_user_input`` token check always applies regardless.
+When camera streaming is handled by the independent C++
+``rammp_ui_bridge_streaming`` node instead, that node arbitrates
+``EngineOverlayImage`` frames itself via its own ``~/acquire_control``/
+``~/release_control`` (the Orchestrator pushes the same per-execution
+session token there as it does to this node's ``ui_control``), so it does
+not depend on this node's grant at all -- see that package's own docs.
 """
 
 from __future__ import annotations
@@ -250,22 +258,24 @@ class UiBridgeNode(Node):
         # camera_stream.launch.py) -- 30030, not the RC WebSocket's 30020.
         self.declare_parameter("ue_stream_port", 30030)
         self.declare_parameter("ue_stream_reconnect_period", 3.0)
-        # When False, this node stops forwarding frames to UE itself (the
-        # three _forward_* methods below become no-ops) -- set False when a
-        # separate rammp_ui_bridge_streaming (C++) node is running instead,
-        # to avoid sending every frame to UE twice. Everything else (topic
-        # subscriptions, frame-count logging, ui_control arbitration/token
-        # checking) keeps running unchanged either way, since the C++ node
-        # relies on this node's validated_engine_overlay_topic republish
-        # (see _on_engine_overlay_frame) for the overlay layer rather than
-        # re-implementing arbitration itself. Default True: zero behaviour
-        # change out of the box.
+        # When False, this node does not touch camera topics at all: it
+        # creates none of the scene-camera/engine-overlay subscriptions or
+        # the validated-overlay republish below (see their creation further
+        # down), not just a forwarding no-op. The C++ rammp_ui_bridge_streaming
+        # node runs independently and in parallel in that configuration --
+        # it subscribes directly to the raw scene/overlay camera topics and
+        # runs its own ui_control arbitration server (own acquire_control/
+        # release_control, granted the same per-execution session token the
+        # Orchestrator pushes to this node's own ui_control), rather than
+        # depending on this node for either the frames or the token check.
+        # Default True: zero behaviour change out of the box.
         self.declare_parameter("use_python_camera_streaming", True)
         # Plain (token-stripped) republish of engine-overlay frames that
-        # already passed this node's ui_control arbitration check -- the
-        # C++ streaming node (if running) subscribes to this instead of the
-        # raw EngineOverlayImage topic, so it never needs to know about
-        # arbitration tokens at all (see _on_engine_overlay_frame).
+        # already passed this node's ui_control arbitration check -- only
+        # created/published while use_python_camera_streaming is True (see
+        # above); of no use to the C++ streaming node, which validates
+        # EngineOverlayImage frames itself instead (see that node's own
+        # acquire_control/release_control).
         self.declare_parameter("validated_engine_overlay_topic", "~/validated_engine_overlay")
         # §3.4 Bridge <-> Hardware node / §5.2.B system status: the arm
         # driver's (or its mock's) sensor_msgs/msg/JointState topic, covering
@@ -438,37 +448,50 @@ class UiBridgeNode(Node):
             ui_event_poll_rate_hz=self.get_parameter("ue_ui_event_poll_rate_hz").value,
         )
 
-        self._scene_color_sub = self.create_subscription(
-            Image,
-            self.get_parameter("scene_camera_color_topic").value,
-            self._on_scene_camera_color,
-            _RELIABLE_SENSOR_DATA_QOS,
-            callback_group=self._cb_group,
-        )
-        self._scene_depth_sub = self.create_subscription(
-            Image,
-            self.get_parameter("scene_camera_depth_topic").value,
-            self._on_scene_camera_depth,
-            _RELIABLE_SENSOR_DATA_QOS,
-            callback_group=self._cb_group,
-        )
-        self._engine_overlay_sub = self.create_subscription(
-            EngineOverlayImage,
-            self.get_parameter("engine_overlay_topic").value,
-            self._on_engine_overlay_frame,
-            _RELIABLE_SENSOR_DATA_QOS,
-            callback_group=self._cb_group,
-        )
-        # Plain (token-stripped) republish of overlay frames that already
-        # passed ui_control arbitration -- see validated_engine_overlay_topic
-        # above and _on_engine_overlay_frame below. Published unconditionally
-        # (cheap, and useful for anyone else wanting a validated feed), not
-        # gated by use_python_camera_streaming.
-        self._validated_overlay_publisher = self.create_publisher(
-            Image,
-            self.get_parameter("validated_engine_overlay_topic").value,
-            qos_profile_sensor_data,
-        )
+        self._scene_color_sub = None
+        self._scene_depth_sub = None
+        self._engine_overlay_sub = None
+        self._validated_overlay_publisher = None
+        if self._use_python_streaming:
+            # Camera subscriptions/publisher are only created when this node
+            # is actually responsible for forwarding frames to UE itself --
+            # when use_python_camera_streaming is False, a separate
+            # rammp_ui_bridge_streaming (C++) node subscribes to these same
+            # topics directly and runs its own ui_control-token arbitration
+            # (see that node's own acquire_control/release_control), so this
+            # node has nothing left to do with camera images at all and
+            # doesn't subscribe to any of them.
+            self._scene_color_sub = self.create_subscription(
+                Image,
+                self.get_parameter("scene_camera_color_topic").value,
+                self._on_scene_camera_color,
+                _RELIABLE_SENSOR_DATA_QOS,
+                callback_group=self._cb_group,
+            )
+            self._scene_depth_sub = self.create_subscription(
+                Image,
+                self.get_parameter("scene_camera_depth_topic").value,
+                self._on_scene_camera_depth,
+                _RELIABLE_SENSOR_DATA_QOS,
+                callback_group=self._cb_group,
+            )
+            self._engine_overlay_sub = self.create_subscription(
+                EngineOverlayImage,
+                self.get_parameter("engine_overlay_topic").value,
+                self._on_engine_overlay_frame,
+                _RELIABLE_SENSOR_DATA_QOS,
+                callback_group=self._cb_group,
+            )
+            # Plain (token-stripped) republish of overlay frames that already
+            # passed ui_control arbitration -- see validated_engine_overlay_topic
+            # above and _on_engine_overlay_frame below. Published unconditionally
+            # whenever python streaming is enabled (cheap, and useful for
+            # anyone else wanting a validated feed).
+            self._validated_overlay_publisher = self.create_publisher(
+                Image,
+                self.get_parameter("validated_engine_overlay_topic").value,
+                qos_profile_sensor_data,
+            )
         self._arm_joint_states_sub = self.create_subscription(
             JointState,
             self.get_parameter("arm_joint_states_topic").value,
@@ -480,13 +503,10 @@ class UiBridgeNode(Node):
         self.get_logger().info(
             f"rammp_ui_bridge ready; bridging UE at "
             f"{self.get_parameter('ue_host').value}; "
-            f"scene camera color='{self.get_parameter('scene_camera_color_topic').value}' "
-            f"depth='{self.get_parameter('scene_camera_depth_topic').value}' "
-            f"engine overlay='{self.get_parameter('engine_overlay_topic').value}' "
             f"arm joint states='{self.get_parameter('arm_joint_states_topic').value}' -> "
             f"UE stream port {self.get_parameter('ue_stream_port').value} "
             f"(python camera streaming "
-            f"{'enabled' if self._use_python_streaming else 'disabled -- external streamer expected'})"
+            f"{'enabled' if self._use_python_streaming else 'disabled -- this node does not touch camera topics at all; expects rammp_ui_bridge_streaming to handle them independently'})"
         )
 
     # ------------------------------------------------------------------
@@ -808,10 +828,12 @@ class UiBridgeNode(Node):
                 f"engine overlay camera: frame #{count} ({image.width}x{image.height}, "
                 f"encoding={image.encoding})"
             )
-        # Republish token-stripped, post-arbitration, for the optional C++
-        # streaming node (or any other consumer) to forward without needing
-        # to know about ui_control arbitration tokens at all.
-        self._validated_overlay_publisher.publish(image)
+        # Republish token-stripped, post-arbitration, for any other consumer
+        # wanting a validated feed without arbitration-token knowledge. Only
+        # created when use_python_camera_streaming is True (see __init__);
+        # this callback only runs in that same configuration.
+        if self._validated_overlay_publisher is not None:
+            self._validated_overlay_publisher.publish(image)
         self._forward_engine_overlay_color(image)
 
     def _forward_engine_overlay_color(self, msg: Image) -> None:

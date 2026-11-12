@@ -33,12 +33,12 @@ def generate_launch_description():
                 description="Scene camera's raw depth image topic (§3.2)",
             ),
             DeclareLaunchArgument(
-                "validated_engine_overlay_topic",
-                default_value="/ui_bridge_node/validated_engine_overlay",
+                "engine_overlay_topic",
+                default_value="/engine_overlay/image_raw",
                 description=(
-                    "ui_bridge_node's post-arbitration, token-stripped republish of "
-                    "EngineOverlayImage frames (§3.3.1) -- must match that node's own "
-                    "validated_engine_overlay_topic parameter"
+                    "Raw shared engine-overlay camera topic (§3.3.1) -- this node "
+                    "validates each frame's token itself via its own "
+                    "acquire_control/release_control, independent of ui_bridge_node"
                 ),
             ),
             Node(
@@ -61,8 +61,8 @@ def generate_launch_description():
                         "scene_camera_depth_topic": LaunchConfiguration(
                             "scene_camera_depth_topic"
                         ),
-                        "validated_engine_overlay_topic": LaunchConfiguration(
-                            "validated_engine_overlay_topic"
+                        "engine_overlay_topic": LaunchConfiguration(
+                            "engine_overlay_topic"
                         ),
                     }
                 ],

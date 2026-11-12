@@ -793,12 +793,22 @@ already covers the detection *semantics* independent of either.
 is a byte-for-byte wire-compatible C++ reimplementation of this channel's
 forwarding (both layers) -- see `LANGUAGE_DECISION.md`'s "Where C++ would
 actually help" section for the rationale (this is the one genuinely
-CPU/memory-bandwidth-bound part of the bridge). It knows nothing about
-`ui_control` arbitration; `ui_bridge_node` remains the arbitration server
-and republishes already-validated overlay frames (plain `sensor_msgs/Image`,
-token stripped) on `validated_engine_overlay_topic` for it to subscribe to.
-Run `ui_bridge_node` with `use_python_camera_streaming:=false` alongside it
-to avoid forwarding every frame to UE twice -- both are off by default
+CPU/memory-bandwidth-bound part of the bridge). It is its own independent
+arbitration *server* for the overlay camera -- it hosts its own
+`rammp_common_interfaces` `~/acquire_control`/`~/release_control` (the same
+contract `mock_arm_driver`/`mock_base_driver`/`ui_bridge_node`'s own
+`ui_control` use) and subscribes directly to the raw, shared
+`engine_overlay_topic` (`EngineOverlayImage`, token included), validating
+each frame's token against its own grant. It does not depend on
+`ui_bridge_node` at all: the Orchestrator pushes this node the exact same
+per-execution session token it pushes to `ui_bridge_node`'s `ui_control`
+(see `rammp-orchestrator`'s `camera_stream_node` parameter and
+`_push_execution_token`/`_push_system_execution_token`), so both nodes
+validate the identical token independently and in parallel. Run
+`ui_bridge_node` with `use_python_camera_streaming:=false` alongside it so
+neither forwards a frame to UE twice -- with that flag `false`,
+`ui_bridge_node` stops subscribing to any camera topic (scene color/depth,
+engine overlay) at all, handling zero camera images itself
 (`use_python_camera_streaming` defaults `true`, so `ui_bridge_node` alone
 reproduces today's behaviour unchanged).
 

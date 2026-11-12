@@ -5,15 +5,18 @@
   <version>0.1.0</version>
   <description>
     C++ RMSS camera-streaming node for rammp_ui_bridge: forwards the scene
-    camera's raw color/depth frames and the active engine's validated
-    overlay-camera frames (docs/NODE_INTERFACE.md §5.2.A) to UE's RMSS
-    streaming server, as an optional replacement for ui_bridge_node's own
-    Python-side forwarding (see that node's
-    "use_python_camera_streaming"/"validated_engine_overlay_topic" params).
+    camera's raw color/depth frames and the engine-overlay camera's frames
+    (docs/NODE_INTERFACE.md §5.2.A) to UE's RMSS streaming server, as an
+    independent replacement for ui_bridge_node's own Python-side forwarding
+    (see that node's "use_python_camera_streaming" param, which also makes
+    it stop touching camera topics at all in this configuration). This node
+    is its own arbitration server for the overlay camera -- it hosts its own
+    rammp_common_interfaces ~/acquire_control / ~/release_control (the
+    Orchestrator pushes it the same per-execution session token it pushes to
+    ui_bridge_node's ui_control) and subscribes directly to the raw
+    engine_overlay_topic, independent of and parallel to ui_bridge_node.
     Wire-compatible byte-for-byte with ramms_tools.streaming.StreamSender --
-    this package re-implements that one client-side class in C++, nothing
-    else; ui_bridge_node remains the ui_control arbitration server and the
-    source of the validated overlay feed this node subscribes to.
+    this package re-implements that one client-side class in C++.
   </description>
   <maintainer email="guo@assistivetech.dev">Liyun Guo</maintainer>
   <license>Proprietary</license>
@@ -23,6 +26,8 @@
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
   <depend>nlohmann-json3-dev</depend>
+  <depend>rammp_common_interfaces</depend>
+  <depend>rammp_ui_bridge_interfaces</depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
