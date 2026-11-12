@@ -793,8 +793,7 @@ already covers the detection *semantics* independent of either.
 is a byte-for-byte wire-compatible C++ reimplementation of this channel's
 forwarding (both layers) -- see `LANGUAGE_DECISION.md`'s "Where C++ would
 actually help" section for the rationale (this is the one genuinely
-CPU/memory-bandwidth-bound part of the bridge). By default (parameter
-`use_validated_overlay_topic` true) it still knows nothing about
+CPU/memory-bandwidth-bound part of the bridge). It knows nothing about
 `ui_control` arbitration; `ui_bridge_node` remains the arbitration server
 and republishes already-validated overlay frames (plain `sensor_msgs/Image`,
 token stripped) on `validated_engine_overlay_topic` for it to subscribe to.
@@ -802,19 +801,6 @@ Run `ui_bridge_node` with `use_python_camera_streaming:=false` alongside it
 to avoid forwarding every frame to UE twice -- both are off by default
 (`use_python_camera_streaming` defaults `true`, so `ui_bridge_node` alone
 reproduces today's behaviour unchanged).
-
-Set `use_validated_overlay_topic:=false` to instead have `camera_stream_node`
-validate `EngineOverlayImage` frames itself, without needing
-`ui_bridge_node`'s pre-validated republish: it subscribes directly to the raw
-`engine_overlay_topic` (`EngineOverlayImage`, default `/engine_overlay/image_raw`)
-and to `ui_bridge_node`'s latched `ui_control_token_topic`
-(`UiControlToken`, default `/ui_bridge_node/ui_control/token`), caches the
-current grant, and drops any overlay frame whose token doesn't match it
-(rate-limited warning log, same `_on_engine_overlay_frame` convention
-`ui_bridge_node.py` itself uses). See `UiControlToken.msg` in
-`rammp_ui_bridge_interfaces` for why exposing the token on that topic isn't
-a new security exposure -- it's already plaintext in every genuine
-`EngineOverlayImage` frame on the ROS graph.
 
 
 #### B. System status (robot proprioception)

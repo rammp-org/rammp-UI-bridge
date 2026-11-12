@@ -99,7 +99,7 @@ from std_msgs.msg import Bool
 from rammp_common_interfaces.msg import ControlStatus
 from rammp_common_interfaces.srv import AcquireControl, ReleaseControl
 from rammp_ui_bridge_interfaces.action import RequestUserInput
-from rammp_ui_bridge_interfaces.msg import EngineOverlayImage, UiControlToken
+from rammp_ui_bridge_interfaces.msg import EngineOverlayImage
 from rammp_ui_bridge_interfaces.srv import SetEngineOverlayVisible, UpdateUserInputPanel
 
 from ramms_tools.streaming import StreamSender
@@ -415,23 +415,6 @@ class UiBridgeNode(Node):
         self._ui_control_status_publisher = self.create_publisher(
             ControlStatus,
             "~/ui_control/status",
-            QoSProfile(
-                depth=1,
-                durability=DurabilityPolicy.TRANSIENT_LOCAL,
-                history=HistoryPolicy.KEEP_LAST,
-            ),
-        )
-        # Same latched convention as ControlStatus above, but also carries
-        # the token itself -- see UiControlToken.msg's own doc comment for
-        # why this is safe to expose here (unlike ControlStatus, which is
-        # shared by every arbitrated resource including real hardware).
-        # Lets a trusted consumer that isn't this arbitration server (e.g.
-        # the optional C++ camera_stream_node) validate EngineOverlayImage
-        # frames on its own instead of needing _on_engine_overlay_frame's
-        # token-stripped republish.
-        self._ui_control_token_publisher = self.create_publisher(
-            UiControlToken,
-            "~/ui_control/token",
             QoSProfile(
                 depth=1,
                 durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -799,12 +782,7 @@ class UiBridgeNode(Node):
             msg.owner_id = self._ui_owner_id
             msg.generation = self._ui_generation
             msg.rejected_count = self._ui_rejected_count
-            token_msg = UiControlToken()
-            token_msg.token = list(self._ui_token)
-            token_msg.owner_id = self._ui_owner_id
-            token_msg.generation = self._ui_generation
         self._ui_control_status_publisher.publish(msg)
-        self._ui_control_token_publisher.publish(token_msg)
 
     def _on_engine_overlay_frame(self, msg: EngineOverlayImage) -> None:
         with self._ui_control_lock:
