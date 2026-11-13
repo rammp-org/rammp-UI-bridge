@@ -681,12 +681,17 @@ The receiver's `PollUIEvents` is exposed as `Poll UIEvents`, `UpdatePanel` as
 `"Unable to resolve the preset field."`
 
 **Parameter names are matched against the `UFUNCTION`'s own signature, and
-unrecognised ones are dropped silently.** A mis-spelled parameter (`PanelJson`
-for `PanelJSON`) returns HTTP 200 and the function receives an empty string --
-in `UpdatePanel`'s case, clearing the panel rather than updating it. There is
-no error to catch, so the names below are worth taking literally:
-`UpdatePanel(PanelJSON)`, `UpdateDetectedObjects(DetectedObjectsJSON)`,
+unrecognised ones are dropped silently.** An unknown parameter returns HTTP 200
+and the function receives an empty string -- in `UpdatePanel`'s case, clearing
+the panel rather than updating it. There is no error to catch, so the argument
+names are worth getting right: `UpdatePanel(PanelJSON)`,
+`UpdateDetectedObjects(DetectedObjectsJSON)`,
 `UpdateWorldState(WorldStateJSON)`, `PollUIEvents(SinceSequence)`.
+
+Matching is case-**in**sensitive, so `PanelJSON`, `PanelJson` and `paneljson`
+all land -- only a genuinely unrecognised name is dropped. (Verified against a
+live editor by sending a distinct payload under each spelling and reading back
+what the receiver logged.)
 
 ### 5.1 UE → bridge: UI event schema
 

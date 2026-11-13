@@ -36,9 +36,11 @@ service-response pair.
 
 **Transport for the `panel_json` value:** a Remote Control function call,
 `UpdatePanel({"PanelJSON": "<json string>"})` -- not the streaming channel.
-(`PanelJSON`, not `PanelJson`: UE matches parameters by name and silently
-drops the ones it does not recognise, so the mis-spelled form returns HTTP
-200 and clears the panel instead of updating it.)
+(the argument is `PanelJSON`; UE resolves parameter names case-insensitively,
+so `PanelJson` works too, but a genuinely unrecognised name is dropped
+silently and the function then receives an empty string -- which for
+`UpdatePanel` clears the panel instead of updating it, with HTTP 200 and no
+error reported.)
 Confirmed in `ui_bridge_node.py` (both `_on_request_user_input_execute()`
 and `_on_update_user_input_panel()` end with
 `self.ue.call_function("Update Panel", {"PanelJSON": panel_json})` whenever
