@@ -34,9 +34,24 @@ StreamSender::~StreamSender()
 
 void StreamSender::connect(int timeout_sec)
 {
-  std::lock_guard<std::mutex> lock(sock_mutex_);
-  if (sock_fd_ >= 0) {
-    throw std::runtime_error("Already connected");
+  {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    if (sock_fd_ >= 0) {
+      throw std::runtime_error("Already connected");
+    }
+  }
+
+  // Join any previous worker thread before starting a new one. Once a
+  // write failure (e.g. peer closed the connection) makes send_worker()
+  // exit on its own and clear sock_fd_, is_connected() reports false and
+  // reconnect_loop() calls connect() again -- but that old std::thread
+  // object is still "joinable" (nobody ever joined it), and move-assigning
+  // a new std::thread onto a still-joinable one calls std::terminate().
+  // Must not hold sock_mutex_ while joining: send_worker briefly locks it
+  // itself, so holding it here could deadlock against a worker that is
+  // still mid-shutdown.
+  if (worker_.joinable()) {
+    worker_.join();
   }
 
   int fd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -74,7 +89,10 @@ void StreamSender::connect(int timeout_sec)
   int sndbuf = kSndBufBytes;
   setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
 
-  sock_fd_ = fd;
+  {
+    std::lock_guard<std::mutex> lock(sock_mutex_);
+    sock_fd_ = fd;
+  }
   shutdown_.store(false);
   worker_ = std::thread(&StreamSender::send_worker, this);
 }
@@ -160,7 +178,10 @@ void StreamSender::send_worker()
     std::size_t sent = 0;
     bool failed = false;
     while (sent < bytes.size()) {
-      ssize_t n = ::send(fd, bytes.data() + sent, bytes.size() - sent, 0);
+      // MSG_NOSIGNAL: writing to a peer-closed socket (e.g. UE stopped)
+      // must fail the send() call with EPIPE, not raise SIGPIPE and kill
+      // this whole process (default SIGPIPE disposition terminates it).
+      ssize_t n = ::send(fd, bytes.data() + sent, bytes.size() - sent, MSG_NOSIGNAL);
       if (n <= 0) {
         failed = true;
         break;
