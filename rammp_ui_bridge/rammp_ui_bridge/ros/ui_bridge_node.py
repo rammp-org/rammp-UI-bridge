@@ -98,7 +98,6 @@ from rclpy.qos import (
     DurabilityPolicy,
     HistoryPolicy,
     QoSProfile,
-    ReliabilityPolicy,
     qos_profile_sensor_data,
 )
 from sensor_msgs.msg import Image, JointState
@@ -150,20 +149,11 @@ _OVERLAY_STREAM_GROUP = "overlay"
 # as-is (uint16 mm, no conversion) -- see StreamSender.send_depth_uint16.
 _UINT16_DEPTH_ENCODINGS = frozenset({"16UC1", "mono16"})
 
-# qos_profile_sensor_data (BEST_EFFORT) has been observed to silently stop
-# delivering samples in unicast-only/multicast-disabled DDS setups (e.g. some
-# CycloneDDS configs used for WSL/dev testing) when matched against a
-# RELIABLE publisher -- the subscription matches at discovery time but no
-# data ever arrives after the first sample. RELIABLE is safe to use against
-# both RELIABLE and BEST_EFFORT publishers and isn't vulnerable to this, at
-# the cost of slightly more retransmission/backpressure overhead on lossy
-# networks. Used for all inbound sensor-ish topics below.
-_RELIABLE_SENSOR_DATA_QOS = QoSProfile(
-    history=qos_profile_sensor_data.history,
-    depth=qos_profile_sensor_data.depth,
-    reliability=ReliabilityPolicy.RELIABLE,
-    durability=qos_profile_sensor_data.durability,
-)
+# Plain best-effort sensor-data QoS for all inbound sensor-ish topics below
+# (scene camera color/depth, engine overlay, arm joint states) -- every
+# publisher of these topics (mock scene/overlay nodes, camera_stream_node.cpp,
+# the real arm driver) is itself best-effort, so this subscriber side matches
+# them rather than forcing RELIABLE.
 
 
 # ---------------------------------------------------------------------------
@@ -469,28 +459,28 @@ class UiBridgeNode(Node):
                 Image,
                 self.get_parameter("scene_camera_color_topic").value,
                 self._on_scene_camera_color,
-                _RELIABLE_SENSOR_DATA_QOS,
+                qos_profile_sensor_data,
                 callback_group=self._cb_group,
             )
             self._scene_depth_sub = self.create_subscription(
                 Image,
                 self.get_parameter("scene_camera_depth_topic").value,
                 self._on_scene_camera_depth,
-                _RELIABLE_SENSOR_DATA_QOS,
+                qos_profile_sensor_data,
                 callback_group=self._cb_group,
             )
             self._engine_overlay_sub = self.create_subscription(
                 EngineOverlayImage,
                 self.get_parameter("engine_overlay_topic").value,
                 self._on_engine_overlay_frame,
-                _RELIABLE_SENSOR_DATA_QOS,
+                qos_profile_sensor_data,
                 callback_group=self._cb_group,
             )
         self._arm_joint_states_sub = self.create_subscription(
             JointState,
             self.get_parameter("arm_joint_states_topic").value,
             self._on_arm_joint_states,
-            _RELIABLE_SENSOR_DATA_QOS,
+            qos_profile_sensor_data,
             callback_group=self._cb_group,
         )
 
