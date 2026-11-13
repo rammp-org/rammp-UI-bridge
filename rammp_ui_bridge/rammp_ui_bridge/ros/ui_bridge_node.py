@@ -142,7 +142,7 @@ _SCENE_STREAM_GROUP = "camera/scene"
 # whichever engine is currently active's own camera -- see
 # engine_overlay_topic below for why this is one topic, not per-engine.
 _OVERLAY_COLOR_CHANNEL = 2
-_OVERLAY_COLOR_STREAM_ID = "camera/wrist/color"
+_OVERLAY_COLOR_STREAM_ID = "engine/overlay"
 _OVERLAY_STREAM_GROUP = "overlay"
 
 # ROS sensor_msgs/Image depth encodings this bridge knows how to forward
