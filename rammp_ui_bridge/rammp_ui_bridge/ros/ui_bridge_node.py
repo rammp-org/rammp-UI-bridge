@@ -770,7 +770,15 @@ class UiBridgeNode(Node):
             granted = bool(self._ui_owner_id) and bytes(request.token) == self._ui_token
             if granted:
                 owner_id = self._ui_owner_id
+            else:
+                current_owner = self._ui_owner_id
+                current_token_prefix = self._ui_token.hex()[:8]
         if not granted:
+            self.get_logger().warning(
+                f"set_overlay_visible({request.visible}) rejected: token "
+                f"{bytes(request.token).hex()[:8]}... doesn't match current ui_control grant "
+                f"(owner '{current_owner}', token {current_token_prefix}...)"
+            )
             response.accepted = False
             response.message = "token doesn't match the current ui_control grant"
             return response
@@ -778,13 +786,19 @@ class UiBridgeNode(Node):
         # in-engine), not a bridge-side stream gate -- the overlay camera
         # frames keep flowing to _forward_engine_overlay_color regardless;
         # these two parameterless UFUNCTIONs are what actually show/hide it.
-        self.ue.call_function("Open Camera Feed" if request.visible else "Close Camera Feed", {})
+        function_name = "Open Camera Feed" if request.visible else "Close Camera Feed"
+        self.get_logger().info(
+            f"engine overlay {'show' if request.visible else 'hide'} requested by '{owner_id}' "
+            f"-- calling UE Remote Control function '{function_name}'"
+        )
+        self.ue.call_function(function_name, {})
         response.accepted = True
         response.message = ""
         self.get_logger().info(
             f"engine overlay {'shown' if request.visible else 'hidden'} by '{owner_id}'"
         )
         return response
+
 
     def _publish_ui_control_status(self) -> None:
         with self._ui_control_lock:
