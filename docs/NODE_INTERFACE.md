@@ -801,11 +801,19 @@ not two interchangeable sources:
   close-up during a manipulation step); the base layer keeps streaming
   the whole time. UE composites the overlay on top of the base layer
   (with the base layer blurred/dimmed behind it) whenever frames are
-  arriving on the overlay stream, and falls back to just the plain base
-  layer the moment the engine stops sending (stream ends/times out) --
-  it's a highlight on top, not a channel switch. Any interaction
-  mask/overlay the engine wants to show is already **rendered into this
-  stream's RGB pixels by the engine itself** (not a separate mask
+  arriving on the overlay stream -- it's a highlight on top, not a channel
+  switch. **It does not time out.** The overlay keeps showing its last frame
+  until the feed is closed explicitly, which the Orchestrator or the executing
+  engine does when that engine stops, so the scene camera and the rest of the
+  UI come back; a stream merely going quiet is not that signal. (Confirmed
+  against a running editor: seconds after an overlay stream stopped, its last
+  frame still filled the view.) An earlier revision of this section said UE
+  fell back to the base layer "the moment the engine stops sending (stream
+  ends/times out)", which would make the hand-back implicit and racy.
+
+  Any interaction mask/overlay the engine wants to show is already
+  **rendered into this stream's RGB pixels by the engine itself** (not a
+  separate mask
   channel); detections during this time still arrive via §3.1/§5.2.D,
   exactly as with the base layer -- neither layer itself carries
   detected-object semantics. **Implemented**: `_on_engine_overlay_color`/
