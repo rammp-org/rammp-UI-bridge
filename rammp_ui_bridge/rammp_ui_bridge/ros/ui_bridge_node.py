@@ -521,7 +521,7 @@ class UiBridgeNode(Node):
             self._latest_scene_depth = msg
             self._scene_depth_frame_count += 1
             count = self._scene_depth_frame_count
-        if count == 1 or count % 2 == 0:
+        if count == 1 or count % 100 == 0:
             self.get_logger().info(
                 f"scene camera depth: frame #{count} ({msg.width}x{msg.height}, "
                 f"encoding={msg.encoding})"
