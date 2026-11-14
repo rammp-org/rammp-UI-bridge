@@ -26,8 +26,9 @@ implementation-language question itself.
 |---|---|---|---|
 | `ue_host` | string | `127.0.0.1` | IP/hostname of the UE instance |
 | `ue_ws_port` | int | `30020` | UE Remote Control WebSocket API port |
-| `ue_preset` | string | `RAMMP` | UE Remote Control preset name to register against |
-| `ue_user_input_property_label` | string | `LastUIEventJSON` | Preset property name the bridge watches for inbound UE command JSON (§5.1) |
+| `ue_preset` | string | `RCP_RammsBridge` | UE Remote Control preset name to register against |
+| `ue_user_input_property_label` | string | `LastUIEventJSON` | Preset property watched by the legacy property-push path (§5.1). The shipped receiver's own property is `UIEventsJson`; this one is kept for older UI builds and runs alongside the poll below |
+| `ue_ui_event_poll_rate_hz` | double (Hz) | `15.0` | How often the bridge calls `PollUIEvents` for buffered taps (§5.1) |
 | `connection_publish_period` | double (seconds) | `1.0` | Interval between connection-status publishes |
 
 ## 3. ROS2-facing interfaces
@@ -528,7 +529,8 @@ with a throttled warning log) any frame whose token doesn't match --
 including frames from a stale/already-released owner. Only frames with a
 matching token are forwarded (`_forward_engine_overlay_color`) to UE,
 unconditionally, on fixed channel 2, `group="overlay"`,
-`stream_id="camera/wrist/color"` -- exactly the same shape as the base
+`stream_id` from `URammsCameraStreamSettings::OverlayColorStreamID`
+(default `"engine/overlay"`) -- exactly the same shape as the base
 layer's forwarding, just one channel number up. An engine's expected
 lifecycle is: call `acquire_control` once it starts needing the UI,
 publish `EngineOverlayImage` frames (and/or call `~/request_user_input`,
@@ -671,15 +673,70 @@ Transport: UE's Remote Control WebSocket API
 (`ws://<ue_host>:<ue_ws_port>`), with the bridge registering `ue_preset` on
 every connect (including reconnects after a dropped connection).
 
-### 5.1 UE → bridge: `LastUIEventJSON` command schema
+**Preset functions are addressed by their exposed label, not their C++ name.**
+The receiver's `PollUIEvents` is exposed as `Poll UIEvents`, `UpdatePanel` as
+`Update Panel`, and so on, so the call is
+`PUT /remote/preset/RCP_RammsBridge/function/Poll%20UIEvents`;
+`.../function/PollUIEvents` fails with
+`"Unable to resolve the preset field."`
 
-The bridge watches the preset's `LastUIEventJSON` string property
-(`ue_user_input_property_label` parameter, default `"LastUIEventJSON"` --
-confirmed with the UI team, superseding this doc's previous
-`UserInput`/`cmd` naming) for changes (delivered as a `ChangedFields`
-WebSocket event) and parses each new value as one JSON object, keyed by
-`event_type` (with `cmd` accepted as a fallback for compatibility with
-earlier mocks/tooling built against this doc's original naming).
+**Parameter names are matched against the `UFUNCTION`'s own signature, and
+unrecognised ones are dropped silently.** An unknown parameter returns HTTP 200
+and the function receives an empty string -- in `UpdatePanel`'s case, clearing
+the panel rather than updating it. There is no error to catch, so the argument
+names are worth getting right: `UpdatePanel(PanelJSON)`,
+`UpdateDetectedObjects(DetectedObjectsJSON)`,
+`UpdateWorldState(WorldStateJSON)`, `PollUIEvents(SinceSequence)`.
+
+Matching is case-**in**sensitive, so `PanelJSON`, `PanelJson` and `paneljson`
+all land -- only a genuinely unrecognised name is dropped. (Verified against a
+live editor by sending a distinct payload under each spelling and reading back
+what the receiver logged.)
+
+### 5.1 UE → bridge: UI event schema
+
+**Two paths deliver the same events, and the bridge runs both.**
+
+1. **`PollUIEvents` (current).** UE buffers every tap behind a monotonic
+   sequence counter, and the bridge calls the preset function
+   `PollUIEvents(SinceSequence) -> (LatestSequence, Events)` at
+   `ue_ui_event_poll_rate_hz` (default 15 Hz). `Events` is an array of JSON
+   **strings**, one per event, each with its own `seq`. Because the bridge
+   asks for everything after the last `seq` it saw, no event can be missed
+   between two polls -- unlike a property watch, where two taps between
+   deliveries collapse into one.
+2. **Property push (legacy).** The bridge also watches the preset property
+   named by `ue_user_input_property_label` for `ChangedFields` events, for
+   UI builds that predate `PollUIEvents`. Both paths funnel into the same
+   handler (`_on_ue_user_input`).
+
+The shipped receiver's own outbound property is **`UIEventsJson`** (exposed
+on the preset with the label `UIEvents Json`), and it holds an *envelope*
+rather than a single event:
+
+```json
+{"latest_seq": 7, "events": [{"event_type": "button_press", "button_id": "deselect", "seq": 7}]}
+```
+
+So a client reading that property must take `events[]`, not parse the value
+as one command object.
+
+**Event shapes, as `URammsBridgeSubsystem` emits them:**
+
+```json
+{"event_type": "button_press",  "button_id": "deselect", "seq": 7}
+{"event_type": "object_tapped", "instance_id": "cup_1", "stream_id": "camera/scene/color", "seq": 8}
+```
+
+- `seq` is present on every event and increases monotonically.
+- `stream_id` is included on `object_tapped` when the UI knows which camera
+  the box was tapped on, and omitted when empty. It is the same stream id
+  space as §5.2.A's `stream_id`s.
+- `object_tapped` is the name UE actually sends. Earlier revisions of this
+  document called it `select_object`; the bridge still accepts that spelling
+  from the legacy property path, and treats the two as identical.
+- `cmd` is accepted in place of `event_type` for compatibility with earlier
+  mocks/tooling built against this document's original naming.
 
 **Governing principle: UE only ever reports a tap -- it never sends a
 domain command directly.** UE has exactly two things a user can tap: an
@@ -691,10 +748,10 @@ resolves it internally.
 
 **Dispatch: resolved purely against whichever `RequestUserInput` goal is
 currently active (§3.1.1) -- there is no other dispatch path.** On a
-`select_object`/`button_press` command, the bridge checks whether a
+`object_tapped`/`button_press` command, the bridge checks whether a
 `RequestUserInput` goal is currently open *and* the tapped ID matches
 something that goal is offering (one of its `objects`' `instance_id`s, or
-one of its `panel_json`'s `button_id`s). A matching `select_object` is
+one of its `panel_json`'s `button_id`s). A matching `object_tapped` is
 consumed as feedback (the goal stays open, §3.1.1 point 3); a matching
 `button_press` completes the goal. If no goal is open, or the tapped ID
 doesn't match what it's offering, the bridge logs a warning and drops the
@@ -744,17 +801,25 @@ not two interchangeable sources:
   close-up during a manipulation step); the base layer keeps streaming
   the whole time. UE composites the overlay on top of the base layer
   (with the base layer blurred/dimmed behind it) whenever frames are
-  arriving on the overlay stream, and falls back to just the plain base
-  layer the moment the engine stops sending (stream ends/times out) --
-  it's a highlight on top, not a channel switch. Any interaction
-  mask/overlay the engine wants to show is already **rendered into this
-  stream's RGB pixels by the engine itself** (not a separate mask
+  arriving on the overlay stream -- it's a highlight on top, not a channel
+  switch. **It does not time out.** The overlay keeps showing its last frame
+  until the feed is closed explicitly, which the Orchestrator or the executing
+  engine does when that engine stops, so the scene camera and the rest of the
+  UI come back; a stream merely going quiet is not that signal. (Confirmed
+  against a running editor: seconds after an overlay stream stopped, its last
+  frame still filled the view.) An earlier revision of this section said UE
+  fell back to the base layer "the moment the engine stops sending (stream
+  ends/times out)", which would make the hand-back implicit and racy.
+
+  Any interaction mask/overlay the engine wants to show is already
+  **rendered into this stream's RGB pixels by the engine itself** (not a
+  separate mask
   channel); detections during this time still arrive via §3.1/§5.2.D,
   exactly as with the base layer -- neither layer itself carries
   detected-object semantics. **Implemented**: `_on_engine_overlay_color`/
   `_forward_engine_overlay_color` subscribe to the single shared
   `engine_overlay_topic` (§3.3.1) and push every frame through to UE on
-  channel 2, `group="overlay"`, `stream_id="camera/wrist/color"` -- but no
+  channel 2, `group="overlay"`, `stream_id="engine/overlay"` -- but no
   real engine publishes to it yet, so this has only been exercised with
   synthetic test traffic, not a real wrist camera.
 
@@ -860,7 +925,7 @@ surface (§3.1): whichever caller holds `ui_control` (the Orchestrator's
 own browse session, or an executing engine) builds its own complete
 `panel_json` -- including every `button_id` and what pressing it should
 mean to *that caller* -- and the bridge just pushes it to UE verbatim
-(`UpdatePanel({"PanelJson": ...})`) and later tells the caller which
+(`UpdatePanel({"PanelJSON": ...})`) and later tells the caller which
 `button_id` was pressed (§3.1.1's `RequestUserInput.result`/
 `_try_resolve_active_input_goal`). The bridge resolves a `button_press`
 only against the currently active goal's own `button_ids` (§5.1) -- it
@@ -887,7 +952,7 @@ than a growing set of bespoke RPC function signatures.
 **Resolved -- see `docs/USER_INPUT_JSON_SCHEMA.md` for the full schema:**
 the three questions originally left open here are now settled by what the
 implementation actually does:
-- Transport: a Remote Control function call, `UpdatePanel({"PanelJson":
+- Transport: a Remote Control function call, `UpdatePanel({"PanelJSON":
   "..."})` -- not the streaming channel.
 - Exact JSON field names/casing: `title`/`message`/`buttons[]`
   (`button_id`/`label`/`style`)/`progress`/`style`, documented in full
@@ -896,6 +961,23 @@ implementation actually does:
   into `InteractionPanel`.
 - The name `InteractionPanel` is kept as-is.
 
+
+#### C.1 World state, and camera-feed visibility
+
+Three further inbound functions are exposed on the preset and are not part of
+any of the four channels above:
+
+| Function | Parameters | Meaning |
+|---|---|---|
+| `UpdateWorldState` | `WorldStateJSON` (string) | A world-state snapshot for whatever UI surface renders one. The bridge does not build or inspect this payload |
+| `OpenCameraFeed` | *(none)* | Ask the UI to show the camera feed |
+| `CloseCameraFeed` | *(none)* | Ask the UI to hide it |
+
+`OpenCameraFeed`/`CloseCameraFeed` take no parameters at all, and the receiver
+records the requested state (`URammsBridgeSubsystem::IsCameraFeedOpen`) so a
+widget created later starts in the right one. Neither the feed state nor the
+last world state reads back over Remote Control, so a caller cannot confirm
+either beyond the call succeeding.
 
 #### D. Detected objects (Remote Control preset function)
 
@@ -950,7 +1032,7 @@ Mechanics (`_push_engine_objects` in the reference implementation):
    compatibility, but UE's current widget only needs the top-level one.
 6. The whole payload is JSON-encoded into a single `DetectedObjectsJSON`
    **string** parameter rather than sent as separate native Remote
-   Control parameters, mirroring `UpdatePanel`'s `PanelJson` convention
+   Control parameters, mirroring `UpdatePanel`'s `PanelJSON` convention
    (§5.2.B) -- UE's Remote Control function parameters are matched by
    name against the actual `UFUNCTION`'s own C++ signature
    (`RammsBridgeReceiver.h`: `void UpdateDetectedObjects(const FString&
@@ -966,7 +1048,7 @@ Mechanics (`_push_engine_objects` in the reference implementation):
 the freshest box may come from an engine's own camera, not a single
 shared Perception mask) -- `source` tells UE which of its two video
 channels (`camera/scene/color`, the §5.2.A base layer; or
-`camera/wrist/color`, the
+`engine/overlay`, the
 §5.2.A overlay layer) to draw/hit-test `box` against, since the two
 channels are independent video feeds that can have different resolutions/
 framings. It's acceptable for `box` to lag slightly behind the live video

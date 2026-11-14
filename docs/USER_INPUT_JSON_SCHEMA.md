@@ -35,10 +35,15 @@ field of its own -- it returns the ordinary `bool accepted, string message`
 service-response pair.
 
 **Transport for the `panel_json` value:** a Remote Control function call,
-`UpdatePanel({"PanelJson": "<json string>"})` -- not the streaming channel.
+`UpdatePanel({"PanelJSON": "<json string>"})` -- not the streaming channel.
+(the argument is `PanelJSON`; UE resolves parameter names case-insensitively,
+so `PanelJson` works too, but a genuinely unrecognised name is dropped
+silently and the function then receives an empty string -- which for
+`UpdatePanel` clears the panel instead of updating it, with HTTP 200 and no
+error reported.)
 Confirmed in `ui_bridge_node.py` (both `_on_request_user_input_execute()`
 and `_on_update_user_input_panel()` end with
-`self.ue.call_function("UpdatePanel", {"PanelJson": panel_json})` whenever
+`self.ue.call_function("Update Panel", {"PanelJSON": panel_json})` whenever
 a `panel_json` key is present); panels are small/sporadic enough that this
 was never revisited. Note the bridge never constructs this string itself --
 it relays whatever `panel_json` the caller (Orchestrator or engine)
