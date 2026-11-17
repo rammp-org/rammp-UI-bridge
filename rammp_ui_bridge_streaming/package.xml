@@ -25,6 +25,9 @@
 
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2</depend>
+  <depend>tf2_ros</depend>
   <depend>nlohmann-json3-dev</depend>
   <depend>rammp_common_interfaces</depend>
   <depend>rammp_ui_bridge_interfaces</depend>

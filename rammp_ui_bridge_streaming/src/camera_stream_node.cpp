@@ -21,15 +21,23 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
 
 #include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <sensor_msgs/msg/camera_info.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <tf2/exceptions.h>
+#include <tf2/time.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #include <rammp_common_interfaces/srv/acquire_control.hpp>
 #include <rammp_common_interfaces/srv/release_control.hpp>
@@ -60,6 +68,75 @@ const TokenArray kZeroToken{};
 bool is_uint16_depth_encoding(const std::string & encoding)
 {
   return encoding == "16UC1" || encoding == "mono16";
+}
+
+// Quaternion -> Euler(roll,pitch,yaw) in degrees, ZYX extraction order --
+// hand-ported from ui_bridge_node.py's _quat_to_euler_zyx_deg (itself a
+// scipy-free port of the Gen1 prototype bridge's rotation_matrix_to_euler_zyx).
+// Must stay numerically identical between the Python and C++ sides.
+struct EulerDeg
+{
+  double roll{0.0};
+  double pitch{0.0};
+  double yaw{0.0};
+};
+
+EulerDeg quat_to_euler_zyx_deg(double x, double y, double z, double w)
+{
+  // Quaternion -> 3x3 rotation matrix (only the entries ZYX extraction
+  // actually needs).
+  const double r00 = 1.0 - 2.0 * (y * y + z * z);
+  const double r01 = 2.0 * (x * y - z * w);
+  const double r10 = 2.0 * (x * y + z * w);
+  const double r11 = 1.0 - 2.0 * (x * x + z * z);
+  const double r20 = 2.0 * (x * z - y * w);
+  const double r21 = 2.0 * (y * z + x * w);
+  const double r22 = 1.0 - 2.0 * (x * x + y * y);
+
+  constexpr double kEpsilon = 1e-8;
+  const double sy = -r20;
+  EulerDeg euler;
+  if (std::abs(sy) >= 1.0 - kEpsilon) {
+    // Gimbal lock: pitch is +/-90 degrees, roll/yaw become coupled -- fold
+    // the remaining rotation into yaw, roll fixed to 0 (same convention as
+    // the Python/Gen1 reference implementations).
+    const double pitch = std::copysign(M_PI / 2.0, sy);
+    const double yaw = std::atan2(-r01, r11);
+    euler.roll = 0.0;
+    euler.pitch = pitch * 180.0 / M_PI;
+    euler.yaw = yaw * 180.0 / M_PI;
+  } else {
+    const double pitch = std::asin(sy);
+    const double roll = std::atan2(r21, r22);
+    const double yaw = std::atan2(r10, r00);
+    euler.roll = roll * 180.0 / M_PI;
+    euler.pitch = pitch * 180.0 / M_PI;
+    euler.yaw = yaw * 180.0 / M_PI;
+  }
+  return euler;
+}
+
+// TransformStamped -> UE-space extrinsics: meters->centimeters, Y position
+// negated, pitch/yaw negated (UE's Y axis is flipped vs ROS; roll is NOT
+// negated) -- same sign convention as ui_bridge_node.py's
+// _tf_to_ue_extrinsics / the Gen1 prototype bridge's _tf_to_ue_extrinsics.
+// Must stay identical between the Python and C++ sides.
+StreamMeta::Extrinsics tf_to_ue_extrinsics(
+  const geometry_msgs::msg::TransformStamped & transform)
+{
+  const auto & t = transform.transform.translation;
+  const auto & q = transform.transform.rotation;
+  const EulerDeg euler = quat_to_euler_zyx_deg(q.x, q.y, q.z, q.w);
+
+  StreamMeta::Extrinsics extrinsics;
+  extrinsics.x = t.x * 100.0;
+  extrinsics.y = -(t.y * 100.0);
+  extrinsics.z = t.z * 100.0;
+  extrinsics.roll = euler.roll;
+  extrinsics.pitch = -euler.pitch;
+  extrinsics.yaw = -euler.yaw;
+  extrinsics.space = "relative";
+  return extrinsics;
 }
 
 TokenArray mint_token()
@@ -109,6 +186,10 @@ public:
       "scene_camera_color_topic", "/scene_camera/color/image_raw");
     this->declare_parameter<std::string>(
       "scene_camera_depth_topic", "/scene_camera/depth/image_rect_raw");
+    this->declare_parameter<std::string>(
+      "scene_camera_depth_camera_info_topic", "/scene_camera/depth/camera_info");
+    this->declare_parameter<std::string>("tf_base_frame", "base_link");
+    this->declare_parameter<std::string>("scene_camera_tf_frame", "scene_link");
     // Raw, direct subscription -- same shared topic every engine with its
     // own camera publishes to and the one ui_bridge_node also subscribes to
     // (when use_python_camera_streaming is True). This node runs its own
@@ -125,6 +206,14 @@ public:
 
     sender_ = std::make_unique<StreamSender>(ue_host, ue_stream_port);
 
+    tf_base_frame_ = this->get_parameter("tf_base_frame").as_string();
+    scene_camera_tf_frame_ = this->get_parameter("scene_camera_tf_frame").as_string();
+    // Zero-ROS-node-argument constructor: creates its own internal node +
+    // dedicated executor thread, independent of this node's own
+    // single-threaded rclcpp::spin() in main().
+    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
     auto qos = rclcpp::QoS(rclcpp::SensorDataQoS());
 
     scene_color_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
@@ -133,6 +222,12 @@ public:
     scene_depth_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
       this->get_parameter("scene_camera_depth_topic").as_string(), qos,
       [this](sensor_msgs::msg::Image::ConstSharedPtr msg) {on_scene_depth(msg);});
+    scene_depth_camera_info_sub_ = this->create_subscription<sensor_msgs::msg::CameraInfo>(
+      this->get_parameter("scene_camera_depth_camera_info_topic").as_string(), qos,
+      [this](sensor_msgs::msg::CameraInfo::ConstSharedPtr msg) {
+        std::lock_guard<std::mutex> lock(camera_info_mutex_);
+        latest_scene_depth_camera_info_ = msg;
+      });
     overlay_sub_ = this->create_subscription<rammp_ui_bridge_interfaces::msg::EngineOverlayImage>(
       this->get_parameter("engine_overlay_topic").as_string(), qos,
       [this](rammp_ui_bridge_interfaces::msg::EngineOverlayImage::ConstSharedPtr msg) {
@@ -271,6 +366,21 @@ private:
     if (!sender_->is_connected()) {
       return;
     }
+    // §7: attach this depth frame's own intrinsics (from its CameraInfo)
+    // and the scene camera's extrinsics (TF pose relative to tf_base_frame_)
+    // so UE can reproject depth pixels into world space. Both are
+    // best-effort -- a frame is still forwarded (bare depth, no 3D
+    // placement) if either hasn't resolved yet.
+    std::optional<StreamMeta::Intrinsics> intrinsics;
+    {
+      std::lock_guard<std::mutex> lock(camera_info_mutex_);
+      if (latest_scene_depth_camera_info_) {
+        const auto & k = latest_scene_depth_camera_info_->k;
+        intrinsics = StreamMeta::Intrinsics{k[0], k[4], k[2], k[5]};
+      }
+    }
+    const std::optional<StreamMeta::Extrinsics> transform = lookup_scene_camera_extrinsics();
+
     try {
       if (is_uint16_depth_encoding(msg->encoding)) {
         StreamMeta meta;
@@ -278,6 +388,8 @@ private:
         meta.role = "depth";
         meta.stream_id = kSceneDepthStreamId;
         meta.name = "Scene camera depth";
+        meta.intrinsics = intrinsics;
+        meta.transform = transform;
         sender_->send_depth_uint16(
           kSceneDepthChannel, msg->data.data(), msg->data.size(), msg->width, msg->height, meta);
       } else {
@@ -288,6 +400,8 @@ private:
         meta.role = "depth";
         meta.stream_id = kSceneDepthStreamId;
         meta.name = "Scene camera depth";
+        meta.intrinsics = intrinsics;
+        meta.transform = transform;
         sender_->send_image(
           kSceneDepthChannel, msg->data.data(), msg->data.size(), msg->width, msg->height,
           msg->encoding, meta);
@@ -295,6 +409,32 @@ private:
     } catch (const std::exception & exc) {
       RCLCPP_WARN(
         this->get_logger(), "failed to forward scene camera depth frame to UE: %s", exc.what());
+    }
+  }
+
+  /// Looks up the scene camera's current pose relative to tf_base_frame_,
+  /// converted to the UE-metadata shape via tf_to_ue_extrinsics(). Returns
+  /// the last successfully-resolved pose (or nullopt if there's never been
+  /// one) rather than nullopt on a transient lookup failure -- e.g. the
+  /// camera's static transform not having been broadcast yet right after
+  /// startup -- same "keep stale rather than drop" convention the Gen1
+  /// prototype bridge's own camera-extrinsics lookup used.
+  std::optional<StreamMeta::Extrinsics> lookup_scene_camera_extrinsics()
+  {
+    try {
+      const auto transform = tf_buffer_->lookupTransform(
+        tf_base_frame_, scene_camera_tf_frame_, tf2::TimePointZero,
+        tf2::durationFromSec(1.0));
+      std::lock_guard<std::mutex> lock(extrinsics_mutex_);
+      last_scene_extrinsics_ = tf_to_ue_extrinsics(transform);
+      return last_scene_extrinsics_;
+    } catch (const tf2::TransformException & exc) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "TF2 lookup failed for '%s' -> '%s': %s",
+        tf_base_frame_.c_str(), scene_camera_tf_frame_.c_str(), exc.what());
+      std::lock_guard<std::mutex> lock(extrinsics_mutex_);
+      return last_scene_extrinsics_;
     }
   }
 
@@ -368,8 +508,19 @@ private:
 
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr scene_color_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr scene_depth_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr scene_depth_camera_info_sub_;
   rclcpp::Subscription<rammp_ui_bridge_interfaces::msg::EngineOverlayImage>::SharedPtr
     overlay_sub_;
+
+  // §7 depth intrinsics/extrinsics state.
+  std::string tf_base_frame_;
+  std::string scene_camera_tf_frame_;
+  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  std::mutex camera_info_mutex_;
+  sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_scene_depth_camera_info_;
+  std::mutex extrinsics_mutex_;
+  std::optional<StreamMeta::Extrinsics> last_scene_extrinsics_;
 
   rclcpp::Service<rammp_common_interfaces::srv::AcquireControl>::SharedPtr acquire_control_srv_;
   rclcpp::Service<rammp_common_interfaces::srv::ReleaseControl>::SharedPtr release_control_srv_;

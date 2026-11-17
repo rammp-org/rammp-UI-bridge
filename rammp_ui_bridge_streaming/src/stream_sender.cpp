@@ -218,6 +218,25 @@ void apply_meta(nlohmann::json & j, const StreamMeta & meta)
   if (meta.name) {
     j["name"] = *meta.name;
   }
+  if (meta.intrinsics) {
+    j["intrinsics"] = {
+      {"fx", meta.intrinsics->fx},
+      {"fy", meta.intrinsics->fy},
+      {"cx", meta.intrinsics->cx},
+      {"cy", meta.intrinsics->cy},
+    };
+  }
+  if (meta.transform) {
+    j["transform"] = {
+      {"x", meta.transform->x},
+      {"y", meta.transform->y},
+      {"z", meta.transform->z},
+      {"pitch", meta.transform->pitch},
+      {"roll", meta.transform->roll},
+      {"yaw", meta.transform->yaw},
+    };
+    j["transform_space"] = meta.transform->space;
+  }
 }
 
 }  // namespace

@@ -11,6 +11,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
 find_package(nlohmann_json REQUIRED)
 find_package(rammp_common_interfaces REQUIRED)
 find_package(rammp_ui_bridge_interfaces REQUIRED)
@@ -31,7 +34,8 @@ target_link_libraries(stream_sender PUBLIC rmss_protocol nlohmann_json::nlohmann
 add_executable(camera_stream_node src/camera_stream_node.cpp)
 target_link_libraries(camera_stream_node PRIVATE stream_sender)
 ament_target_dependencies(camera_stream_node PUBLIC
-  rclcpp sensor_msgs rammp_common_interfaces rammp_ui_bridge_interfaces)
+  rclcpp sensor_msgs geometry_msgs tf2 tf2_ros rammp_common_interfaces
+  rammp_ui_bridge_interfaces)
 
 install(TARGETS
   rmss_protocol

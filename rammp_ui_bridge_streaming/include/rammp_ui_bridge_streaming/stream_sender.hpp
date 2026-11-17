@@ -31,6 +31,35 @@ struct StreamMeta
   std::optional<std::string> role;
   std::optional<std::string> stream_id;
   std::optional<std::string> name;
+
+  /// Camera intrinsics (§7) -- fx/fy/cx/cy, pulled from the matching
+  /// sensor_msgs/CameraInfo.K (same four indices as the Python/Gen1
+  /// prototype bridges: K[0], K[4], K[2], K[5]).
+  struct Intrinsics
+  {
+    double fx{0.0};
+    double fy{0.0};
+    double cx{0.0};
+    double cy{0.0};
+  };
+
+  /// Camera extrinsics (§7) -- this camera's pose relative to some TF root
+  /// frame, converted to UE's units/axis convention (centimeters/degrees,
+  /// ROS->UE Y-axis flip already applied) -- see tf_to_ue_extrinsics() in
+  /// camera_stream_node.cpp.
+  struct Extrinsics
+  {
+    double x{0.0};
+    double y{0.0};
+    double z{0.0};
+    double roll{0.0};
+    double pitch{0.0};
+    double yaw{0.0};
+    std::string space{"relative"};
+  };
+
+  std::optional<Intrinsics> intrinsics;
+  std::optional<Extrinsics> transform;
 };
 
 class StreamSender

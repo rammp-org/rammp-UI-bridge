@@ -90,8 +90,10 @@ import time
 from typing import Any
 
 import rclpy
+import tf2_ros
 from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import (
@@ -100,7 +102,7 @@ from rclpy.qos import (
     QoSProfile,
     qos_profile_sensor_data,
 )
-from sensor_msgs.msg import Image, JointState
+from sensor_msgs.msg import CameraInfo, Image, JointState
 from std_msgs.msg import Bool
 
 from rammp_common_interfaces.msg import ControlStatus
@@ -193,6 +195,57 @@ def parse_request_json(request_json: str) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _quat_to_euler_zyx_deg(x: float, y: float, z: float, w: float) -> tuple[float, float, float]:
+    """Quaternion (ROS order x,y,z,w) -> intrinsic ZYX Euler angles
+    (roll, pitch, yaw), in degrees. Pure-Python port of the Gen1 prototype
+    bridge's ``rotation_matrix_to_euler_zyx`` (``rammp_prototype_gui.
+    Gui_bridge``, itself built on ``scipy.spatial.transform.Rotation``) --
+    reimplemented directly off the quaternion->rotation-matrix formula so
+    this package doesn't need scipy as a dependency just for this one
+    conversion."""
+    r20 = 2.0 * (x * z - y * w)
+    r21 = 2.0 * (y * z + x * w)
+    r22 = 1.0 - 2.0 * (x * x + y * y)
+    r10 = 2.0 * (x * y + z * w)
+    r00 = 1.0 - 2.0 * (y * y + z * z)
+    sy = -r20
+    epsilon = 1e-6
+    if abs(sy) < 1 - epsilon:
+        pitch = math.asin(sy)
+        roll = math.atan2(r21, r22)
+        yaw = math.atan2(r10, r00)
+    else:
+        # Gimbal lock.
+        pitch = math.pi / 2 if sy < 0 else -math.pi / 2
+        roll = 0.0
+        r01 = 2.0 * (x * y - z * w)
+        r11 = 1.0 - 2.0 * (x * x + z * z)
+        yaw = math.atan2(-r01, r11)
+    return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
+
+
+def _tf_to_ue_extrinsics(transform_stamped) -> dict[str, float]:
+    """Converts a ``geometry_msgs/TransformStamped`` (e.g. from a
+    ``tf2_ros.Buffer.lookup_transform`` call) into the
+    ``{"x","y","z","roll","pitch","yaw"}`` shape UE's RMSS stream metadata
+    expects (position in centimeters, rotation in degrees) -- same
+    conversion the Gen1 prototype bridge's ``_tf_to_ue_extrinsics`` used,
+    including its ROS->UE Y-axis-flip adjustment (UE's Y axis is flipped
+    relative to ROS's, so the Y position and the pitch/yaw that depend on
+    it are negated)."""
+    t = transform_stamped.transform.translation
+    r = transform_stamped.transform.rotation
+    roll_deg, pitch_deg, yaw_deg = _quat_to_euler_zyx_deg(r.x, r.y, r.z, r.w)
+    return {
+        "x": t.x * 100.0,
+        "y": -t.y * 100.0,
+        "z": t.z * 100.0,
+        "roll": roll_deg,
+        "pitch": -pitch_deg,
+        "yaw": -yaw_deg,
+    }
+
+
 class UiBridgeNode(Node):
     """Bridges one UE instance to one Orchestrator instance.
 
@@ -232,6 +285,25 @@ class UiBridgeNode(Node):
         # below). Override per-robot via a launch/params-file argument.
         self.declare_parameter("scene_camera_color_topic", "/scene_camera/color/image_raw")
         self.declare_parameter("scene_camera_depth_topic", "/scene_camera/depth/image_rect_raw")
+        # Depth's own CameraInfo (not the color one) -- its intrinsics
+        # (focal length/principal point, see
+        # ``_lookup_scene_camera_depth_intrinsics``) are what UE needs to
+        # reproject depth pixels back into 3D, since depth is sent
+        # separately from color (§7 below).
+        self.declare_parameter(
+            "scene_camera_depth_camera_info_topic", "/scene_camera/depth/camera_info"
+        )
+        # §7: scene-camera depth is sent to UE together with its intrinsics
+        # (from the topic above) and extrinsics (this camera's pose,
+        # looked up via TF -- see ``_lookup_scene_camera_extrinsics``), so
+        # UE can place each depth pixel in world space without any
+        # hardcoded camera-mount assumption. ``tf_base_frame`` is the
+        # common root every sensor frame (including this one) is ultimately
+        # relative to (ROS_Specification_Gen1.5.md: "/tf ... rooted at
+        # base_link"); ``scene_camera_tf_frame`` is the scene camera's own
+        # static TF frame (same doc's sensor table: "scene_link").
+        self.declare_parameter("tf_base_frame", "base_link")
+        self.declare_parameter("scene_camera_tf_frame", "scene_link")
         # §3.3.1/§5.2.A overlay layer: one fixed, shared topic every engine
         # publishes its own camera to -- not a per-engine topic/parameter
         # table. Only one engine can ever be *active* at a time (the
@@ -301,6 +373,19 @@ class UiBridgeNode(Node):
         self._latest_scene_depth: Image | None = None
         self._scene_color_frame_count = 0
         self._scene_depth_frame_count = 0
+        # Depth's own CameraInfo (intrinsics) and this camera's last-known
+        # TF pose (extrinsics) -- both attached to every depth frame sent
+        # to UE, see _forward_scene_camera_depth/_lookup_scene_camera_extrinsics.
+        # Extrinsics are cached (not cleared) across a transient TF lookup
+        # failure, same "keep stale rather than drop" convention as the
+        # Gen1 prototype bridge's own camera-extrinsics lookup.
+        self._latest_scene_depth_camera_info: CameraInfo | None = None
+        self._last_scene_camera_extrinsics: dict[str, float] | None = None
+        self.tf_buffer: tf2_ros.Buffer | None = None
+        self.tf_listener: tf2_ros.TransformListener | None = None
+        if self._use_python_streaming:
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self, spin_thread=True)
 
         # -- engine overlay camera state (§3.3.1) -----------------------------
         # Latest frame from the single shared overlay topic (see
@@ -445,6 +530,7 @@ class UiBridgeNode(Node):
 
         self._scene_color_sub = None
         self._scene_depth_sub = None
+        self._scene_depth_camera_info_sub = None
         self._engine_overlay_sub = None
         if self._use_python_streaming:
             # Camera subscriptions are only created when this node is
@@ -466,6 +552,13 @@ class UiBridgeNode(Node):
                 Image,
                 self.get_parameter("scene_camera_depth_topic").value,
                 self._on_scene_camera_depth,
+                qos_profile_sensor_data,
+                callback_group=self._cb_group,
+            )
+            self._scene_depth_camera_info_sub = self.create_subscription(
+                CameraInfo,
+                self.get_parameter("scene_camera_depth_camera_info_topic").value,
+                self._on_scene_camera_depth_camera_info,
                 qos_profile_sensor_data,
                 callback_group=self._cb_group,
             )
@@ -528,6 +621,35 @@ class UiBridgeNode(Node):
             )
         self._forward_scene_camera_depth(msg)
 
+    def _on_scene_camera_depth_camera_info(self, msg: CameraInfo) -> None:
+        with self._camera_lock:
+            self._latest_scene_depth_camera_info = msg
+
+    def _lookup_scene_camera_extrinsics(self) -> dict[str, float] | None:
+        """Looks up the scene camera's current pose (TF, §7) relative to
+        ``tf_base_frame``, converted to the UE-metadata shape via
+        ``_tf_to_ue_extrinsics``. Returns the last successfully-resolved
+        pose (or ``None`` if there's never been one) rather than ``None``
+        on a transient lookup failure -- e.g. the camera's static
+        transform not having been broadcast yet right after startup --
+        same "keep stale rather than drop" convention the Gen1 prototype
+        bridge's own camera-extrinsics lookup used."""
+        base_frame = self.get_parameter("tf_base_frame").value
+        camera_frame = self.get_parameter("scene_camera_tf_frame").value
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                base_frame, camera_frame, rclpy.time.Time(), timeout=Duration(seconds=1.0)
+            )
+            extrinsics = _tf_to_ue_extrinsics(transform)
+            self._last_scene_camera_extrinsics = extrinsics
+            return extrinsics
+        except Exception as exc:  # tf2's own exception hierarchy, kept broad on purpose
+            self.get_logger().warning(
+                f"TF2 lookup failed for '{base_frame}' -> '{camera_frame}': {exc}",
+                throttle_duration_sec=5.0,
+            )
+            return self._last_scene_camera_extrinsics
+
     def _stream_ready(self, frame_kind: str) -> bool:
         """True if python-side camera streaming is enabled and the TCP
         connection to UE's RMSS streaming server is currently up.
@@ -574,6 +696,26 @@ class UiBridgeNode(Node):
         if not self._stream_ready("scene camera depth"):
             self.get_logger().info("Scene camera depth frame dropped: stream not ready.")
             return
+        # §7: attach the depth frame's intrinsics (from its own CameraInfo,
+        # not the color one) and this camera's extrinsics (TF pose relative
+        # to tf_base_frame) so UE can reproject depth pixels into world
+        # space -- see _tf_to_ue_extrinsics/_lookup_scene_camera_extrinsics.
+        # Both are best-effort: a frame is still forwarded (bare depth, no
+        # 3D placement) if either hasn't resolved yet.
+        meta: dict[str, Any] = {}
+        with self._camera_lock:
+            camera_info = self._latest_scene_depth_camera_info
+        if camera_info is not None:
+            meta["intrinsics"] = {
+                "fx": camera_info.k[0],
+                "fy": camera_info.k[4],
+                "cx": camera_info.k[2],
+                "cy": camera_info.k[5],
+            }
+        extrinsics = self._lookup_scene_camera_extrinsics()
+        if extrinsics is not None:
+            meta["transform"] = extrinsics
+            meta["transform_space"] = "relative"
         try:
             if msg.encoding in _UINT16_DEPTH_ENCODINGS:
                 self._stream_sender.send_depth_uint16(
@@ -581,6 +723,7 @@ class UiBridgeNode(Node):
                     bytes(msg.data),
                     msg.width,
                     msg.height,
+                    metadata=meta,
                     group=_SCENE_STREAM_GROUP,
                     role="depth",
                     stream_id=_SCENE_DEPTH_STREAM_ID,
@@ -597,6 +740,7 @@ class UiBridgeNode(Node):
                     msg.width,
                     msg.height,
                     fmt=msg.encoding,
+                    metadata=meta,
                     group=_SCENE_STREAM_GROUP,
                     role="depth",
                     stream_id=_SCENE_DEPTH_STREAM_ID,

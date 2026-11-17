@@ -43,6 +43,24 @@ def generate_launch_description():
                 ),
             ),
             DeclareLaunchArgument(
+                "scene_camera_depth_camera_info_topic",
+                default_value="/scene_camera/depth/camera_info",
+                description=(
+                    "Scene camera depth's CameraInfo topic -- intrinsics "
+                    "(fx/fy/cx/cy) attached to every depth frame sent to UE (§7)"
+                ),
+            ),
+            DeclareLaunchArgument(
+                "tf_base_frame",
+                default_value="base_link",
+                description="TF root frame the scene camera's extrinsics are resolved relative to (§7)",
+            ),
+            DeclareLaunchArgument(
+                "scene_camera_tf_frame",
+                default_value="scene_link",
+                description="Scene camera's own static TF frame, looked up for its extrinsics (§7)",
+            ),
+            DeclareLaunchArgument(
                 "engine_overlay_topic",
                 default_value="/engine_overlay/image_raw",
                 description=(
@@ -78,6 +96,13 @@ def generate_launch_description():
                         ),
                         "scene_camera_depth_topic": LaunchConfiguration(
                             "scene_camera_depth_topic"
+                        ),
+                        "scene_camera_depth_camera_info_topic": LaunchConfiguration(
+                            "scene_camera_depth_camera_info_topic"
+                        ),
+                        "tf_base_frame": LaunchConfiguration("tf_base_frame"),
+                        "scene_camera_tf_frame": LaunchConfiguration(
+                            "scene_camera_tf_frame"
                         ),
                         "engine_overlay_topic": LaunchConfiguration(
                             "engine_overlay_topic"
