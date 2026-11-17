@@ -42,6 +42,17 @@ class UnrealRemoteError(Exception):
 
 UserInputCallback = Callable[[str], None]
 
+# UFUNCTION/C++ names of the RammsBridgeReceiver functions the bridge needs
+# to call, used to auto-resolve each one's *current* preset + DisplayName
+# (see UnrealRemoteWebsocket.resolve_functions) -- UE's Remote Control HTTP
+# API routes a call by DisplayName/Label, which the UI team can rename at
+# any time, but UnderlyingFunction.Name (the bare UFUNCTION name) is not
+# renameable from the Remote Control UI, so it's the stable key to match
+# against.
+RESOLVED_FUNCTION_CPP_NAMES = frozenset(
+    {"UpdateDetectedObjects", "UpdateWorldState", "PollUIEvents", "UpdatePanel"}
+)
+
 
 def _is_empty_poll_events_response(command: dict) -> bool:
     """True if ``command`` is a PollUIEvents response shaped like
@@ -86,6 +97,19 @@ class UnrealRemoteWebsocket:
         # Label/DisplayName, not its bare UFUNCTION name -- see the
         # matching call_function() fixes in ui_bridge_node.py).
         ui_event_poll_function: str = "Poll UIEvents",
+        # resolve_functions() reruns at this period, but only until it
+        # fully resolves for the *current* WS connection -- a
+        # freshly-(re)connected UE can report an exposed function's
+        # OwnerObjects as empty for a few seconds until its
+        # RammsBridgeReceiver actor finishes BeginPlay and binds, so a
+        # single attempt right after connecting can race this and resolve
+        # nothing (confirmed live, 2026-11-16). Once resolved, it stays
+        # resolved until the next reconnect (e.g. UE restarted with a
+        # different build/release that renamed a DisplayName or moved a
+        # function to another preset) -- function names don't change while
+        # a single UE instance keeps running, so there's no need to keep
+        # re-querying UE indefinitely once they're known.
+        function_resolve_period_s: float = 5.0,
     ):
         self.base_url = f"ws://{host}:{ws_port}"
         self.loop = asyncio.new_event_loop()
@@ -121,6 +145,17 @@ class UnrealRemoteWebsocket:
         # resolves. Reset to None as soon as a 200 response is seen again.
         self._last_logged_error_response = None
         self._last_poll_error_response = None
+        # Set (while holding _send_lock) by call_function_and_wait(quiet=True)
+        # right before sending, cleared by ws_client_handler as soon as it
+        # consumes the one response that pairs with it. Because the lock
+        # serializes all senders for the full round trip, the next
+        # "ResponseCode" message to arrive is guaranteed to be that quiet
+        # call's own response -- lets us suppress it unconditionally
+        # (regardless of its ReturnedValues shape), unlike the old
+        # shape-only _is_empty_poll_events_response() heuristic, which
+        # missed UE's actual bare "ReturnedValues": [] responses and let
+        # every single ~10-15Hz PollUIEvents response through.
+        self._quiet_response_pending = False
 
         # -- PollUIEvents (2026-11-04 UI-team design) --------------------
         # UE no longer pushes individual taps as unsolicited property
@@ -140,12 +175,26 @@ class UnrealRemoteWebsocket:
         self.poll_ui_events = poll_ui_events
         self.ui_event_poll_rate_hz = ui_event_poll_rate_hz
         self.ui_event_poll_function = ui_event_poll_function
+        self.function_resolve_period_s = function_resolve_period_s
+        self._last_logged_resolution: Optional[dict[str, dict[str, str]]] = None
+        # Bumped by ws_client_handler every time a new WS connection is
+        # established -- lets resolve_functions_loop know it's looking at a
+        # fresh connection (possibly a different UE build/release) and
+        # should retry resolving again, rather than treating the previous
+        # connection's already-resolved result as still good forever.
+        self._connection_generation = 0
         self._ui_event_since_sequence = 0
+        # Populated by resolve_functions() (scheduled on every WS (re)connect,
+        # alongside list_presets()): cpp_name -> {"preset": ..., "display_name": ...}
+        # for each of RESOLVED_FUNCTION_CPP_NAMES actually found exposed (with
+        # a non-empty OwnerObjects) in some registered preset.
+        self._function_resolution: dict[str, dict[str, str]] = {}
 
         t = threading.Thread(target=self.start_async_loop, daemon=True)
         t.start()
         asyncio.run_coroutine_threadsafe(self.ws_client_handler(), self.loop)
         asyncio.run_coroutine_threadsafe(self.parse_value_changes(), self.loop)
+        asyncio.run_coroutine_threadsafe(self.resolve_functions_loop(), self.loop)
         if self.poll_ui_events:
             asyncio.run_coroutine_threadsafe(self.poll_ui_events_loop(), self.loop)
 
@@ -155,6 +204,7 @@ class UnrealRemoteWebsocket:
             try:
                 async with websockets.connect(self.base_url) as ws:
                     self.ws_client = ws
+                    self._connection_generation += 1
                     print("GUI connected.")
                     self._disconnected_logged = False
                     await self.register_preset()  # Register preset on connect
@@ -172,13 +222,22 @@ class UnrealRemoteWebsocket:
                         # registered it yet) would otherwise re-log the same
                         # line every poll tick until it resolves -- only log
                         # it once, on first occurrence or when it changes.
+                        is_quiet_response = (
+                            "ResponseCode" in command
+                            and response_code == 200
+                            and self._quiet_response_pending
+                        )
+                        if "ResponseCode" in command:
+                            self._quiet_response_pending = False
                         is_routine_poll = _is_empty_poll_events_response(command)
                         is_repeated_error = (
                             response_code is not None
                             and response_code != 200
                             and command == self._last_logged_error_response
                         )
-                        should_log = not is_routine_poll and not is_repeated_error
+                        should_log = (
+                            not is_routine_poll and not is_repeated_error and not is_quiet_response
+                        )
                         if should_log:
                             logger.debug(f"WS <- {message}")
                         if "ResponseCode" in command:
@@ -268,6 +327,265 @@ class UnrealRemoteWebsocket:
         names = [p.get("Name") for p in presets]
         logger.info(f"UE Remote Control presets available: {names}")
 
+    # -- Debug-only helpers (not used by the normal bridge runtime path) --
+    # Unlike list_presets()/get_preset_functions_porperties() above, these
+    # actually *return* the parsed data (instead of just logging, or
+    # relying on send_and_wait()'s currently-dead/commented-out response
+    # wait) so a debug-only HTTP endpoint on ui_bridge_node can expose them.
+    async def get_presets(self, timeout=None) -> list[dict]:
+        """GET /remote/presets via the WS "http" tunnel; returns UE's full
+        list of registered presets (not just their names)."""
+        if self.ws_client is None:
+            raise RuntimeError("WebSocket is not open")
+        parameters = {"Url": "/remote/presets", "Verb": "GET"}
+        payload = {"MessageName": "http", "Parameters": parameters}
+        async with self._send_lock:
+            while not self._response_queue.empty():
+                self._response_queue.get_nowait()
+            await self.ws_client.send(json.dumps(payload))
+            try:
+                resp = await asyncio.wait_for(
+                    self._response_queue.get(), timeout or self.default_timeout
+                )
+            except asyncio.TimeoutError as te:
+                raise TimeoutError(f"Timeout waiting for WS response to {parameters}") from te
+        if "_error" in resp:
+            raise RuntimeError(f"WebSocket receive loop error: {resp['_error']}")
+        if resp.get("ResponseCode", 0) != 200:
+            raise UnrealRemoteError(
+                f"UE responded with error code {resp.get('ResponseCode')}: {resp.get('Body')}"
+            )
+        return resp.get("ResponseBody", {}).get("Presets", [])
+
+    async def get_preset(self, name: str, timeout=None) -> dict:
+        """GET /remote/preset/<name> via the WS "http" tunnel; returns UE's
+        full preset description (exposed functions/properties), for an
+        arbitrary preset name -- unlike get_preset_functions_porperties()
+        this isn't limited to ``self.preset``."""
+        if self.ws_client is None:
+            raise RuntimeError("WebSocket is not open")
+        parameters = {"Url": "/remote/preset/" + name, "Verb": "GET"}
+        payload = {"MessageName": "http", "Parameters": parameters}
+        async with self._send_lock:
+            while not self._response_queue.empty():
+                self._response_queue.get_nowait()
+            await self.ws_client.send(json.dumps(payload))
+            try:
+                resp = await asyncio.wait_for(
+                    self._response_queue.get(), timeout or self.default_timeout
+                )
+            except asyncio.TimeoutError as te:
+                raise TimeoutError(f"Timeout waiting for WS response to {parameters}") from te
+        if "_error" in resp:
+            raise RuntimeError(f"WebSocket receive loop error: {resp['_error']}")
+        if resp.get("ResponseCode", 0) != 200:
+            raise UnrealRemoteError(
+                f"UE responded with error code {resp.get('ResponseCode')}: {resp.get('Body')}"
+            )
+        return resp.get("ResponseBody", {})
+
+    async def resolve_functions(self) -> dict[str, dict[str, str]]:
+        """Auto-discovers, across *every* preset UE currently has
+        registered (not just ``self.preset``), which preset+DisplayName
+        currently exposes each UFUNCTION in ``RESOLVED_FUNCTION_CPP_NAMES``.
+
+        Matches by ``UnderlyingFunction.Name`` (the bare UFUNCTION/C++ name
+        -- stable, can't be renamed from the Remote Control UI) rather than
+        ``DisplayName``/Label (renameable by the UI team at any time, but
+        the name UE's Remote Control HTTP API actually routes a call by --
+        see ``call_function``). Only accepts a match whose ``OwnerObjects``
+        is non-empty (an exposed function with no bound OwnerObjects can't
+        actually be invoked). Called on every WS (re)connect, alongside
+        ``list_presets()``, so a UE restart/Blueprint reload that moves a
+        function to a different preset or renames its DisplayName is
+        picked up automatically without a bridge restart.
+
+        Keeps whatever was last resolved if this fails/can't reach UE
+        rather than clearing it (same reconnect-resilience philosophy as
+        the rest of this class) -- only replaces ``self._function_resolution``
+        once a full pass over every preset succeeds."""
+        try:
+            presets = await self.get_presets()
+        except Exception as e:
+            logger.warning(f"resolve_functions: failed to list presets: {e!r}")
+            return self._function_resolution
+
+        resolution: dict[str, dict[str, str]] = {}
+        for preset_summary in presets:
+            preset_name = preset_summary.get("Name")
+            if not preset_name:
+                continue
+            try:
+                body = await self.get_preset(preset_name)
+            except Exception as e:
+                logger.warning(f"resolve_functions: failed to GET preset {preset_name!r}: {e!r}")
+                continue
+            preset_body = body.get("Preset", body)
+            for group in preset_body.get("Groups", []):
+                for entry in group.get("ExposedFunctions", []):
+                    if not entry.get("OwnerObjects"):
+                        continue
+                    underlying = entry.get("UnderlyingFunction") or {}
+                    cpp_name = underlying.get("Name")
+                    if cpp_name not in RESOLVED_FUNCTION_CPP_NAMES:
+                        continue
+                    display_name = entry.get("DisplayName")
+                    if not display_name:
+                        continue
+                    existing = resolution.get(cpp_name)
+                    if existing is not None and existing["preset"] != preset_name:
+                        logger.warning(
+                            f"resolve_functions: {cpp_name!r} is exposed in multiple "
+                            f"presets ({existing['preset']!r} and {preset_name!r}) -- "
+                            f"keeping the first one found ({existing['preset']!r})"
+                        )
+                        continue
+                    resolution[cpp_name] = {"preset": preset_name, "display_name": display_name}
+
+        missing = RESOLVED_FUNCTION_CPP_NAMES - resolution.keys()
+        if missing:
+            logger.warning(
+                f"resolve_functions: could not resolve {sorted(missing)} in any "
+                "registered preset (checked OwnerObjects non-empty + "
+                "UnderlyingFunction.Name match)"
+            )
+        if resolution != self._last_logged_resolution:
+            logger.info(f"resolve_functions: resolved {resolution}")
+            self._last_logged_resolution = dict(resolution)
+        else:
+            logger.debug(f"resolve_functions: resolved {resolution} (unchanged)")
+        self._function_resolution = resolution
+        return resolution
+
+    async def resolve_functions_loop(self):
+        """Resolves once per WS connection, not indefinitely -- UE's
+        exposed function DisplayNames/preset locations only change between
+        builds/releases, not while a given UE instance keeps running, so
+        there's no need to keep re-querying it forever once resolved.
+
+        Retries at ``function_resolve_period_s`` only until fully resolved
+        *for the current connection*: a freshly-(re)connected UE can report
+        a just-registered preset's exposed functions with an empty
+        OwnerObjects for a few seconds until its RammsBridgeReceiver actor
+        finishes BeginPlay and binds, so a single attempt right after
+        connecting can race this and resolve nothing (confirmed live,
+        2026-11-16). Once resolved, goes quiet (no more WS traffic/logging)
+        until the next reconnect (``self._connection_generation`` bumps,
+        e.g. UE restarted with a different build) triggers a fresh
+        resolution attempt. A no-op while disconnected (``ws_client is
+        None``)."""
+        resolved_generation = -1
+        while not self.ws_shutdown:
+            if self.ws_client is not None and resolved_generation != self._connection_generation:
+                try:
+                    await self.resolve_functions()
+                except Exception as e:
+                    logger.debug(f"resolve_functions_loop: {e!r}")
+                if RESOLVED_FUNCTION_CPP_NAMES <= self._function_resolution.keys():
+                    resolved_generation = self._connection_generation
+            await asyncio.sleep(self.function_resolve_period_s)
+
+    async def _ensure_resolved(self, cpp_name: str) -> Optional[dict[str, str]]:
+        """Returns the cached resolution for ``cpp_name`` if there is one;
+        otherwise actively runs one ``resolve_functions()`` attempt right
+        now instead of waiting for ``resolve_functions_loop``'s next
+        ``function_resolve_period_s`` tick. Closes the real race observed
+        live (2026-11-16): the very first call right after connecting can
+        otherwise fire before the background loop's first attempt even
+        gets a chance to run, always falling back to a (possibly stale,
+        UI-team-renamed) hardcoded DisplayName."""
+        resolution = self._function_resolution.get(cpp_name)
+        if resolution is not None:
+            return resolution
+        try:
+            await self.resolve_functions()
+        except Exception as e:
+            logger.debug(f"_ensure_resolved({cpp_name!r}): on-demand resolve failed: {e!r}")
+        return self._function_resolution.get(cpp_name)
+
+    def call_resolved_function(
+        self,
+        cpp_name: str,
+        function_parameters: dict[str, Any],
+        fallback_display_name: Optional[str] = None,
+        fallback_preset: Optional[str] = None,
+    ) -> None:
+        """Fire-and-forget call to whichever preset+DisplayName is resolved
+        for ``cpp_name`` (one of ``RESOLVED_FUNCTION_CPP_NAMES``) -- if
+        nothing's cached yet, actively resolves on demand first (see
+        ``_ensure_resolved``) rather than just hoping
+        ``resolve_functions_loop`` got there first. If that still finds
+        nothing and a ``fallback_display_name`` is given, falls back to
+        that (with ``fallback_preset`` or ``self.preset``) so a resolution
+        failure doesn't silently drop the call -- logs a warning either way
+        so a persistently-unresolved function is visible. Runs on
+        ``self.loop`` (fire-and-forget from the caller's perspective, same
+        as ``call_function``)."""
+
+        async def _do() -> None:
+            resolution = await self._ensure_resolved(cpp_name)
+            if resolution is not None:
+                self.call_function(
+                    resolution["display_name"], function_parameters, preset=resolution["preset"]
+                )
+                return
+            if fallback_display_name is not None:
+                logger.warning(
+                    f"call_resolved_function({cpp_name!r}): not resolved -- falling "
+                    f"back to hardcoded DisplayName {fallback_display_name!r} on "
+                    f"preset {(fallback_preset or self.preset)!r}"
+                )
+                self.call_function(
+                    fallback_display_name, function_parameters, preset=fallback_preset
+                )
+                return
+            logger.warning(
+                f"call_resolved_function({cpp_name!r}): not resolved and no fallback "
+                "given -- skipping call"
+            )
+
+        asyncio.run_coroutine_threadsafe(_do(), self.loop)
+
+    async def call_resolved_function_and_wait(
+        self,
+        cpp_name: str,
+        function_parameters: dict[str, Any],
+        timeout=None,
+        quiet: bool = False,
+        fallback_display_name: Optional[str] = None,
+        fallback_preset: Optional[str] = None,
+    ) -> dict:
+        """Same as ``call_resolved_function`` but awaits and returns UE's
+        response, like ``call_function_and_wait`` -- used by
+        ``poll_ui_events_loop`` for ``PollUIEvents``."""
+        resolution = await self._ensure_resolved(cpp_name)
+        if resolution is not None:
+            return await self.call_function_and_wait(
+                resolution["display_name"],
+                function_parameters,
+                timeout=timeout,
+                quiet=quiet,
+                preset=resolution["preset"],
+            )
+        if fallback_display_name is not None:
+            if not quiet:
+                logger.warning(
+                    f"call_resolved_function_and_wait({cpp_name!r}): not resolved -- "
+                    f"falling back to hardcoded DisplayName "
+                    f"{fallback_display_name!r} on preset {(fallback_preset or self.preset)!r}"
+                )
+            return await self.call_function_and_wait(
+                fallback_display_name,
+                function_parameters,
+                timeout=timeout,
+                quiet=quiet,
+                preset=fallback_preset,
+            )
+        raise UnrealRemoteError(
+            f"call_resolved_function_and_wait({cpp_name!r}): not resolved yet and no "
+            "fallback given"
+        )
+
     async def send_and_wait(self, parameters, timeout=None):
         """
         Sends a tunneled HTTP request via WS and waits for the next response.
@@ -303,6 +621,7 @@ class UnrealRemoteWebsocket:
         function_parameters: dict[str, Any],
         timeout=None,
         quiet: bool = False,
+        preset: Optional[str] = None,
     ) -> dict:
         """Same tunneled HTTP call as ``call_function``, but actually waits
         for and returns UE's response -- used by the PollUIEvents poller,
@@ -326,7 +645,7 @@ class UnrealRemoteWebsocket:
             raise RuntimeError("WebSocket is not open")
 
         parameters = {
-            "Url": "/remote/preset/" + self.preset + "/function/" + function_name,
+            "Url": "/remote/preset/" + (preset or self.preset) + "/function/" + function_name,
             "Verb": "PUT",
             "Body": {
                 "Parameters": function_parameters,
@@ -343,12 +662,14 @@ class UnrealRemoteWebsocket:
                 self._response_queue.get_nowait()
             if not quiet:
                 logger.debug(f"WS -> {payload}")
+            self._quiet_response_pending = quiet
             await self.ws_client.send(json.dumps(payload))
             try:
                 resp = await asyncio.wait_for(
                     self._response_queue.get(), timeout or self.default_timeout
                 )
             except asyncio.TimeoutError as te:
+                self._quiet_response_pending = False
                 raise TimeoutError(
                     f"Timeout waiting for WS response to {parameters}"
                 ) from te
@@ -377,10 +698,11 @@ class UnrealRemoteWebsocket:
                 await asyncio.sleep(period)
                 continue
             try:
-                resp = await self.call_function_and_wait(
-                    self.ui_event_poll_function,
+                resp = await self.call_resolved_function_and_wait(
+                    "PollUIEvents",
                     {"SinceSequence": self._ui_event_since_sequence},
                     quiet=True,
+                    fallback_display_name=self.ui_event_poll_function,
                 )
             except Exception as e:
                 logger.debug(f"PollUIEvents error: {e!r}")
@@ -417,9 +739,14 @@ class UnrealRemoteWebsocket:
 
             await asyncio.sleep(period)
 
-    def call_function(self, function_name: str, function_parameters: dict[str, Any]):
+    def call_function(
+        self,
+        function_name: str,
+        function_parameters: dict[str, Any],
+        preset: Optional[str] = None,
+    ):
         Parameters = {
-            "Url": "/remote/preset/" + self.preset + "/function/" + function_name,
+            "Url": "/remote/preset/" + (preset or self.preset) + "/function/" + function_name,
             "Verb": "PUT",
             # Body shape matches UE's Remote Control HTTP API exactly as
             # confirmed/tested by the UI team (capitalized "Parameters" +

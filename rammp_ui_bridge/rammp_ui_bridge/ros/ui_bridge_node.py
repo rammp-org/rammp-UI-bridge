@@ -260,7 +260,7 @@ class UiBridgeNode(Node):
         # Orchestrator pushes to this node's own ui_control), rather than
         # depending on this node for either the frames or the token check.
         # Default True: zero behaviour change out of the box.
-        self.declare_parameter("use_python_camera_streaming", True)
+        self.declare_parameter("use_python_camera_streaming", False)
         # §3.4 Bridge <-> Hardware node / §5.2.B system status: the arm
         # driver's (or its mock's) sensor_msgs/msg/JointState topic, covering
         # every arm joint -- see sheppy's `arm` node (rammp-deployments'
@@ -1064,12 +1064,19 @@ class UiBridgeNode(Node):
         # RammsBridgeSubsystem.h's OnDetectedObjectsJson comment).
         #
         # UE's Remote Control preset route resolves the function name
-        # against the exposed field's Label/DisplayName ("Update Detected
-        # Objects"), not the bare UFUNCTION name ("UpdateDetectedObjects")
-        # -- but the argument name is still matched against the UFUNCTION's
-        # own parameter name ("DetectedObjectsJSON"), not its DisplayName.
-        self.ue.call_function(
-            "Update Detected Objects",
+        # against the exposed field's current Label/DisplayName (e.g.
+        # "Update Detected Objects"), which the UI team can rename at any
+        # time -- not the bare UFUNCTION name ("UpdateDetectedObjects"),
+        # which is stable. self.ue.call_resolved_function auto-discovers
+        # whichever preset+DisplayName currently exposes
+        # "UpdateDetectedObjects" (see
+        # UnrealRemoteWebsocket.resolve_functions), falling back to the
+        # hardcoded "Update Detected Objects"/self.preset below only if
+        # that hasn't resolved yet. The argument name is still matched
+        # against the UFUNCTION's own parameter name ("DetectedObjectsJSON"),
+        # not its DisplayName, either way.
+        self.ue.call_resolved_function(
+            "UpdateDetectedObjects",
             {
                 "DetectedObjectsJSON": json.dumps(
                     {
@@ -1079,6 +1086,7 @@ class UiBridgeNode(Node):
                     }
                 ),
             },
+            fallback_display_name="Update Detected Objects",
         )
 
     def _on_request_user_input_execute(self, goal_handle):
@@ -1108,10 +1116,14 @@ class UiBridgeNode(Node):
             self._active_input_goal = goal_state
 
         if panel_json:
-            # "Update Panel" is the RC Label (DisplayName, with a space);
-            # "PanelJSON" is still the bare UFUNCTION parameter name (no
-            # space) -- see the matching call_function above.
-            self.ue.call_function("Update Panel", {"PanelJSON": panel_json})
+            # Auto-resolved against UnderlyingFunction.Name "UpdatePanel"
+            # (see UnrealRemoteWebsocket.resolve_functions); "Update Panel"
+            # is only the hardcoded fallback DisplayName if that hasn't
+            # resolved yet. "PanelJSON" is still the bare UFUNCTION
+            # parameter name (no space) either way.
+            self.ue.call_resolved_function(
+                "UpdatePanel", {"PanelJSON": panel_json}, fallback_display_name="Update Panel"
+            )
         if objects:
             self._push_engine_objects(objects, selected_instance_id)
 
@@ -1202,9 +1214,15 @@ class UiBridgeNode(Node):
             selected_instance_id = state["selected_instance_id"]
 
         if update_panel:
-            # "Update Panel" is the RC Label (DisplayName), while
-            # "PanelJSON" is still the bare UFUNCTION parameter name.
-            self.ue.call_function("Update Panel", {"PanelJSON": update["panel_json"]})
+            # Auto-resolved against UnderlyingFunction.Name "UpdatePanel"
+            # (see UnrealRemoteWebsocket.resolve_functions); "Update Panel"
+            # is only the hardcoded fallback DisplayName if that hasn't
+            # resolved yet.
+            self.ue.call_resolved_function(
+                "UpdatePanel",
+                {"PanelJSON": update["panel_json"]},
+                fallback_display_name="Update Panel",
+            )
         if update_objects or update_selected:
             self._push_engine_objects(objects, selected_instance_id)
 
