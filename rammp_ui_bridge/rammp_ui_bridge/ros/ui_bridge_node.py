@@ -301,9 +301,9 @@ class UiBridgeNode(Node):
         # common root every sensor frame (including this one) is ultimately
         # relative to (ROS_Specification_Gen1.5.md: "/tf ... rooted at
         # base_link"); ``scene_camera_tf_frame`` is the scene camera's own
-        # static TF frame (same doc's sensor table: "scene_link").
+        # static TF frame (same doc's sensor table: "scene_camera").
         self.declare_parameter("tf_base_frame", "base_link")
-        self.declare_parameter("scene_camera_tf_frame", "scene_link")
+        self.declare_parameter("scene_camera_tf_frame", "scene_camera")
         # §3.3.1/§5.2.A overlay layer: one fixed, shared topic every engine
         # publishes its own camera to -- not a per-engine topic/parameter
         # table. Only one engine can ever be *active* at a time (the

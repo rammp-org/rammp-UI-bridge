@@ -189,7 +189,7 @@ public:
     this->declare_parameter<std::string>(
       "scene_camera_depth_camera_info_topic", "/scene_camera/depth/camera_info");
     this->declare_parameter<std::string>("tf_base_frame", "base_link");
-    this->declare_parameter<std::string>("scene_camera_tf_frame", "scene_link");
+    this->declare_parameter<std::string>("scene_camera_tf_frame", "scene_camera");
     // Raw, direct subscription -- same shared topic every engine with its
     // own camera publishes to and the one ui_bridge_node also subscribes to
     // (when use_python_camera_streaming is True). This node runs its own

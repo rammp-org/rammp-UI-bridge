@@ -57,7 +57,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "scene_camera_tf_frame",
-                default_value="scene_link",
+                default_value="scene_camera",
                 description="Scene camera's own static TF frame, looked up for its extrinsics (§7)",
             ),
             DeclareLaunchArgument(
