@@ -61,14 +61,17 @@ RESOLVED_FUNCTION_CPP_NAMES = frozenset(
         "UpdatePanel",
         "OpenCameraFeed",
         "CloseCameraFeed",
-        # The real C++/UFUNCTION name hasn't been confirmed with the UI
-        # team yet (unlike the names above, which were) -- "SetJoints"
-        # is a best guess following this project's PascalCase UFUNCTION
-        # naming convention. ui_bridge_node.py's
-        # fallback_display_name="setJoints" (the exact, confirmed-working
-        # Remote Control DisplayName the Gen1 prototype called) covers the
-        # case where this guess doesn't resolve to anything.
-        "SetJoints",
+        # Confirmed directly against a live UE instance (GET
+        # /remote/preset/RCPS -- the "UI" group, owned by the
+        # RammsSkeletalPose component) -- not a guess like the earlier
+        # "SetJoints"/"setJoints" placeholder this replaced. Its
+        # parameter key ("Values", a flat array) was also confirmed live
+        # via a direct /remote/object/call -- a 53-value array round-trips
+        # correctly as doubles, so the TArray<float> deserialization bug
+        # its own description warns about doesn't affect this bridge
+        # (Python floats already serialize as plain JSON numbers, which UE
+        # parses as the double this UFUNCTION actually declares).
+        "SetAllJointTargets",
     }
 )
 

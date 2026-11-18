@@ -37,8 +37,8 @@ Note: the Gen1 prototype GUI bridge (``rammp_prototype_gui.Gui_bridge``)
 also streamed camera images/depth/masks to UE and mapped real robot joint
 states into a UE skeleton (§5.2.A/B here), via a hardcoded 53-element
 float array keyed by fixed skeleton-bone indices for its specific
-chair+arm hardware (``set_ui_joints``, ``SetJoints``/``setJoints`` Remote
-Control call). This node's §3.4/§5.2.B **does carry that scheme forward**
+chair+arm hardware (``set_ui_joints``, ``setJoints`` Remote Control
+call). This node's §3.4/§5.2.B **does carry that scheme forward**
 (``_build_set_joints_array``/``_forward_set_joints``) -- an earlier
 by-name approach (forwarding every ``sensor_msgs/msg/JointState`` as-is
 and relying on UE's own blueprint to resolve each joint name to its
@@ -373,7 +373,7 @@ class UiBridgeNode(Node):
         self.declare_parameter("base_joint_states_topic", "/base/joint_states")
         # Throttle how often a JointState is actually forwarded to UE --
         # /joint_states can publish at the driver's own high rate (tens of
-        # Hz), but SetJoints is a per-call Remote Control request (WS round
+        # Hz), but SetAllJointTargets is a per-call Remote Control request (WS round
         # trip + DEBUG log line each time), so forwarding every single
         # message floods both the network and the log. UE's skeleton only
         # needs to update fast enough to look smooth to a human, so default
@@ -820,10 +820,13 @@ class UiBridgeNode(Node):
     # Gen1 prototype's confirmed-working `set_ui_joints`
     # (rammp_prototype_gui/Gui_bridge.py) byte-for-byte: a fixed
     # 53-element float array keyed to specific skeleton-bone indices,
-    # sent via a `SetJoints` Remote Control call (`{"Values": [...]}`).
-    # This hardcodes one chair+arm robot's skeleton layout (same
-    # limitation Gen1 had), but it is the layout this specific UE asset
-    # actually understands.
+    # sent via a `SetAllJointTargets` Remote Control call
+    # (`{"Values": [...]}`) -- confirmed live against a running UE
+    # instance's RCPS preset (`UnderlyingFunction.Name ==
+    # "SetAllJointTargets"`, owned by its `RammsSkeletalPose` component;
+    # DisplayName "Set All Joint Targets"). This hardcodes one chair+arm
+    # robot's skeleton layout (same limitation Gen1 had), but it is the
+    # layout this specific UE asset actually understands.
     # ------------------------------------------------------------------
 
     # Gen1's exact index layout (Gui_bridge.py's set_ui_joints) -- comments
@@ -845,8 +848,8 @@ class UiBridgeNode(Node):
     def _build_set_joints_array(
         cls, arm_joints: JointState | None, base_joints: JointState | None
     ) -> list[float]:
-        """The Gen1-compatible 53-element float array `SetJoints` sends,
-        built the same way Gen1's `set_ui_joints` did: a fixed index per
+        """The Gen1-compatible 53-element float array `SetAllJointTargets`
+        sends, built the same way Gen1's `set_ui_joints` did: a fixed index per
         skeleton bone, radians converted to degrees (some arm joints
         sign-flipped -- Gen1's skeleton authors a few axes mirrored from
         the driver's own convention), the gripper's single open/close
@@ -924,7 +927,9 @@ class UiBridgeNode(Node):
         try:
             values = self._build_set_joints_array(arm_joints, base_joints)
             self.ue.call_resolved_function(
-                "SetJoints", {"Values": values}, fallback_display_name="setJoints"
+                "SetAllJointTargets",
+                {"Values": values},
+                fallback_display_name="Set All Joint Targets",
             )
         except (RuntimeError, OSError) as exc:
             self.get_logger().warning(f"failed to forward joint states to UE: {exc}")

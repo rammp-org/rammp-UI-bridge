@@ -651,11 +651,12 @@ float array keyed to specific skeleton-bone indices (radians converted
 to degrees, a few arm axes sign-flipped to match the skeleton's
 mirrored convention, the gripper's one open/close joint mapped to each
 finger's own ±45° bone, and the chair's two carriage joints converted to
-centimeters instead of degrees), sent via a Remote Control call,
-`SetJoints` (`{"Values": [...]}`) -- resolved by this (unconfirmed-with-
-the-UI-team, best-guess-at-PascalCase-convention) C++ name first, falling
-back to the exact `setJoints` DisplayName Gen1 called if that doesn't
-resolve (see `RESOLVED_FUNCTION_CPP_NAMES`). Whichever JointState (arm or
+centimeters instead of degrees), sent via a Remote Control call, `SetAllJointTargets`
+(`{"Values": [...]}`) -- confirmed live against a running UE instance's
+`RCPS` preset (`UnderlyingFunction.Name == "SetAllJointTargets"`, owned
+by its `RammsSkeletalPose` component; DisplayName "Set All Joint
+Targets"), not a guess like the earlier "SetJoints"/"setJoints"
+placeholder this replaced (see `RESOLVED_FUNCTION_CPP_NAMES`). Whichever JointState (arm or
 base) arrives first/most-recently is cached and combined with the other
 cached one on every forward, so either updating alone still sends a
 complete, correctly-combined array; an absent or too-short JointState for
@@ -673,10 +674,18 @@ array-building math -- index offsets, radian→degree conversion, the five
 sign-flipped arm axes, the gripper's open/closed threshold, the
 chair/base's carriage-to-centimeters conversion, and all-zero/partial
 behavior when a JointState is absent or too short -- exactly matches
-Gen1's `set_ui_joints`. End-to-end verification against a live UE
-instance (confirming `SetJoints` resolves and actually animates the
-skeleton) is still pending (needs a live UE connection, not available
-this session).
+Gen1's `set_ui_joints`. Also manually confirmed directly against a live
+UE instance (`GET /remote/preset/RCPS`, then a direct
+`PUT /remote/object/call` on `SetAllJointTargets` with a real 53-value
+array): the function exists, its parameter key is `Values` (a flat
+array), and the values round-trip correctly as doubles -- its own
+UFUNCTION description warns of a `TArray<float>` deserialization bug
+(values doubled with a zero prepended), but since this bridge already
+sends plain Python floats as JSON numbers (parsed by UE as the
+`TArray<double>` this UFUNCTION actually declares), that bug doesn't
+apply here. End-to-end verification that the skeleton actually animates
+in the running level (not just that the Remote Control call succeeds)
+is still pending a live run with `ui_bridge_node` itself.
 
 **Still TBD** (tracked in §7): chair/base speed/odometry/fault-status
 *telemetry* (distinct from the joint *positions* now forwarded above) --
