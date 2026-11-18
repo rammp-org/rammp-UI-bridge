@@ -61,6 +61,14 @@ RESOLVED_FUNCTION_CPP_NAMES = frozenset(
         "UpdatePanel",
         "OpenCameraFeed",
         "CloseCameraFeed",
+        # The real C++/UFUNCTION name hasn't been confirmed with the UI
+        # team yet (unlike the names above, which were) -- "SetJoints"
+        # is a best guess following this project's PascalCase UFUNCTION
+        # naming convention. ui_bridge_node.py's
+        # fallback_display_name="setJoints" (the exact, confirmed-working
+        # Remote Control DisplayName the Gen1 prototype called) covers the
+        # case where this guess doesn't resolve to anything.
+        "SetJoints",
     }
 )
 

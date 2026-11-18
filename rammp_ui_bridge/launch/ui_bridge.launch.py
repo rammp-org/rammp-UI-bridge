@@ -91,10 +91,20 @@ def generate_launch_description():
                 "arm_joint_states_forward_rate_hz",
                 default_value="2.0",
                 description=(
-                    "Max rate (Hz) UpdateArmJointStates is actually sent to UE, "
-                    "independent of /joint_states' own publish rate -- avoids "
-                    "flooding the Remote Control WebSocket/log with every driver "
-                    "tick. 0 or negative disables throttling (forwards every message)."
+                    "Max rate (Hz) SetJoints is actually sent to UE, "
+                    "independent of /joint_states'/'base_joint_states_topic's own "
+                    "publish rate -- avoids flooding the Remote Control WebSocket/log "
+                    "with every driver tick. 0 or negative disables throttling "
+                    "(forwards every message)."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "base_joint_states_topic",
+                default_value="/base/joint_states",
+                description=(
+                    "Chair/base driver's own JointState topic (foot control, "
+                    "rotation, left/right drive, carriage, wheel) -- combined with "
+                    "arm_joint_states_topic into one SetJoints call (§3.4)"
                 ),
             ),
             Node(
@@ -132,6 +142,9 @@ def generate_launch_description():
                         ),
                         "arm_joint_states_forward_rate_hz": LaunchConfiguration(
                             "arm_joint_states_forward_rate_hz"
+                        ),
+                        "base_joint_states_topic": LaunchConfiguration(
+                            "base_joint_states_topic"
                         ),
                     }
                 ],

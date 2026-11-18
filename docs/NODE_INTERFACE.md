@@ -614,7 +614,7 @@ remains to document here beyond what §3.1.1 already covers; this heading
 is kept only so existing cross-references (§5.1, §5.2.A/C/D) resolve to
 the right place.
 
-### 3.4 Bridge ↔ Hardware node -- **arm joint states implemented, chair/base still TBD**
+### 3.4 Bridge ↔ Hardware node -- **arm + base joint states implemented as a Gen1-compatible array**
 
 No shared interface package defines this (it's plain `sensor_msgs/msg/
 JointState`, no bridge-specific message type needed). Unlike §3.3's engine
@@ -628,52 +628,64 @@ status) rather than being proxied through any engine or through the
 Orchestrator's generic World-State JSON snapshot (`get_world_state`'s
 `snapshot_json`, not meant for high-frequency structured telemetry).
 
-**Implemented: arm joint states.** The bridge subscribes directly to
-`arm_joint_states_topic` (default `/joint_states`,
-`sensor_msgs/msg/JointState`) -- see `rammp-deployments`'
-`december_2026/sheppy-manifest.yaml`'s `arm` node, whose real alternative
-(`kinova_gen3_driver`/`kinova_gen3_driver_nightly`) publishes the Kinova
-Gen3's 7 arm joints plus the 2F-85 gripper's own joint on this topic, and
-whose mock alternative (`arm_mock`) publishes the same topic name with
-empty `name`/`position` arrays, purely to keep it wired up on a
-workstation profile with no arm attached. **Design decision: forward
-every joint in the message by name, not a fixed index layout.** The Gen1
-prototype's `set_ui_joints` built a hardcoded 53-element float array
-keyed to specific skeleton-bone indices for its one chair+arm robot --
-that doesn't generalize (per §7's prior note) and this bridge has no
-chair/base to combine it with anyway. Instead, `_on_arm_joint_states`/
-`_forward_arm_joint_states` push the message's `name`/`position` arrays
-through as-is (radians converted to degrees, matching Gen1's degree
-convention for skeleton authoring) via a Remote Control call,
-`UpdateArmJointStates` (`{"Names": [...], "PositionsDeg": [...]}`) -- UE's
-own blueprint is responsible for mapping each joint name to its own
-skeleton bone, so the bridge needs no knowledge of the UE skeleton's
-layout and "use that for all the arm joints" (whatever the publishing
-node names them) just works without a bridge-side mapping table. An
-empty `JointState` (the mock) forwards as empty arrays; UE is expected to
-simply leave its skeleton unchanged on an empty update.
+**Implemented: arm + base joint states, as Gen1's own hardcoded array.**
+The bridge subscribes directly to `arm_joint_states_topic` (default
+`/joint_states`, `sensor_msgs/msg/JointState`) -- see
+`rammp-deployments`' `december_2026/sheppy-manifest.yaml`'s `arm` node,
+whose real alternative (`kinova_gen3_driver`/`kinova_gen3_driver_nightly`)
+publishes the Kinova Gen3's 7 arm joints plus the 2F-85 gripper's own
+joint on this topic, and whose mock alternative (`arm_mock`) publishes
+the same topic name with empty `name`/`position` arrays, purely to keep
+it wired up on a workstation profile with no arm attached -- and to
+`base_joint_states_topic` (default `/base/joint_states`) for the
+chair/base's own joints, when a base driver publishes them. **Reverted
+design decision: forward a Gen1-compatible 53-element float array, not
+by joint name.** This bridge previously forwarded every joint in the
+message by name (`UpdateArmJointStates`, `{"Names": [...],
+"PositionsDeg": [...]}`), expecting UE's own blueprint to resolve each
+name to its skeleton bone -- that never actually animated anything in
+UE. `_build_set_joints_array`/`_forward_set_joints` instead replicate the
+Gen1 prototype's confirmed-working `set_ui_joints`
+(`rammp_prototype_gui/Gui_bridge.py`) byte-for-byte: a fixed 53-element
+float array keyed to specific skeleton-bone indices (radians converted
+to degrees, a few arm axes sign-flipped to match the skeleton's
+mirrored convention, the gripper's one open/close joint mapped to each
+finger's own ±45° bone, and the chair's two carriage joints converted to
+centimeters instead of degrees), sent via a Remote Control call,
+`SetJoints` (`{"Values": [...]}`) -- resolved by this (unconfirmed-with-
+the-UI-team, best-guess-at-PascalCase-convention) C++ name first, falling
+back to the exact `setJoints` DisplayName Gen1 called if that doesn't
+resolve (see `RESOLVED_FUNCTION_CPP_NAMES`). Whichever JointState (arm or
+base) arrives first/most-recently is cached and combined with the other
+cached one on every forward, so either updating alone still sends a
+complete, correctly-combined array; an absent or too-short JointState for
+either half simply leaves that half of the array at 0.0, same as Gen1
+leaving `self.arm_joints`/`self.base_joints` unpopulated. An empty
+`JointState` (the mock) is handled the same way. This hardcodes one
+chair+arm robot's skeleton-bone layout (the same limitation Gen1 had),
+but it is the layout this specific UE asset actually understands.
 
-This is the source for §5.2.B's "system status" channel (the arm-joints
+This is the source for §5.2.B's "system status" channel (the joints
 portion of it).
 
-**Verified:** a live smoke test (bridge node + a plain publisher node in
-one process) confirmed a populated `JointState` (7 arm joints + gripper)
-forwards with matching names and correctly-converted degree values, and
-that an empty `JointState` (the real shape of `arm_mock`'s own output)
-forwards as empty arrays without error. The jetson's `arm_mock` (sheppy
-node `arm`) has been confirmed running and publishing `/joint_states` on
-the shared robot; the bridge's own deployed copy on that jetson has not
-yet been updated to this session's commit, so end-to-end verification
-against the live mock over the real ROS graph is still pending a
-redeploy (not requested this session).
+**Verified:** `test/test_set_joints_array.py` (5 tests) confirms the
+array-building math -- index offsets, radian→degree conversion, the five
+sign-flipped arm axes, the gripper's open/closed threshold, the
+chair/base's carriage-to-centimeters conversion, and all-zero/partial
+behavior when a JointState is absent or too short -- exactly matches
+Gen1's `set_ui_joints`. End-to-end verification against a live UE
+instance (confirming `SetJoints` resolves and actually animates the
+skeleton) is still pending (needs a live UE connection, not available
+this session).
 
-**Still TBD** (tracked in §7): chair/base speed and status -- a mock
-base driver exists now (`rammp_orchestrator/ros/mock_base_driver_node.py`),
-but it only consumes `rammp_base_interfaces/TwistSetpoint` for
-resource-arbitration purposes (per the engine's `base` lock); it doesn't
-publish any speed/odometry/status telemetry topic, so there's still
-nothing for the bridge to subscribe to and that part of §5.2.B remains
-unimplemented.
+**Still TBD** (tracked in §7): chair/base speed/odometry/fault-status
+*telemetry* (distinct from the joint *positions* now forwarded above) --
+a mock base driver exists now (`rammp_orchestrator/ros/
+mock_base_driver_node.py`), but it only consumes `rammp_base_interfaces/
+TwistSetpoint` for resource-arbitration purposes (per the engine's `base`
+lock); it doesn't publish any speed/odometry/status telemetry topic, so
+there's still nothing for the bridge to subscribe to for that part of
+§5.2.B.
 
 
 ## 4. UI-facing interface (ROS2 server/publisher side)

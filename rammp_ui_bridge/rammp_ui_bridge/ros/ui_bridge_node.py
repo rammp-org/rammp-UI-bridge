@@ -37,16 +37,19 @@ Note: the Gen1 prototype GUI bridge (``rammp_prototype_gui.Gui_bridge``)
 also streamed camera images/depth/masks to UE and mapped real robot joint
 states into a UE skeleton (§5.2.A/B here), via a hardcoded 53-element
 float array keyed by fixed skeleton-bone indices for its specific
-chair+arm hardware (``set_ui_joints``). This node does **not** carry that
-scheme forward -- §3.4/§5.2.B instead forwards every ``sensor_msgs/msg/
-JointState`` arriving on ``arm_joint_states_topic`` (default
-``/joint_states``) through **by name**, not by a hardcoded index layout
-(see ``_on_arm_joint_states``/``_forward_arm_joint_states``), so it needs
-no bridge-side knowledge of which joints exist or in what order -- UE's
-own blueprint maps each joint name to its skeleton bone. This is the only
-mock/real hardware node this bridge has wired up for §3.4 so far (one
-topic, all of the arm's joints); chair/base telemetry (also part of
-§5.2.B) still has no ROS2-side source. The scene camera (§3.2) also has
+chair+arm hardware (``set_ui_joints``, ``SetJoints``/``setJoints`` Remote
+Control call). This node's §3.4/§5.2.B **does carry that scheme forward**
+(``_build_set_joints_array``/``_forward_set_joints``) -- an earlier
+by-name approach (forwarding every ``sensor_msgs/msg/JointState`` as-is
+and relying on UE's own blueprint to resolve each joint name to its
+skeleton bone) never actually animated anything in UE, so this reverted
+to Gen1's confirmed-working hardcoded index layout instead. Both
+``arm_joint_states_topic`` (default ``/joint_states``) and
+``base_joint_states_topic`` (default ``/base/joint_states``) are
+forwarded this way, combined into one array per Gen1's own layout. This
+is the only mock/real hardware node this bridge has wired up for §3.4 so
+far; chair/base telemetry has no real ROS2-side source yet (only the
+array slot reserved for it). The scene camera (§3.2) also has
 a real source -- this node subscribes directly to its raw color/depth
 topics (see ``_on_scene_camera_color``/``_on_scene_camera_depth``) and
 forwards every frame to UE as the §5.2.A base layer, over the RMSS
@@ -353,16 +356,28 @@ class UiBridgeNode(Node):
         # (arm_mock) publishes this same topic name with empty name/position
         # arrays for wiring, and whose real alternative (kinova_gen3_driver)
         # publishes the Kinova Gen3's 7 arm joints plus the 2F-85 gripper's
-        # own joint. Forwarded to UE by name (_on_arm_joint_states), not a
-        # hardcoded index layout -- see the module docstring.
+        # own joint. Forwarded to UE as a Gen1-compatible 53-element
+        # skeleton-bone index array (see _build_set_joints_array) -- the
+        # by-name UpdateArmJointStates approach this bridge tried first
+        # (resolve-by-joint-name on UE's own blueprint) never actually
+        # animated anything in UE, so this reverts to the Gen1 prototype's
+        # confirmed-working hardcoded index layout instead.
         self.declare_parameter("arm_joint_states_topic", "/joint_states")
+        # Same idea as arm_joint_states_topic, for the chair/base driver's
+        # own JointState (foot control, rotation, left/right drive,
+        # carriage, wheel) -- see Gen1's Gui_bridge.py set_ui_joints, whose
+        # exact index layout _build_set_joints_array replicates. Empty
+        # name/position (no base driver publishing yet) is handled the same
+        # way as an absent arm JointState: that half of the array is simply
+        # left at 0.0.
+        self.declare_parameter("base_joint_states_topic", "/base/joint_states")
         # Throttle how often a JointState is actually forwarded to UE --
         # /joint_states can publish at the driver's own high rate (tens of
-        # Hz), but UpdateArmJointStates is a per-call Remote Control request
-        # (WS round trip + DEBUG log line each time), so forwarding every
-        # single message floods both the network and the log. UE's skeleton
-        # only needs to update fast enough to look smooth to a human, so
-        # default to a modest, bridge-controlled rate; 0 or negative disables
+        # Hz), but SetJoints is a per-call Remote Control request (WS round
+        # trip + DEBUG log line each time), so forwarding every single
+        # message floods both the network and the log. UE's skeleton only
+        # needs to update fast enough to look smooth to a human, so default
+        # to a modest, bridge-controlled rate; 0 or negative disables
         # throttling (forwards every message, the old behavior).
         self.declare_parameter("arm_joint_states_forward_rate_hz", 2.0)
 
@@ -419,11 +434,15 @@ class UiBridgeNode(Node):
         self._engine_overlay_frame_count = 0
 
         # -- arm joint-state telemetry (§3.4/§5.2.B) --------------------------
-        # No "latest frame" buffer/lock needed like the cameras above -- each
-        # JointState is forwarded to UE immediately as a single Remote
-        # Control call (small structured data, not a streamed frame), so
-        # there's nothing to hold between messages except the frame counter
-        # used for throttled logging.
+        # Unlike the cameras above, forwarding needs both the latest arm
+        # JointState and the latest base/chair JointState together (see
+        # _build_set_joints_array) -- so each is cached here (instead of
+        # forwarding immediately alone) and the combined array is rebuilt
+        # and sent whenever either one arrives. A lock since arm/base
+        # subscriptions can run on different executor threads.
+        self._joint_states_lock = threading.Lock()
+        self._latest_arm_joint_state: JointState | None = None
+        self._latest_base_joint_state: JointState | None = None
         self._arm_joint_states_frame_count = 0
         # Last time (time.monotonic()) a JointState was actually forwarded to
         # UE -- see arm_joint_states_forward_rate_hz above/_on_arm_joint_states.
@@ -601,11 +620,19 @@ class UiBridgeNode(Node):
             qos_profile_sensor_data,
             callback_group=self._cb_group,
         )
+        self._base_joint_states_sub = self.create_subscription(
+            JointState,
+            self.get_parameter("base_joint_states_topic").value,
+            self._on_base_joint_states,
+            qos_profile_sensor_data,
+            callback_group=self._cb_group,
+        )
 
         self.get_logger().info(
             f"rammp_ui_bridge ready; bridging UE at "
             f"{self.get_parameter('ue_host').value}; "
-            f"arm joint states='{self.get_parameter('arm_joint_states_topic').value}' -> "
+            f"arm joint states='{self.get_parameter('arm_joint_states_topic').value}', "
+            f"base joint states='{self.get_parameter('base_joint_states_topic').value}' -> "
             f"UE stream port {self.get_parameter('ue_stream_port').value} "
             f"(python camera streaming "
             f"{'enabled' if self._use_python_streaming else 'disabled -- this node does not touch camera topics at all; expects rammp_ui_bridge_streaming to handle them independently'})"
@@ -775,51 +802,132 @@ class UiBridgeNode(Node):
             self.get_logger().warning(f"failed to forward scene camera depth frame to UE: {exc}")
 
     # ------------------------------------------------------------------
-    # Bridge <-> Hardware node (§3.4): arm joint-state telemetry, forwarded
-    # to UE as the §5.2.B system-status channel.
+    # Bridge <-> Hardware node (§3.4): arm + chair/base joint-state
+    # telemetry, forwarded to UE as the §5.2.B system-status channel.
     #
     # Always-on and independent of engine selection (unlike §3.3's
     # per-engine overlay camera) -- the arm driver (or its sheppy mock,
     # arm_mock) publishes sensor_msgs/msg/JointState on a single fixed
-    # topic covering every arm joint, no per-robot topic table needed.
-    # Forwarded by name, not a hardcoded skeleton-bone index array like the
-    # Gen1 prototype's set_ui_joints -- UE's own blueprint resolves each
-    # joint name to its bone. Positions are converted radians -> degrees,
-    # matching Gen1's convention (UE skeletons author joint angles in
-    # degrees). An empty JointState (name=[], position=[]) -- e.g. from
-    # arm_mock, which exists only to keep this topic wired up on a
-    # workstation profile -- forwards as empty arrays; UE is expected to
-    # simply leave the skeleton unchanged when it receives no joints.
+    # topic covering every arm joint, and the chair/base driver (if any)
+    # publishes its own JointState the same way, no per-robot topic table
+    # needed.
+    #
+    # **Reverted design decision**: this bridge previously forwarded
+    # joints by name (`UpdateArmJointStates`, `{"Names": [...],
+    # "PositionsDeg": [...]}`), expecting UE's own blueprint to resolve
+    # each joint name to its skeleton bone -- that never actually animated
+    # anything in UE. `_build_set_joints_array` instead replicates the
+    # Gen1 prototype's confirmed-working `set_ui_joints`
+    # (rammp_prototype_gui/Gui_bridge.py) byte-for-byte: a fixed
+    # 53-element float array keyed to specific skeleton-bone indices,
+    # sent via a `SetJoints` Remote Control call (`{"Values": [...]}`).
+    # This hardcodes one chair+arm robot's skeleton layout (same
+    # limitation Gen1 had), but it is the layout this specific UE asset
+    # actually understands.
     # ------------------------------------------------------------------
+
+    # Gen1's exact index layout (Gui_bridge.py's set_ui_joints) -- comments
+    # match Gen1's own.
+    _SET_JOINTS_ARRAY_LEN = 53
+    _ARM_JOINT_INDEX_OFFSET = 46  # index for link 0
+    _ARM_GRIPPER_JOINT_LEFT_INDEX = 38  # index for left gripper joint
+    _ARM_GRIPPER_JOINT_RIGHT_INDEX = 40  # index for right gripper joint
+    _CHAIR_FC_JOINT_INDEX = 16  # index for chair foot control joint
+    _CHAIR_RC_JOINT_INDEX = 25  # index for chair rotation control joint
+    _CHAIR_ML_JOINT_INDEX = 1  # index for chair movement control joint
+    _CHAIR_MR_JOINT_INDEX = 8  # index for chair movement control joint
+    _CHAIR_ML_CARRIAGE_INDEX = 0  # index for chair movement carriage joint
+    _CHAIR_MR_CARRIAGE_INDEX = 4  # index for chair movement carriage joint
+    _CHAIR_ML_WHEEL_INDEX = 2  # index for chair movement wheel joint
+    _CHAIR_MR_WHEEL_INDEX = 9  # index for chair movement wheel joint
+
+    @classmethod
+    def _build_set_joints_array(
+        cls, arm_joints: JointState | None, base_joints: JointState | None
+    ) -> list[float]:
+        """The Gen1-compatible 53-element float array `SetJoints` sends,
+        built the same way Gen1's `set_ui_joints` did: a fixed index per
+        skeleton bone, radians converted to degrees (some arm joints
+        sign-flipped -- Gen1's skeleton authors a few axes mirrored from
+        the driver's own convention), the gripper's single open/close
+        joint mapped to each finger's own +/-45deg bone, and the
+        chair/base's carriage joints converted to centimeters instead of
+        degrees. Returns an all-zero array when the corresponding
+        JointState is ``None`` or doesn't have enough positions -- same as
+        Gen1 leaving those entries untouched (0.0) when its own
+        `self.arm_joints`/`self.base_joints` weren't populated yet."""
+        arr = [0.0] * cls._SET_JOINTS_ARRAY_LEN
+        if arm_joints is not None and len(arm_joints.position) >= 8:
+            offset = cls._ARM_JOINT_INDEX_OFFSET
+            for i in range(7):  # only the first 7 joints are the arm's own
+                arr[offset + i] = arm_joints.position[i] * 180.0 / math.pi
+            arr[offset + 0] = -arr[offset + 0]
+            arr[offset + 2] = -arr[offset + 2]
+            arr[offset + 4] = -arr[offset + 4]
+            arr[offset + 5] = -arr[offset + 5]
+            arr[offset + 6] = -arr[offset + 6]
+            # the 8th joint is the gripper, 1 is close and 0 is open; set
+            # each finger's own bone angle to 0 or 45 for close/open.
+            gripper_closed = arm_joints.position[7] > 0.9
+            arr[cls._ARM_GRIPPER_JOINT_LEFT_INDEX] = 0.0 if gripper_closed else -45.0
+            arr[cls._ARM_GRIPPER_JOINT_RIGHT_INDEX] = 0.0 if gripper_closed else 45.0
+        if base_joints is not None and len(base_joints.position) >= 8:
+            p = base_joints.position
+            arr[cls._CHAIR_FC_JOINT_INDEX] = p[0] * 180.0 / math.pi
+            arr[cls._CHAIR_RC_JOINT_INDEX] = p[1] * 180.0 / math.pi
+            arr[cls._CHAIR_MR_JOINT_INDEX] = p[2] * 180.0 / math.pi
+            arr[cls._CHAIR_ML_JOINT_INDEX] = p[3] * 180.0 / math.pi
+            arr[cls._CHAIR_ML_CARRIAGE_INDEX] = p[4] * 100.0  # to cm
+            arr[cls._CHAIR_MR_CARRIAGE_INDEX] = p[5] * 100.0  # to cm
+            arr[cls._CHAIR_ML_WHEEL_INDEX] = p[6] * 180.0 / math.pi
+            arr[cls._CHAIR_MR_WHEEL_INDEX] = p[7] * 180.0 / math.pi
+        return arr
+
     def _on_arm_joint_states(self, msg: JointState) -> None:
+        with self._joint_states_lock:
+            self._latest_arm_joint_state = msg
         self._arm_joint_states_frame_count += 1
         count = self._arm_joint_states_frame_count
         if count == 1 or count % 100 == 0:
             self.get_logger().info(
                 f"arm joint states: frame #{count} ({len(msg.name)} joint(s))"
             )
+        self._maybe_forward_set_joints()
+
+    def _on_base_joint_states(self, msg: JointState) -> None:
+        with self._joint_states_lock:
+            self._latest_base_joint_state = msg
+        self._maybe_forward_set_joints()
+
+    def _maybe_forward_set_joints(self) -> None:
         # Throttle the actual UE forward -- see arm_joint_states_forward_rate_hz's
         # declare_parameter comment above. rate_hz <= 0 disables throttling
-        # (forwards every message, the old unthrottled behavior).
+        # (forwards every message, the old unthrottled behavior). Shared
+        # by both arm and base callbacks, so either one arriving can
+        # trigger a forward, but never faster than this combined rate.
         rate_hz = self.get_parameter("arm_joint_states_forward_rate_hz").value
         if rate_hz > 0:
             now = time.monotonic()
             if now - self._last_arm_joint_states_forward_time < (1.0 / rate_hz):
                 return
             self._last_arm_joint_states_forward_time = now
-        self._forward_arm_joint_states(msg)
+        with self._joint_states_lock:
+            arm_joints = self._latest_arm_joint_state
+            base_joints = self._latest_base_joint_state
+        self._forward_set_joints(arm_joints, base_joints)
 
-    def _forward_arm_joint_states(self, msg: JointState) -> None:
+    def _forward_set_joints(
+        self, arm_joints: JointState | None, base_joints: JointState | None
+    ) -> None:
         if not self.ue.is_connected():
             return
         try:
-            positions_deg = [p * 180.0 / math.pi for p in msg.position]
-            self.ue.call_function(
-                "UpdateArmJointStates",
-                {"Names": list(msg.name), "PositionsDeg": positions_deg},
+            values = self._build_set_joints_array(arm_joints, base_joints)
+            self.ue.call_resolved_function(
+                "SetJoints", {"Values": values}, fallback_display_name="setJoints"
             )
         except (RuntimeError, OSError) as exc:
-            self.get_logger().warning(f"failed to forward arm joint states to UE: {exc}")
+            self.get_logger().warning(f"failed to forward joint states to UE: {exc}")
 
     # ------------------------------------------------------------------
     # Bridge <-> Engine node (§3.3.1): a single shared overlay-camera topic,
