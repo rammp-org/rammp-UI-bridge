@@ -24,14 +24,18 @@ logger = logging.getLogger(__name__)
 # this module runs on its own background thread inside ui_bridge_node, which
 # never configures Python's stdlib logging itself, so without a handler here
 # these .debug() calls would be silently dropped by the logging module's
-# WARNING-level "handler of last resort". Attach our own handler + force
-# DEBUG so this traffic is visible by default when running the bridge.
+# WARNING-level "handler of last resort". Attach our own handler here so this
+# traffic *can* be seen, but default the level to INFO (quiet) -- every
+# call_function()/poll response used to log at DEBUG unconditionally, which
+# floods the console at a high-frequency poll/forward rate. ui_bridge_node
+# raises this back to DEBUG at startup via its own ue_log_level parameter
+# when per-call WS traffic needs to be inspected.
 if not logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(asctime)s [%(name)s] %(levelname)s: %(message)s"))
     logger.addHandler(_handler)
     logger.propagate = False
-logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
 
 
 class UnrealRemoteError(Exception):
@@ -50,7 +54,14 @@ UserInputCallback = Callable[[str], None]
 # renameable from the Remote Control UI, so it's the stable key to match
 # against.
 RESOLVED_FUNCTION_CPP_NAMES = frozenset(
-    {"UpdateDetectedObjects", "UpdateWorldState", "PollUIEvents", "UpdatePanel"}
+    {
+        "UpdateDetectedObjects",
+        "UpdateWorldState",
+        "PollUIEvents",
+        "UpdatePanel",
+        "OpenCameraFeed",
+        "CloseCameraFeed",
+    }
 )
 
 

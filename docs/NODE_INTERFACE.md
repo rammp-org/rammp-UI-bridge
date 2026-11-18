@@ -205,13 +205,33 @@ string request_json
 #     "objects": [                # optional, default [] -- candidate objects the user can tap
 #                                # (on the scene camera for the Orchestrator's own browse
 #                                # session, or on the calling engine's own overlay stream,
-#                                # §3.3.1); omitted/[] if this request is panel-only
+#                                # §3.3.1); key omitted entirely if this request is panel-only
+#                                # (leave previously-pushed objects untouched) -- an explicit
+#                                # "objects": [] instead actively clears whatever was last
+#                                # shown (e.g. the Orchestrator's own browse session pushes
+#                                # "objects": [] on boot when no engine has registered any
+#                                # perception class yet, so UE doesn't keep showing stale
+#                                # detections left over from a previous run)
 #       {"instance_id": str, "perception_class": str, "box": [x_min, y_min, x_max, y_max],
 #        "centroid": [x, y],     # optional -- tap-marker point; derived from box's center
 #                                # if omitted, see docs/USER_INPUT_JSON_SCHEMA.md §3
+#        "box_norm": [x_min, y_min, x_max, y_max],   # optional -- box normalized to a 0-1
+#                                # fraction of the source image's width/height (from
+#                                # ObjectDetections.label_image, scene-camera objects only).
+#                                # Additive, not currently consumed by the bridge/UE -- the
+#                                # pixel-space "box" above remains the one forwarded to UE.
+#        "centroid_norm": [x, y], # box_norm's center, same normalization
 #        "source": str}         # "scene" or "overlay" -- which video channel `box` is
 #                                # relative to, see §5.2.D
 #     ],
+#     "stream_id": str,          # optional -- overrides the top-level stream_id the bridge
+#                                # would otherwise infer from objects' own "source" fields
+#                                # (§5.2.D); only needed/consulted when "objects" is empty or
+#                                # mixes sources, since there's then nothing (or no single
+#                                # thing) to infer from. The Orchestrator's own browse
+#                                # session always sends "scene" here (its objects are always
+#                                # scene-sourced), so even its boot-time "objects": [] push
+#                                # tells UE which overlay to clear.
 #     "selected_instance_id": str  # optional, default "" -- one of objects' instance_id to
 #                                # show as already highlighted when the goal starts
 #   }
@@ -249,6 +269,9 @@ string request_json
 #       {"instance_id": str, "perception_class": str, "box": [x_min, y_min, x_max, y_max],
 #        "centroid": [x, y], "source": str}
 #     ],
+#     "stream_id": str,          # optional -- same override as RequestUserInput's own
+#                                # "stream_id" above, iff present; persists across later
+#                                # calls that omit it, until a later call overrides it again
 #     "selected_instance_id": str  # highlight this instance_id ("" clears), iff present
 #   }
 ---
@@ -273,11 +296,18 @@ Bridge behavior while a goal is active:
    `InteractionPanel` channel (§5.2.C) immediately -- this **takes over**
    whatever was previously shown there, reverting only once a new
    panel is pushed (by this goal, or by whoever's goal opens next).
-2. If `request_json`'s `objects` is non-empty, push them to UE's
-   `UpdateDetectedObjects` channel (§5.2.D) along with
-   `selected_instance_id` (initially `request_json`'s own
+2. If `request_json` includes an `objects` key at all (even an empty
+   list), push it to UE's `UpdateDetectedObjects` channel (§5.2.D) along
+   with `selected_instance_id` (initially `request_json`'s own
    `selected_instance_id`), exactly like any other detected-objects push
-   -- tappable the same way.
+   -- tappable the same way. An empty list is a legitimate, intentional
+   push (e.g. the Orchestrator's own browse session on boot when no
+   engine has registered any perception class yet) that clears whatever
+   UE last displayed; only a genuinely **omitted** `objects` key means
+   "panel-only, leave objects untouched." The push's top-level
+   `stream_id` is the caller's explicit `stream_id` hint if given,
+   otherwise inferred from `objects`' own `source` fields (empty string
+   if `objects` is empty or mixes sources and no hint was given).
 3. **An object tap does not complete the goal.** The user may tap
    several different candidates in a row while deciding; each tap is
    reported to the caller as an `{"event_type": "object_tapped", ...}`
@@ -936,15 +966,31 @@ Mechanics (`_push_engine_objects` in the reference implementation):
    components -- a plain array is rejected outright (confirmed live
    against a real UE instance: `"Unable to import JSON value that is
    neither string nor object into Vector4 property box"`). `centroid` is
-   `{"X": (x_min+x_max)/2, "Y": (y_min+y_max)/2}` in the same pixel space
-   as `box` -- the caller-supplied value if present, otherwise derived
-   from `box` by the bridge itself.
+   `{"X": (x_min+x_max)/2, "Y": (y_min+y_max)/2}` in the same space as
+   `box` -- the caller-supplied value if present, otherwise derived
+   from `box` by the bridge itself. **Normalization:** when the caller
+   supplies `"box_norm"`/`"centroid_norm"` (0-1 fraction of the source
+   image's width/height, e.g. the Orchestrator's scene-camera objects,
+   computed from `ObjectDetections.label_image`'s dimensions), the bridge
+   forwards *those* as `box`/`centroid` instead of the pixel-space
+   values -- so UE receives resolution-independent coordinates for any
+   object that has them. Falls back to the legacy pixel-space
+   `box`/`centroid` unchanged for objects that don't carry a
+   `box_norm` (e.g. an engine's own overlay-camera objects, which have
+   no associated image size to normalize against).
 4. `selected_instance_id` is sent inside the same JSON payload as
    `objects` on every push, reflecting the goal's current
    `selected_instance_id` (§3.1.1).
-5. `stream_id` is the top-level source of the whole push -- `"scene"`/
-   `"overlay"` when every object in the push shares one source, `""` if
-   they're mixed or there are none. UE's `OnDetectedObjectsJson` delegate
+5. `stream_id` is the top-level source of the whole push -- the caller's
+   explicit `request_json`/`update`'s `"stream_id"` hint (§3.1.1) if
+   given, otherwise `"scene"`/`"overlay"` when every object in the push
+   shares one source, `""` if they're mixed, there are none, and no hint
+   was given (e.g. a plain panel-only engine that's never sent any
+   objects at all). The explicit hint exists specifically for an empty
+   `objects` push (nothing to infer a source from) whose caller still
+   knows which stream it represents -- the Orchestrator's own browse
+   session always hints `"scene"`, even when clearing the screen.
+   UE's `OnDetectedObjectsJson` delegate
    has no per-object notion of source, only this single top-level field
    -- each object's own `source` key is still included too, for forward
    compatibility, but UE's current widget only needs the top-level one.

@@ -129,7 +129,7 @@ if not _stream_logger.handlers:
     )
     _stream_logger.addHandler(_stream_handler)
     _stream_logger.propagate = False
-_stream_logger.setLevel(logging.DEBUG)
+    _stream_logger.setLevel(logging.INFO)
 
 # §5.2.A base-layer camera stream: fixed RMSS channel numbers + stream IDs for
 # the scene camera's two layers (one bridge, one scene camera -- no per-robot
@@ -150,6 +150,8 @@ _OVERLAY_STREAM_GROUP = "overlay"
 # ROS sensor_msgs/Image depth encodings this bridge knows how to forward
 # as-is (uint16 mm, no conversion) -- see StreamSender.send_depth_uint16.
 _UINT16_DEPTH_ENCODINGS = frozenset({"16UC1", "mono16"})
+
+
 
 # Plain best-effort sensor-data QoS for all inbound sensor-ish topics below
 # (scene camera color/depth, engine overlay, arm joint states) -- every
@@ -264,6 +266,17 @@ class UiBridgeNode(Node):
         self.declare_parameter("ue_host", "127.0.0.1")
         self.declare_parameter("ue_ws_port", 30020)
         self.declare_parameter("ue_preset", "RCP_RammsBridge")
+        # Controls the unreal_remote_websocket/ramms_tools.streaming loggers'
+        # level (see their own module docstrings/comments) -- both default to
+        # INFO on import to stay quiet; set this to "DEBUG" (e.g.
+        # `-p ue_log_level:=DEBUG`) to see every WS send/receive (every
+        # call_function(...), every poll response) when diagnosing the UE
+        # link itself.
+        self.declare_parameter("ue_log_level", "INFO")
+        ue_log_level_name = str(self.get_parameter("ue_log_level").value).upper()
+        ue_log_level = getattr(logging, ue_log_level_name, logging.INFO)
+        logging.getLogger("rammp_ui_bridge.unreal_remote_websocket").setLevel(ue_log_level)
+        logging.getLogger("ramms_tools.streaming").setLevel(ue_log_level)
         # Confirmed with the UI team: their Blueprint exposes inbound
         # command JSON through a preset property labeled "LastUIEventJSON"
         # (not this bridge's originally-documented "UserInput").
@@ -343,6 +356,15 @@ class UiBridgeNode(Node):
         # own joint. Forwarded to UE by name (_on_arm_joint_states), not a
         # hardcoded index layout -- see the module docstring.
         self.declare_parameter("arm_joint_states_topic", "/joint_states")
+        # Throttle how often a JointState is actually forwarded to UE --
+        # /joint_states can publish at the driver's own high rate (tens of
+        # Hz), but UpdateArmJointStates is a per-call Remote Control request
+        # (WS round trip + DEBUG log line each time), so forwarding every
+        # single message floods both the network and the log. UE's skeleton
+        # only needs to update fast enough to look smooth to a human, so
+        # default to a modest, bridge-controlled rate; 0 or negative disables
+        # throttling (forwards every message, the old behavior).
+        self.declare_parameter("arm_joint_states_forward_rate_hz", 2.0)
 
         self._cb_group = ReentrantCallbackGroup()
 
@@ -403,6 +425,9 @@ class UiBridgeNode(Node):
         # there's nothing to hold between messages except the frame counter
         # used for throttled logging.
         self._arm_joint_states_frame_count = 0
+        # Last time (time.monotonic()) a JointState was actually forwarded to
+        # UE -- see arm_joint_states_forward_rate_hz above/_on_arm_joint_states.
+        self._last_arm_joint_states_forward_time = 0.0
 
         # -- ui-control arbitration state (§3.3.1/§3.3.2) ----------------------
         # This node is the arbitration *server* for the "UI control"
@@ -773,6 +798,15 @@ class UiBridgeNode(Node):
             self.get_logger().info(
                 f"arm joint states: frame #{count} ({len(msg.name)} joint(s))"
             )
+        # Throttle the actual UE forward -- see arm_joint_states_forward_rate_hz's
+        # declare_parameter comment above. rate_hz <= 0 disables throttling
+        # (forwards every message, the old unthrottled behavior).
+        rate_hz = self.get_parameter("arm_joint_states_forward_rate_hz").value
+        if rate_hz > 0:
+            now = time.monotonic()
+            if now - self._last_arm_joint_states_forward_time < (1.0 / rate_hz):
+                return
+            self._last_arm_joint_states_forward_time = now
         self._forward_arm_joint_states(msg)
 
     def _forward_arm_joint_states(self, msg: JointState) -> None:
@@ -920,12 +954,17 @@ class UiBridgeNode(Node):
         # in-engine), not a bridge-side stream gate -- the overlay camera
         # frames keep flowing to _forward_engine_overlay_color regardless;
         # these two parameterless UFUNCTIONs are what actually show/hide it.
-        function_name = "Open Camera Feed" if request.visible else "Close Camera Feed"
+        # Calling by hardcoded DisplayName (as this used to) silently does
+        # nothing once the UI team renames the DisplayName in UE -- resolve
+        # by the stable UFUNCTION/C++ name instead, same as the other four
+        # bridge functions (see RESOLVED_FUNCTION_CPP_NAMES).
+        cpp_name = "OpenCameraFeed" if request.visible else "CloseCameraFeed"
+        fallback_display_name = "Open Camera Feed" if request.visible else "Close Camera Feed"
         self.get_logger().info(
             f"engine overlay {'show' if request.visible else 'hide'} requested by '{owner_id}' "
-            f"-- calling UE Remote Control function '{function_name}'"
+            f"-- calling UE Remote Control function '{cpp_name}'"
         )
-        self.ue.call_function(function_name, {})
+        self.ue.call_resolved_function(cpp_name, {}, fallback_display_name=fallback_display_name)
         response.accepted = True
         response.message = ""
         self.get_logger().info(
@@ -1145,7 +1184,7 @@ class UiBridgeNode(Node):
         return [(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0]
 
     def _push_engine_objects(
-        self, objects: list[dict[str, Any]], selected_instance_id: str
+        self, objects: list[dict[str, Any]], selected_instance_id: str, stream_id: str = ""
     ) -> None:
         """Pushes an engine's ``RequestUserInput`` candidate objects to UE's
         ``UpdateDetectedObjects`` channel, along with the currently-
@@ -1154,11 +1193,21 @@ class UiBridgeNode(Node):
         ``objects`` is already a list of plain dicts (parsed from
         ``request_json``), not ROS messages. Each object's own ``source``
         key (``"scene"``/``"overlay"``, caller-supplied) is passed through
-        as-is so UE knows which video channel the box's pixel coordinates
-        are relative to -- the bridge does not infer or default this from
-        ``engine_id``, since one goal's objects can mix both sources."""
+        as-is so UE knows which video channel the box's coordinates are
+        relative to -- the bridge does not infer or default this from
+        ``engine_id``, since one goal's objects can mix both sources.
+
+        ``stream_id``, if given, overrides the inferred top-level
+        ``stream_id`` below -- needed because an *empty* ``objects`` list
+        (e.g. the Orchestrator clearing the screen when no engine has
+        registered any perception class) has no objects to infer a source
+        from, but the caller still knows which stream it would have been
+        (the Orchestrator's own browse session is always scene-sourced) and
+        UE needs that ``stream_id`` to know which overlay to actually
+        clear."""
         def _to_ue_object(o: dict[str, Any]) -> dict[str, Any]:
             box = list(o.get("box", (0.0, 0.0, 0.0, 0.0)))
+            centroid = self._object_centroid(o, box)
             return {
                 "instance_id": o.get("instance_id", ""),
                 "perception_class": o.get("perception_class", ""),
@@ -1178,7 +1227,7 @@ class UiBridgeNode(Node):
                 # applies to FDetectedObject.centroid (an FVector2D) --
                 # sent as {"X":.., "Y":..} rather than a bare [x, y] array
                 # for the same reason as box above.
-                "centroid": dict(zip("XY", self._object_centroid(o, box))),
+                "centroid": dict(zip("XY", centroid)),
                 "source": o.get("source", ""),
             }
 
@@ -1189,9 +1238,13 @@ class UiBridgeNode(Node):
         # {stream_id, selected_instance_id, objects} JSON payload -- there
         # is no per-push notion of "mixed streams" on UE's side). Left ""
         # when objects mix sources or there are none; each object's own
-        # "source" key is still included for forward-compatibility.
+        # "source" key is still included for forward-compatibility. The
+        # caller-supplied ``stream_id`` argument (see this method's own
+        # docstring) takes precedence when given, so an empty-objects
+        # clearing push still tells UE which stream to clear.
         sources = {o["source"] for o in ue_objects if o["source"]}
-        stream_id = sources.pop() if len(sources) == 1 else ""
+        inferred_stream_id = sources.pop() if len(sources) == 1 else ""
+        stream_id = stream_id or inferred_stream_id
 
         # UE's UpdatePanel/UpdateDetectedObjects functions
         # (RammsBridgeReceiver.h) each take exactly one FString parameter
@@ -1239,6 +1292,7 @@ class UiBridgeNode(Node):
         panel_json = request.get("panel_json") or ""
         objects = request.get("objects") or []
         selected_instance_id = request.get("selected_instance_id") or ""
+        stream_id = request.get("stream_id") or ""
         button_ids = panel_button_ids(panel_json)
         object_ids = frozenset(o.get("instance_id", "") for o in objects)
         done_event = threading.Event()
@@ -1250,6 +1304,7 @@ class UiBridgeNode(Node):
             "object_ids": object_ids,
             "objects": list(objects),
             "selected_instance_id": selected_instance_id,
+            "stream_id": stream_id,
             "event": done_event,
             "result": {
                 "status": "cancelled",
@@ -1268,8 +1323,16 @@ class UiBridgeNode(Node):
             self.ue.call_resolved_function(
                 "UpdatePanel", {"PanelJSON": panel_json}, fallback_display_name="Update Panel"
             )
-        if objects:
-            self._push_engine_objects(objects, selected_instance_id)
+        if "objects" in request:
+            # An explicit (possibly empty) "objects" key means the caller
+            # is actively declaring the candidate-object list -- including
+            # an empty list, e.g. the Orchestrator's own browse session at
+            # boot when no engine has registered any perception class yet
+            # -- and must be pushed so UE clears any stale overlay from a
+            # previous goal/process. A genuinely omitted key (not present
+            # in the request at all) still means "panel-only, don't touch
+            # objects" and is left alone.
+            self._push_engine_objects(objects, selected_instance_id, stream_id)
 
         try:
             while not done_event.is_set():
@@ -1339,6 +1402,7 @@ class UiBridgeNode(Node):
         update_panel = "panel_json" in update
         update_objects = "objects" in update
         update_selected = "selected_instance_id" in update
+        update_stream_id = "stream_id" in update
 
         with self._active_input_lock:
             state = self._active_input_goal
@@ -1354,8 +1418,11 @@ class UiBridgeNode(Node):
                 state["object_ids"] = frozenset(o.get("instance_id", "") for o in objects)
             if update_selected:
                 state["selected_instance_id"] = update["selected_instance_id"]
+            if update_stream_id:
+                state["stream_id"] = update["stream_id"] or ""
             objects = state["objects"]
             selected_instance_id = state["selected_instance_id"]
+            stream_id = state.get("stream_id") or ""
 
         if update_panel:
             # Auto-resolved against UnderlyingFunction.Name "UpdatePanel"
@@ -1367,8 +1434,8 @@ class UiBridgeNode(Node):
                 {"PanelJSON": update["panel_json"]},
                 fallback_display_name="Update Panel",
             )
-        if update_objects or update_selected:
-            self._push_engine_objects(objects, selected_instance_id)
+        if update_objects or update_selected or update_stream_id:
+            self._push_engine_objects(objects, selected_instance_id, stream_id)
 
         response.accepted = True
         response.message = ""

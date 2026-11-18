@@ -29,6 +29,8 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -139,6 +141,39 @@ StreamMeta::Extrinsics tf_to_ue_extrinsics(
   return extrinsics;
 }
 
+// Synthetic placeholder intrinsics (§7 fallback) -- a simple pinhole model
+// assuming square pixels and the given horizontal FOV, principal point at
+// the image center. Only ever used when no real CameraInfo has arrived
+// yet; clearly logged as "FAKE" wherever reported (see on_scene_depth) so
+// it's never mistaken for an actual calibration.
+StreamMeta::Intrinsics fake_intrinsics(uint32_t width, uint32_t height, double hfov_deg)
+{
+  const double hfov_rad = hfov_deg * M_PI / 180.0;
+  const double fx = static_cast<double>(width) / (2.0 * std::tan(hfov_rad / 2.0));
+  StreamMeta::Intrinsics intrinsics;
+  intrinsics.fx = fx;
+  intrinsics.fy = fx;  // square pixels assumption
+  intrinsics.cx = static_cast<double>(width) / 2.0;
+  intrinsics.cy = static_cast<double>(height) / 2.0;
+  return intrinsics;
+}
+
+// Synthetic placeholder extrinsics (§7 fallback) -- identity pose (camera
+// coincident with tf_base_frame_), used only when no real TF transform has
+// ever resolved. Same "clearly logged as FAKE" caveat as fake_intrinsics().
+StreamMeta::Extrinsics fake_extrinsics()
+{
+  StreamMeta::Extrinsics extrinsics;
+  extrinsics.x = 0.0;
+  extrinsics.y = 0.0;
+  extrinsics.z = 0.0;
+  extrinsics.roll = 0.0;
+  extrinsics.pitch = 0.0;
+  extrinsics.yaw = 0.0;
+  extrinsics.space = "relative";
+  return extrinsics;
+}
+
 TokenArray mint_token()
 {
   // Not cryptographic-grade, just needs to be unguessable enough to tell
@@ -190,6 +225,17 @@ public:
       "scene_camera_depth_camera_info_topic", "/scene_camera/depth/camera_info");
     this->declare_parameter<std::string>("tf_base_frame", "base_link");
     this->declare_parameter<std::string>("scene_camera_tf_frame", "scene_camera");
+    // Fallback depth intrinsics/extrinsics (§7) -- when no real
+    // CameraInfo/TF has resolved yet (e.g. a mock/test publisher with no
+    // calibration or TF tree), send clearly-synthetic placeholder values
+    // instead of omitting the fields entirely, so UE always has *some*
+    // 3D-placement metadata to test its reprojection path against. Off by
+    // default is not an option here -- this is purely a test/dev
+    // convenience; disable via use_fake_depth_metadata_fallback:=false once
+    // real calibration/TF is wired up, so stale fake data is never
+    // mistaken for a real reading.
+    this->declare_parameter<bool>("use_fake_depth_metadata_fallback", true);
+    this->declare_parameter<double>("fake_intrinsics_hfov_deg", 60.0);
     // Raw, direct subscription -- same shared topic every engine with its
     // own camera publishes to and the one ui_bridge_node also subscribes to
     // (when use_python_camera_streaming is True). This node runs its own
@@ -208,6 +254,9 @@ public:
 
     tf_base_frame_ = this->get_parameter("tf_base_frame").as_string();
     scene_camera_tf_frame_ = this->get_parameter("scene_camera_tf_frame").as_string();
+    use_fake_depth_metadata_fallback_ =
+      this->get_parameter("use_fake_depth_metadata_fallback").as_bool();
+    fake_intrinsics_hfov_deg_ = this->get_parameter("fake_intrinsics_hfov_deg").as_double();
     // Zero-ROS-node-argument constructor: creates its own internal node +
     // dedicated executor thread, independent of this node's own
     // single-threaded rclcpp::spin() in main().
@@ -343,6 +392,16 @@ private:
 
   void on_scene_color(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
   {
+    const uint64_t frame_num = ++scene_color_frame_count_;
+    if (frame_num == 1 || frame_num % 100 == 0) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "scene color frame #%lu: channel=%u stream_id='%s' group='%s' %ux%u fmt='%s' "
+        "data_bytes=%zu connected=%s",
+        static_cast<unsigned long>(frame_num), kSceneColorChannel, kSceneColorStreamId,
+        kSceneGroup, msg->width, msg->height, msg->encoding.c_str(), msg->data.size(),
+        sender_->is_connected() ? "true" : "false");
+    }
     if (!sender_->is_connected()) {
       return;
     }
@@ -363,15 +422,13 @@ private:
 
   void on_scene_depth(const sensor_msgs::msg::Image::ConstSharedPtr & msg)
   {
-    if (!sender_->is_connected()) {
-      return;
-    }
     // §7: attach this depth frame's own intrinsics (from its CameraInfo)
     // and the scene camera's extrinsics (TF pose relative to tf_base_frame_)
     // so UE can reproject depth pixels into world space. Both are
     // best-effort -- a frame is still forwarded (bare depth, no 3D
     // placement) if either hasn't resolved yet.
     std::optional<StreamMeta::Intrinsics> intrinsics;
+    bool intrinsics_is_fake = false;
     {
       std::lock_guard<std::mutex> lock(camera_info_mutex_);
       if (latest_scene_depth_camera_info_) {
@@ -379,7 +436,47 @@ private:
         intrinsics = StreamMeta::Intrinsics{k[0], k[4], k[2], k[5]};
       }
     }
-    const std::optional<StreamMeta::Extrinsics> transform = lookup_scene_camera_extrinsics();
+    std::optional<StreamMeta::Extrinsics> transform = lookup_scene_camera_extrinsics();
+    bool transform_is_fake = false;
+    if (use_fake_depth_metadata_fallback_) {
+      if (!intrinsics) {
+        intrinsics = fake_intrinsics(msg->width, msg->height, fake_intrinsics_hfov_deg_);
+        intrinsics_is_fake = true;
+      }
+      if (!transform) {
+        transform = fake_extrinsics();
+        transform_is_fake = true;
+      }
+    }
+
+    const uint64_t frame_num = ++scene_depth_frame_count_;
+    if (frame_num == 1 || frame_num % 100 == 0) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "scene depth frame #%lu: channel=%u stream_id='%s' group='%s' %ux%u encoding='%s' "
+        "data_bytes=%zu intrinsics=%s transform=%s connected=%s",
+        static_cast<unsigned long>(frame_num), kSceneDepthChannel, kSceneDepthStreamId,
+        kSceneGroup, msg->width, msg->height, msg->encoding.c_str(), msg->data.size(),
+        intrinsics ? (intrinsics_is_fake ? "FAKE" : "present") : "MISSING",
+        transform ? (transform_is_fake ? "FAKE" : "present") : "MISSING",
+        sender_->is_connected() ? "true" : "false");
+      if (intrinsics) {
+        RCLCPP_INFO(
+          this->get_logger(), "  intrinsics: fx=%.3f fy=%.3f cx=%.3f cy=%.3f",
+          intrinsics->fx, intrinsics->fy, intrinsics->cx, intrinsics->cy);
+      }
+      if (transform) {
+        RCLCPP_INFO(
+          this->get_logger(),
+          "  transform (%s): x=%.3f y=%.3f z=%.3f roll=%.3f pitch=%.3f yaw=%.3f",
+          transform->space.c_str(), transform->x, transform->y, transform->z,
+          transform->roll, transform->pitch, transform->yaw);
+      }
+    }
+
+    if (!sender_->is_connected()) {
+      return;
+    }
 
     try {
       if (is_uint16_depth_encoding(msg->encoding)) {
@@ -461,10 +558,20 @@ private:
       return;
     }
 
+    const auto & image = msg->image;
+    const uint64_t frame_num = ++overlay_frame_count_;
+    if (frame_num == 1 || frame_num % 100 == 0) {
+      RCLCPP_INFO(
+        this->get_logger(),
+        "overlay frame #%lu: channel=%u stream_id='%s' group='%s' %ux%u fmt='%s' "
+        "data_bytes=%zu connected=%s",
+        static_cast<unsigned long>(frame_num), kOverlayColorChannel, kOverlayColorStreamId,
+        kOverlayGroup, image.width, image.height, image.encoding.c_str(), image.data.size(),
+        sender_->is_connected() ? "true" : "false");
+    }
     if (!sender_->is_connected()) {
       return;
     }
-    const auto & image = msg->image;
     StreamMeta meta;
     meta.group = kOverlayGroup;
     meta.role = "color";
@@ -515,12 +622,22 @@ private:
   // §7 depth intrinsics/extrinsics state.
   std::string tf_base_frame_;
   std::string scene_camera_tf_frame_;
+  bool use_fake_depth_metadata_fallback_{true};
+  double fake_intrinsics_hfov_deg_{60.0};
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
   std::mutex camera_info_mutex_;
   sensor_msgs::msg::CameraInfo::ConstSharedPtr latest_scene_depth_camera_info_;
   std::mutex extrinsics_mutex_;
   std::optional<StreamMeta::Extrinsics> last_scene_extrinsics_;
+
+  // Per-stream frame counters, logged (first frame + every 100th) so a
+  // frame's exact outgoing header/metadata can be checked against what UE
+  // actually receives when diagnosing a "connected but UE renders nothing"
+  // report.
+  std::atomic<uint64_t> scene_color_frame_count_{0};
+  std::atomic<uint64_t> scene_depth_frame_count_{0};
+  std::atomic<uint64_t> overlay_frame_count_{0};
 
   rclcpp::Service<rammp_common_interfaces::srv::AcquireControl>::SharedPtr acquire_control_srv_;
   rclcpp::Service<rammp_common_interfaces::srv::ReleaseControl>::SharedPtr release_control_srv_;

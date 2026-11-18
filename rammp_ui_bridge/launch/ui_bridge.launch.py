@@ -28,6 +28,15 @@ def generate_launch_description():
                 description="UE Remote Control preset name to register against",
             ),
             DeclareLaunchArgument(
+                "ue_log_level",
+                default_value="INFO",
+                description=(
+                    "Log level for the UE WebSocket traffic/streaming-connection "
+                    "loggers (unreal_remote_websocket, ramms_tools.streaming); "
+                    "set to DEBUG to see every WS send/receive"
+                ),
+            ),
+            DeclareLaunchArgument(
                 "scene_camera_color_topic",
                 default_value="/scene_camera/color/image_raw",
                 description="Scene camera's raw color image topic (§3.2)",
@@ -78,6 +87,16 @@ def generate_launch_description():
                     "forwarding every frame to UE twice"
                 ),
             ),
+            DeclareLaunchArgument(
+                "arm_joint_states_forward_rate_hz",
+                default_value="2.0",
+                description=(
+                    "Max rate (Hz) UpdateArmJointStates is actually sent to UE, "
+                    "independent of /joint_states' own publish rate -- avoids "
+                    "flooding the Remote Control WebSocket/log with every driver "
+                    "tick. 0 or negative disables throttling (forwards every message)."
+                ),
+            ),
             Node(
                 package="rammp_ui_bridge",
                 executable="ui_bridge_node",
@@ -91,6 +110,7 @@ def generate_launch_description():
                         "ue_ws_port": LaunchConfiguration("ue_ws_port"),
                         "ue_stream_port": LaunchConfiguration("ue_stream_port"),
                         "ue_preset": LaunchConfiguration("ue_preset"),
+                        "ue_log_level": LaunchConfiguration("ue_log_level"),
                         "scene_camera_color_topic": LaunchConfiguration(
                             "scene_camera_color_topic"
                         ),
@@ -109,6 +129,9 @@ def generate_launch_description():
                         ),
                         "use_python_camera_streaming": LaunchConfiguration(
                             "use_python_camera_streaming"
+                        ),
+                        "arm_joint_states_forward_rate_hz": LaunchConfiguration(
+                            "arm_joint_states_forward_rate_hz"
                         ),
                     }
                 ],
