@@ -1,0 +1,81 @@
+# syntax=docker/dockerfile:1
+
+# Container image for the rammp_ui_bridge node (+ its C++
+# rammp_ui_bridge_streaming sibling package).
+#
+# Copied from RAMMP-docker's templates/module.Dockerfile (see that repo for
+# the generic, heavily-commented version this is based on) and
+# rammp-orchestrator's Dockerfile (same base-image/overlay pattern).
+#
+# The base image already contains ROS 2 Humble, Cyclone DDS, and the RAMMP
+# interface contract (including rammp_ui_bridge_interfaces and
+# rammp_orchestrator_interfaces), so this copies ONLY this repo.
+
+# ── Pick and pin the base ────────────────────────────────────────────────────
+# rammp-base, not rammp-cuda: the bridge has no GPU workload -- it only
+# relays UE WebSocket/RMSS traffic and ROS2 topics/services. Pin an explicit
+# VERSION, not the floating :humble tag, so this image records exactly which
+# robot-interface version it was built against.
+#
+# This image is arm64/Jetson only -- build it on the Jetson, or on a native
+# arm64 CI runner.
+#
+# 2.0.0-jp6 is the first rammp-base release carrying rammp_ui_bridge_interfaces
+# and rammp_orchestrator_interfaces (see that tag's own release notes) -- all
+# this bridge needs; no later interface additions are required.
+FROM ghcr.io/rammp-org/rammp-base:2.0.0-jp6
+
+# ── Build this repo's packages into their own overlay ───────────────────────
+# /module_ws is a separate workspace layered on top of the base's /ros2_ws.
+# The entrypoint sources it automatically. Building here rather than into
+# /ros2_ws means this build does not recompile the robot interfaces (much
+# faster) and cannot accidentally ship a modified copy of them.
+WORKDIR /module_ws
+
+COPY . /module_ws/src/rammp_ui_bridge/
+
+# colcon finds every package.xml under src/, so both rammp_ui_bridge
+# (ament_python) and rammp_ui_bridge_streaming (ament_cmake, C++) are built.
+# The base ships rosdep's sources but no cache, so rosdep update first (bare
+# rosdep install fails with "rosdep installation has not been initialized
+# yet" otherwise). ramms-tools (rammp_ui_bridge/setup.py's pinned git
+# dependency) has no rosdep key, so colcon's own pip-install-the-package step
+# picks it up instead -- no separate pip install line needed here.
+# Keeps /module_ws/build (unlike rammp-orchestrator's Dockerfile, which
+# removes it): rammp_ui_bridge_streaming's gtest binary isn't installed by
+# `colcon build` (ament_add_gtest only places it under build/), and CI's own
+# docker-build-then-test-inside-the-image step needs it there.
+RUN . /opt/ros/humble/setup.sh \
+    && . /ros2_ws/install/setup.sh \
+    && apt-get update \
+    && rosdep update --rosdistro humble \
+    && rosdep install --from-paths src --ignore-src -y \
+    && rm -rf /var/lib/apt/lists/* \
+    && colcon build \
+    && rm -rf /module_ws/log
+
+# ros2 launch: what every engine developer actually runs today, per
+# README.md/docs/MANUAL_TESTING.md, and the default when this image is run
+# standalone (no sheppy). sheppy's own rammp-alternative.yaml overrides this
+# CMD with the node's installed executable directly (ros2 launch rejects the
+# --ros-args --params-file sheppy appends) -- the launch file's
+# LaunchConfiguration names are the same as the node's own parameter names,
+# so the same params work either way.
+CMD ["ros2", "launch", "rammp_ui_bridge", "ui_bridge.launch.py"]
+
+# `ros2 launch` on Humble has no SIGTERM handler: as PID 1 it ignores the
+# SIGTERM `docker stop` (and `sheppy woof`) sends and is SIGKILLed after the
+# grace period, leaving the node no chance to close its UE WebSocket/RMSS
+# connections cleanly. On SIGINT it shuts its nodes down properly, so make
+# that the stop signal (same fix already proven in
+# rammp-kitchen-capability-engines's Dockerfiles).
+STOPSIGNAL SIGINT
+
+# ── Running on the robot ────────────────────────────────────────────────────
+#   docker run --rm --network host --ipc host \
+#     ghcr.io/rammp-org/rammp-ui-bridge:<version>
+#
+#   --network host    required for DDS discovery. On a bridge network Cyclone
+#                     binds the bridge interface and nodes in other containers
+#                     never discover each other.
+#   --ipc host        lets Cyclone use shared memory between containers.

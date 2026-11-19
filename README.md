@@ -180,4 +180,35 @@ camera's real topics (§3.2). The joint/base-state side (§5.2.B) still has
 no ROS2-side source -- see `docs/NODE_INTERFACE.md`'s "Not yet in scope"
 section for what's blocked on that.
 
+## Deployment: this image as sheppy alternatives
+
+`Dockerfile` builds both `rammp_ui_bridge` and `rammp_ui_bridge_streaming`
+into one image, `FROM ghcr.io/rammp-org/rammp-base:2.0.0-jp6` (the first
+`rammp-base` release carrying `rammp_ui_bridge_interfaces` and
+`rammp_orchestrator_interfaces`). CI (`.github/workflows/ci.yml`) validates,
+builds, tests, smoke-tests, and publishes it to
+`ghcr.io/rammp-org/rammp-ui-bridge` on every push to `main`.
+
+This repo ships one real/mock fragment pair, transcribed into
+`rammp-deployments`'s sheppy manifest the same way every
+`rammp-kitchen-capability-engines` capability's own fragment is:
+
+- `rammp-alternative.yaml` -- the real `ui_bridge_node`, expecting a real UE
+  instance (or `mock_ue`, for local dev) reachable at `ue_host`/`ue_ws_port`.
+- `rammp-alternative.mock.yaml` -- the exact same node/image/interface (this
+  node has no internal simulation mode, unlike a capability engine's
+  `mock:=true`), for an all-mock sheppy profile pointed at a `mock_ue`
+  peer instead -- see that file's own comment and "Testing without real UE"
+  above for `mock_ue` itself.
+
+`scripts/validate_fragment.py` checks each fragment's shape (copied from
+`rammp-kitchen-capability-engines`/`rammp-orchestrator`'s identical generic
+checker -- keep all three in sync if any changes). `scripts/check_fragments.py`
+additionally checks: both fragments' `id`s are unique, both pin this repo's
+own GHCR image, the mock's `publishes`/`subscribes` match the real one
+exactly, and the Dockerfile's `FROM` is pinned to a release/nightly tag.
+`scripts/smoke.py` runs the built image the way `sheppyd` will (one real run
+per fragment, its `params:` as a params file) and checks it stays up and
+exits cleanly on `SIGTERM`.
+
 
