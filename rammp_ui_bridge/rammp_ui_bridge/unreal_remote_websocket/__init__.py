@@ -205,6 +205,17 @@ class UnrealRemoteWebsocket:
         # should retry resolving again, rather than treating the previous
         # connection's already-resolved result as still good forever.
         self._connection_generation = 0
+        # Tracks which connection generation _ensure_resolved last ran its
+        # own on-demand resolve_functions() attempt for -- without this, a
+        # function that never resolves (e.g. UE's project genuinely
+        # doesn't expose it) gets re-resolved on *every single call* of
+        # whatever hot loop needs it (PollUIEvents at
+        # ui_event_poll_rate_hz, ~15Hz by default), hammering UE's preset
+        # API and spamming the "could not resolve" warning at that same
+        # rate instead of once per function_resolve_period_s via the
+        # background loop. One on-demand attempt per generation still
+        # closes the original just-reconnected race this was built for.
+        self._ensure_resolved_attempted_generation = -1
         self._ui_event_since_sequence = 0
         # Populated by resolve_functions() (scheduled on every WS (re)connect,
         # alongside list_presets()): cpp_name -> {"preset": ..., "display_name": ...}
@@ -515,10 +526,23 @@ class UnrealRemoteWebsocket:
         live (2026-11-16): the very first call right after connecting can
         otherwise fire before the background loop's first attempt even
         gets a chance to run, always falling back to a (possibly stale,
-        UI-team-renamed) hardcoded DisplayName."""
+        UI-team-renamed) hardcoded DisplayName.
+
+        Only does this *once per connection generation* (tracked via
+        ``_ensure_resolved_attempted_generation``) -- a caller in a hot
+        loop (e.g. ``poll_ui_events_loop`` at ``ui_event_poll_rate_hz``,
+        ~15Hz by default) asking for a function that never resolves (UE's
+        project genuinely doesn't expose it) would otherwise re-trigger a
+        full ``resolve_functions()`` GET-preset call on every single tick
+        forever, hammering UE's preset API and spamming the "could not
+        resolve" warning at that same rate instead of leaving further
+        retries to the background loop's own period."""
         resolution = self._function_resolution.get(cpp_name)
         if resolution is not None:
             return resolution
+        if self._ensure_resolved_attempted_generation == self._connection_generation:
+            return None
+        self._ensure_resolved_attempted_generation = self._connection_generation
         try:
             await self.resolve_functions()
         except Exception as e:
