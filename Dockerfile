@@ -47,7 +47,11 @@ COPY . /module_ws/src/rammp_ui_bridge/
 # NOT pip-install a package's install_requires (confirmed the hard way: CI's
 # first real build produced an image that couldn't import ramms_tools at
 # all), so it needs its own explicit pip install, pinned to the exact same
-# tag setup.py declares (per package.xml's own comment on this).
+# tag setup.py declares (per package.xml's own comment on this). Plain
+# `pip install git+<url>@<tag>`, not the PEP 508 `name @ git+<url>` form --
+# the latter also failed CI, since pip cross-checks the requested name
+# ("ramms-tools") against this package's own build metadata name and
+# rejects the install on any mismatch.
 # Keeps /module_ws/build (unlike rammp-orchestrator's Dockerfile, which
 # removes it): rammp_ui_bridge_streaming's gtest binary isn't installed by
 # `colcon build` (ament_add_gtest only places it under build/), and CI's own
@@ -60,7 +64,7 @@ RUN . /opt/ros/humble/setup.sh \
     && rosdep install --from-paths src --ignore-src -y \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -m pip install --no-cache-dir \
-         'ramms-tools @ git+https://github.com/rammp-org/ramms-tools.git@v0.2.1' \
+         'git+https://github.com/rammp-org/ramms-tools.git@v0.2.1' \
     && colcon build \
     && rm -rf /module_ws/log
 
