@@ -71,6 +71,24 @@ COPY . /module_ws/src/rammp_ui_bridge/
 # removes it): rammp_ui_bridge_streaming's gtest binary isn't installed by
 # `colcon build` (ament_add_gtest only places it under build/), and CI's own
 # docker-build-then-test-inside-the-image step needs it there.
+#
+# Also upgrade websockets after rosdep install: rosdep resolves
+# package.xml's `python3-websockets` exec_depend to Ubuntu jammy's apt
+# package, pinned at 9.1-1 -- which predates Python 3.10 support. Its
+# connection-teardown code (legacy/protocol.py) still calls
+# `asyncio.Lock(loop=...)`/`Event(loop=...)` guarded by a `sys.version_info
+# < (3, 8)` check that resolves to `loop=None` (not omitting the kwarg
+# entirely) on 3.10+, and Python 3.10's asyncio locks reject even an
+# explicit `loop=None` with `TypeError: As of 3.10, the *loop* parameter was
+# removed...`. This only fires when a WS connection actually closes (e.g.
+# UE's connection dropping, or this node being stopped) -- confirmed live:
+# killing ui_bridge_node logged "GUI connection error: As of 3.10, the *loop*
+# parameter was removed from Lock() since it is no longer necessary" and the
+# UE connection never recovered. Upgrading to any websockets>=10 removes
+# these guarded loop= call sites entirely; pip-installed packages live under
+# /usr/local/lib and shadow rosdep's apt copy at /usr/lib on `sys.path`, so
+# this is enough to fix it without touching the rosdep dependency itself
+# (still a valid key, just a stale version).
 RUN . /opt/ros/humble/setup.sh \
     && . /ros2_ws/install/setup.sh \
     && apt-get update \
@@ -81,6 +99,8 @@ RUN . /opt/ros/humble/setup.sh \
     && python3 -m pip install --no-cache-dir --upgrade 'setuptools>=68,<80' wheel \
     && python3 -m pip install --no-cache-dir --no-build-isolation \
          'git+https://github.com/rammp-org/ramms-tools.git@v0.2.1' \
+    && python3 -m pip install --no-cache-dir --upgrade 'websockets>=12,<17' \
+    && python3 -m pip install --no-cache-dir --upgrade 'websockets>=12,<17' \
     && colcon build \
     && rm -rf /module_ws/log
 
