@@ -1,0 +1,63 @@
+# This repo's contract, as code: sheppy's `alternative` schema plus RAMMP's
+# `tier` (and `implements`, once a role contract exists). It is transcribed
+# into rammp-deployments's sheppy-manifest.yaml, the same way every
+# rammp-kitchen-capability-engines capability's own fragment is.
+#
+# Keys under `container:` are the compose subset sheppy supports: image,
+# command, entrypoint, environment, env_file, network_mode, volumes, devices,
+# gpus, privileged, cap_add, cap_drop, ports, user, working_dir. Declare
+# hardware here, never in a README step. Do not set RMW_IMPLEMENTATION or
+# CYCLONEDDS_URI; rammp-base owns them.
+id: ui_bridge
+tier: experimental
+kind: docker
+container:
+  # :dev is mutable and overwritten on every merge to main. A demo profile
+  # needs a release tag or digest; `tier: demo-ready` is rejected without one.
+  image: ghcr.io/rammp-org/rammp-ui-bridge:dev
+  network_mode: host
+  ipc: host
+  # Runs the ui_bridge_node executable directly, without ros2 launch/run:
+  # sheppy appends `--ros-args --params-file` to the command, which `ros2
+  # launch` rejects and which `ros2 run` (as PID 1) would otherwise have to
+  # forward itself; the node's installed executable handles both cleanly.
+  command: ["/module_ws/install/rammp_ui_bridge/lib/rammp_ui_bridge/ui_bridge_node"]
+# Defaults for every value a deployment may change per robot or from the
+# sheppy TUI; a profile can override only keys listed here. These mirror
+# ui_bridge.launch.py's own LaunchConfiguration defaults (the node's own
+# declare_parameter() defaults for ue_preset/use_python_camera_streaming are
+# stale placeholders the launch file already overrides in practice -- see
+# ui_bridge_node.py and docs/NODE_INTERFACE.md for what each parameter does).
+params:
+  ue_host: "127.0.0.1"
+  ue_ws_port: 30020
+  ue_stream_port: 30030
+  ue_preset: "RAMMP"
+  ue_log_level: "INFO"
+  # Not launch-file overridden; these fall back to ui_bridge_node.py's own
+  # declare_parameter() defaults even when run via the launch file too.
+  ue_user_input_property_label: "LastUIEventJSON"
+  ue_ui_event_poll_rate_hz: 15.0
+  connection_publish_period: 1.0
+  ue_stream_reconnect_period: 3.0
+  arm_joint_states_topic: "/joint_states"
+  scene_camera_color_topic: "/scene_camera/color/image_raw"
+  scene_camera_depth_topic: "/scene_camera/depth/image_rect_raw"
+  scene_camera_depth_camera_info_topic: "/scene_camera/depth/camera_info"
+  tf_base_frame: "base_link"
+  scene_camera_tf_frame: "scene_camera"
+  engine_overlay_topic: "/engine_overlay/image_raw"
+  # true: this node forwards scene/engine-overlay frames to UE itself. Set
+  # false only when rammp_ui_bridge_streaming's camera_stream_node (C++) is
+  # deployed instead, to avoid forwarding every frame to UE twice.
+  use_python_camera_streaming: true
+  arm_joint_states_forward_rate_hz: 2.0
+  base_joint_states_topic: "/base/joint_states"
+publishes: [/ui_bridge_node/ui_control/status, /ui_bridge_node/ue_connection]
+subscribes:
+  - /scene_camera/color/image_raw
+  - /scene_camera/depth/image_rect_raw
+  - /scene_camera/depth/camera_info
+  - /engine_overlay/image_raw
+  - /joint_states
+  - /base/joint_states

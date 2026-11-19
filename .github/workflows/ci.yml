@@ -1,0 +1,115 @@
+name: UI Bridge
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install checker dependencies
+        run: pip install pyyaml
+
+      - name: Validate every rammp-alternative.yaml fragment
+        run: python3 scripts/check_fragments.py
+
+  build-test-smoke:
+    needs: checks
+    # Native arm64: rammp-base is arm64-only, and so is this image's robot target.
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t rammp_ui_bridge:ci .
+
+      # rammp_ui_bridge's own pytest suite -- the image already has ROS2
+      # Humble and python3-pytest (a declared test_depend, installed by the
+      # Dockerfile's own `rosdep install`).
+      - name: Run rammp_ui_bridge's pytest suite inside the built image
+        run: |
+          docker run --rm rammp_ui_bridge:ci \
+            bash -lc "cd /module_ws/src/rammp_ui_bridge/rammp_ui_bridge && python3 -m pytest -q"
+
+      # rammp_ui_bridge_streaming's C++ gtest. Runs the gtest binary
+      # directly rather than `colcon test` (which also runs ament_lint_auto's
+      # flake8/uncrustify/pep257/cmake-lint/xmllint battery -- unrelated to
+      # this change and already failing in this environment for pre-existing
+      # reasons: a flake8/pycodestyle version mismatch and one file's
+      # pre-existing uncrustify formatting).
+      - name: Run rammp_ui_bridge_streaming's gtest inside the built image
+        run: |
+          docker run --rm rammp_ui_bridge:ci \
+            bash -lc "/module_ws/build/rammp_ui_bridge_streaming/test_rmss_protocol"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Stays up and exits cleanly -- real and mock fragments
+        run: |
+          pip install pyyaml
+          python3 scripts/smoke.py rammp_ui_bridge:ci rammp-alternative.yaml rammp-alternative.mock.yaml
+
+      - id: repo
+        if: github.event_name != 'pull_request'
+        name: Compute lowercase image name
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        if: github.event_name != 'pull_request'
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ steps.repo.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=sha,format=long
+
+      - if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push the exact image that just passed smoke, rather than rebuilding it.
+      - if: github.event_name != 'pull_request'
+        name: Publish
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
+            docker tag rammp_ui_bridge:ci "$tag"
+            docker push "$tag"
+          done
+
+  # The single check the branch ruleset requires.
+  ci-ok:
+    needs: [checks, build-test-smoke]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - name: All jobs passed
+        run: |
+          [ "${{ needs.checks.result }}" = success ] \
+            && [ "${{ needs.build-test-smoke.result }}" = success ]

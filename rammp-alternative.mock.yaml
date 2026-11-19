@@ -1,0 +1,48 @@
+# The mock: the real alternative's exact ROS interface, no real UE instance
+# required. Unlike rammp-kitchen-capability-engines's capability mocks (which
+# simulate hardware inside the same node via a `mock:=true` launch arg), this
+# node has no internal simulation mode -- its only external dependency is
+# whatever is listening at ue_host:ue_ws_port, so the mock here is the exact
+# same node/image/command/params, just pointed at a mock_ue peer instead of a
+# real UE instance. Run `ros2 run rammp_ui_bridge mock_ue` (same image, see
+# README.md) reachable at that host for this fragment to connect successfully
+# in an all-mock sheppy profile. check_fragments.py rejects a mock whose
+# publishes/subscribes differ from the real one.
+id: ui_bridge_mock
+tier: experimental
+kind: docker
+container:
+  image: ghcr.io/rammp-org/rammp-ui-bridge:dev
+  network_mode: host
+  ipc: host
+  command: ["/module_ws/install/rammp_ui_bridge/lib/rammp_ui_bridge/ui_bridge_node"]
+params:
+  # mock_ue listens on the same default host/port as a real UE instance
+  # would -- override only if the all-mock profile runs it elsewhere.
+  ue_host: "127.0.0.1"
+  ue_ws_port: 30020
+  ue_stream_port: 30030
+  ue_preset: "RAMMP"
+  ue_log_level: "INFO"
+  ue_user_input_property_label: "LastUIEventJSON"
+  ue_ui_event_poll_rate_hz: 15.0
+  connection_publish_period: 1.0
+  ue_stream_reconnect_period: 3.0
+  arm_joint_states_topic: "/joint_states"
+  scene_camera_color_topic: "/scene_camera/color/image_raw"
+  scene_camera_depth_topic: "/scene_camera/depth/image_rect_raw"
+  scene_camera_depth_camera_info_topic: "/scene_camera/depth/camera_info"
+  tf_base_frame: "base_link"
+  scene_camera_tf_frame: "scene_camera"
+  engine_overlay_topic: "/engine_overlay/image_raw"
+  use_python_camera_streaming: true
+  arm_joint_states_forward_rate_hz: 2.0
+  base_joint_states_topic: "/base/joint_states"
+publishes: [/ui_bridge_node/ui_control/status, /ui_bridge_node/ue_connection]
+subscribes:
+  - /scene_camera/color/image_raw
+  - /scene_camera/depth/image_rect_raw
+  - /scene_camera/depth/camera_info
+  - /engine_overlay/image_raw
+  - /joint_states
+  - /base/joint_states
