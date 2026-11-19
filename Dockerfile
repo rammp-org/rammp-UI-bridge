@@ -29,6 +29,17 @@
 # the earliest base tag that actually has everything this bridge needs.
 FROM ghcr.io/rammp-org/rammp-base:2.2.0-jp6
 
+# Unbuffer Python's stdout: without this, print()-based logs (e.g. "GUI
+# connected."/"GUI disconnected." in unreal_remote_websocket) are fully
+# block-buffered under Docker (stdout isn't a tty), so they only reach
+# `docker logs` whenever the buffer happens to fill or the process exits --
+# confirmed live: "GUI connected." only appeared in the log at the same
+# moment the node was killed, many minutes after the connection actually
+# happened, making the log look like nothing had connected at all. The
+# `logging` module's lines (written to stderr, which Python never
+# block-buffers) were unaffected and always showed up immediately.
+ENV PYTHONUNBUFFERED=1
+
 # ── Build this repo's packages into their own overlay ───────────────────────
 # /module_ws is a separate workspace layered on top of the base's /ros2_ws.
 # The entrypoint sources it automatically. Building here rather than into
@@ -99,7 +110,6 @@ RUN . /opt/ros/humble/setup.sh \
     && python3 -m pip install --no-cache-dir --upgrade 'setuptools>=68,<80' wheel \
     && python3 -m pip install --no-cache-dir --no-build-isolation \
          'git+https://github.com/rammp-org/ramms-tools.git@v0.2.1' \
-    && python3 -m pip install --no-cache-dir --upgrade 'websockets>=12,<17' \
     && python3 -m pip install --no-cache-dir --upgrade 'websockets>=12,<17' \
     && colcon build \
     && rm -rf /module_ws/log
