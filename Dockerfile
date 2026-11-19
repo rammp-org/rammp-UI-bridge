@@ -43,8 +43,11 @@ COPY . /module_ws/src/rammp_ui_bridge/
 # The base ships rosdep's sources but no cache, so rosdep update first (bare
 # rosdep install fails with "rosdep installation has not been initialized
 # yet" otherwise). ramms-tools (rammp_ui_bridge/setup.py's pinned git
-# dependency) has no rosdep key, so colcon's own pip-install-the-package step
-# picks it up instead -- no separate pip install line needed here.
+# dependency) has no rosdep key -- `colcon build`'s ament_python step does
+# NOT pip-install a package's install_requires (confirmed the hard way: CI's
+# first real build produced an image that couldn't import ramms_tools at
+# all), so it needs its own explicit pip install, pinned to the exact same
+# tag setup.py declares (per package.xml's own comment on this).
 # Keeps /module_ws/build (unlike rammp-orchestrator's Dockerfile, which
 # removes it): rammp_ui_bridge_streaming's gtest binary isn't installed by
 # `colcon build` (ament_add_gtest only places it under build/), and CI's own
@@ -52,9 +55,12 @@ COPY . /module_ws/src/rammp_ui_bridge/
 RUN . /opt/ros/humble/setup.sh \
     && . /ros2_ws/install/setup.sh \
     && apt-get update \
+    && apt-get install -y --no-install-recommends git \
     && rosdep update --rosdistro humble \
     && rosdep install --from-paths src --ignore-src -y \
     && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir \
+         'ramms-tools @ git+https://github.com/rammp-org/ramms-tools.git@v0.2.1' \
     && colcon build \
     && rm -rf /module_ws/log
 
