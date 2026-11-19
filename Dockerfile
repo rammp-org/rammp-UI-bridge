@@ -52,6 +52,17 @@ COPY . /module_ws/src/rammp_ui_bridge/
 # the latter also failed CI, since pip cross-checks the requested name
 # ("ramms-tools") against this package's own build metadata name and
 # rejects the install on any mismatch.
+#
+# Also upgrade setuptools/wheel first: the system python3-pip here ends up
+# building ramms-tools' pyproject.toml-only metadata (name/version/package
+# discovery, no setup.py/setup.cfg at all) with the system setuptools
+# (Ubuntu jammy's 59.6.0) rather than the `setuptools>=68,<80` its own
+# build-system.requires asks for -- confirmed the hard way: CI's build
+# "succeeded" but silently produced a near-empty `UNKNOWN-0.0.0` wheel
+# (setuptools 59.6.0 predates PEP 621 `[project]` table support, so it
+# read no name/version/packages at all), which is how pytest's import
+# failed despite the pip install step reporting success. setuptools>=68
+# parses `[project]`/`[tool.setuptools.packages.find]` correctly.
 # Keeps /module_ws/build (unlike rammp-orchestrator's Dockerfile, which
 # removes it): rammp_ui_bridge_streaming's gtest binary isn't installed by
 # `colcon build` (ament_add_gtest only places it under build/), and CI's own
@@ -63,6 +74,7 @@ RUN . /opt/ros/humble/setup.sh \
     && rosdep update --rosdistro humble \
     && rosdep install --from-paths src --ignore-src -y \
     && rm -rf /var/lib/apt/lists/* \
+    && python3 -m pip install --no-cache-dir --upgrade 'setuptools>=68,<80' wheel \
     && python3 -m pip install --no-cache-dir \
          'git+https://github.com/rammp-org/ramms-tools.git@v0.2.1' \
     && colcon build \
