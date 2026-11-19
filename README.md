@@ -183,9 +183,11 @@ section for what's blocked on that.
 ## Deployment: this image as sheppy alternatives
 
 `Dockerfile` builds both `rammp_ui_bridge` and `rammp_ui_bridge_streaming`
-into one image, `FROM ghcr.io/rammp-org/rammp-base:2.0.0-jp6` (the first
-`rammp-base` release carrying `rammp_ui_bridge_interfaces` and
-`rammp_orchestrator_interfaces`). CI (`.github/workflows/ci.yml`) validates,
+into one image, `FROM ghcr.io/rammp-org/rammp-base:2.2.0-jp6` (the first
+`rammp-base` release compiled against `rammp-interfaces-ros2` v2.1.0+,
+which is when `SetEngineOverlayVisible`/`UpdateUserInputPanel` were added to
+`rammp_ui_bridge_interfaces` -- earlier base tags carry an older, incompatible
+copy of that package). CI (`.github/workflows/ci.yml`) validates,
 builds, tests, smoke-tests, and publishes it to
 `ghcr.io/rammp-org/rammp-ui-bridge` on every push to `main`.
 

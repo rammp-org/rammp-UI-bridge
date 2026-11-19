@@ -20,10 +20,14 @@
 # This image is arm64/Jetson only -- build it on the Jetson, or on a native
 # arm64 CI runner.
 #
-# 2.0.0-jp6 is the first rammp-base release carrying rammp_ui_bridge_interfaces
-# and rammp_orchestrator_interfaces (see that tag's own release notes) -- all
-# this bridge needs; no later interface additions are required.
-FROM ghcr.io/rammp-org/rammp-base:2.0.0-jp6
+# 2.0.0-jp6 carries rammp_ui_bridge_interfaces, but only as of the
+# rammp-interfaces-ros2 contract it compiled in at the time (v2.0.0), which
+# predates the UI-control services this node actually calls
+# (SetEngineOverlayVisible/UpdateUserInputPanel were added in interfaces
+# v2.1.0). 2.2.0-jp6 is the first rammp-base release built against
+# rammp-interfaces-ros2 v2.1.0+ (matches rammp-orchestrator's own pin) --
+# the earliest base tag that actually has everything this bridge needs.
+FROM ghcr.io/rammp-org/rammp-base:2.2.0-jp6
 
 # ── Build this repo's packages into their own overlay ───────────────────────
 # /module_ws is a separate workspace layered on top of the base's /ros2_ws.
