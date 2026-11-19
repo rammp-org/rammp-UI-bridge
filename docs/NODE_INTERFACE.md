@@ -826,7 +826,7 @@ Remote Control function calls:
 Uses the RMSS binary TCP streaming protocol from the
 [`ramms-tools`](https://github.com/rammp-org/ramms-tools) dependency
 (MIT licensed; install with
-`pip install git+https://github.com/rammp-org/ramms-tools.git` -- see
+`pip install git+https://github.com/rammp-org/ramms-tools.git@v0.2.1` -- see
 README.md's "Prerequisites"), imported as `ramms_tools.streaming` rather
 than vendored -- the bridge only uses `StreamSender`, since it never
 receives -- `StreamSender.send_image`/`send_depth_uint16` framing, not

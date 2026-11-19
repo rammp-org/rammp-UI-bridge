@@ -15,7 +15,13 @@ setup(
     install_requires=[
         'setuptools',
         'websockets',
-        'ramms-tools @ git+https://github.com/rammp-org/ramms-tools.git',
+        # Pinned to a release tag (not the floating default branch) -- v0.2.1
+        # is the first release where ramms-tools/issues/13 is fixed: the
+        # NumPy floor is numpy>=1.21 (matches Ubuntu 22.04/ROS Humble's
+        # system python3-numpy 1.21.5) and setuptools is capped <80, so
+        # installing this no longer upgrades NumPy and breaks the system
+        # python3-scipy ROS code elsewhere depends on.
+        'ramms-tools @ git+https://github.com/rammp-org/ramms-tools.git@v0.2.1',
     ],
     zip_safe=True,
     maintainer='Liyun Guo',

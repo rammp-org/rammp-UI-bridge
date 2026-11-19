@@ -22,10 +22,14 @@ Besides the usual ROS2 (Humble) + `rammp_orchestrator_interfaces`/
 `rammp_ui_bridge_interfaces` colcon workspace setup, this node depends on
 [`ramms-tools`](https://github.com/rammp-org/ramms-tools) (MIT licensed)
 for its RMSS camera-streaming client, which is not on PyPI/rosdep -- install
-it manually into the same Python environment colcon builds against:
+it manually into the same Python environment colcon builds against. Pin the
+same release tag `setup.py` declares (currently `v0.2.1` --
+[ramms-tools#13](https://github.com/rammp-org/ramms-tools/issues/13)'s
+NumPy/setuptools fixes, the first release that doesn't upgrade the host's
+NumPy and break the system `python3-scipy` ROS code elsewhere depends on):
 
 ```bash
-pip install git+https://github.com/rammp-org/ramms-tools.git
+pip install git+https://github.com/rammp-org/ramms-tools.git@v0.2.1
 ```
 
 ## Testing without real UE

@@ -31,8 +31,8 @@
   <!--
     ramms_tools (for rammp_ui_bridge.streaming -> ramms_tools.streaming,
     the RMSS camera-stream client, see README.md "Prerequisites") has no
-    rosdep key; install manually:
-      pip install git+https://github.com/rammp-org/ramms-tools.git
+    rosdep key; install manually, pinned to the release tag setup.py uses:
+      pip install git+https://github.com/rammp-org/ramms-tools.git@v0.2.1
   -->
 
   <test_depend>python3-pytest</test_depend>

@@ -56,8 +56,8 @@ forwards every frame to UE as the §5.2.A base layer, over the RMSS
 streaming protocol (``ramms_tools.streaming.StreamSender`` -- a TCP client
 of UE's streaming server, separate from the Remote Control WebSocket,
 since this is bulk pixel data). ``ramms_tools`` is a dependency, installed
-via ``pip install git+https://github.com/rammp-org/ramms-tools.git`` (see
-README.md), not vendored into this repo.
+via ``pip install git+https://github.com/rammp-org/ramms-tools.git@v0.2.1``
+(see README.md), not vendored into this repo.
 
 **Overlay-camera & user-input arbitration (§3.3.1/§3.3.2).** Every engine
 with its own camera publishes to the *same* topic (``engine_overlay_topic``),
