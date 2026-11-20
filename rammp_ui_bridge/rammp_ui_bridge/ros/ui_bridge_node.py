@@ -360,19 +360,27 @@ class UiBridgeNode(Node):
         # relative to (ROS_Specification_Gen1.5.md: "/tf ... rooted at
         # base_link").
         #
-        # issue #8: the extrinsics pose is now looked up against the depth
-        # *image's own* ``header.frame_id`` (normally a ROS optical-
-        # convention frame, e.g. "scene_camera_color_optical_frame") rather
-        # than a separately-configured body frame -- that's the only frame
+        # issue #8: the extrinsics pose is looked up against the depth
+        # camera's own optical TF frame (normally a ROS optical-convention
+        # frame, e.g. "scene_camera_color_optical_frame") rather than a
+        # separately-configured body frame -- that's the only frame
         # guaranteed to actually match the intrinsics/pixels being sent,
         # including any body<->optical translation offset, and
         # ``_tf_to_ue_extrinsics(..., optical=True)`` corrects its rotation
-        # back to UE's +X-forward camera convention. ``scene_camera_tf_frame``
-        # is kept only as a manual override for a frame that's already in
-        # UE's body convention (e.g. "scene_camera" itself) -- leave it ""
-        # (default) to use the depth image's frame_id.
+        # back to UE's +X-forward camera convention. This is a hardcoded
+        # param (``scene_camera_depth_frame_id``), not read from the live
+        # depth ``Image``'s ``header.frame_id`` -- this node doesn't need
+        # to subscribe to depth at all when python-side streaming is
+        # disabled (``use_python_streaming:=false``, the C++
+        # ``rammp_ui_bridge_streaming`` node handles pixels instead), so
+        # the frame name can't depend on a message it may never receive.
+        # ``scene_camera_tf_frame`` is kept only as a manual override for a
+        # frame that's already in UE's body convention (e.g.
+        # "scene_camera" itself) -- leave it "" (default) to use
+        # ``scene_camera_depth_frame_id``.
         self.declare_parameter("tf_base_frame", "base_link")
         self.declare_parameter("scene_camera_tf_frame", "")
+        self.declare_parameter("scene_camera_depth_frame_id", "scene_camera_color_optical_frame")
         # §3.3.1/§5.2.A overlay layer: one fixed, shared topic every engine
         # publishes its own camera to -- not a per-engine topic/parameter
         # table. Only one engine can ever be *active* at a time (the
@@ -730,9 +738,7 @@ class UiBridgeNode(Node):
         with self._camera_lock:
             self._latest_scene_depth_camera_info = msg
 
-    def _lookup_scene_camera_extrinsics(
-        self, image_frame_id: str = ""
-    ) -> dict[str, float] | None:
+    def _lookup_scene_camera_extrinsics(self) -> dict[str, float] | None:
         """Looks up the scene camera's current pose (TF, §7) relative to
         ``tf_base_frame``, converted to the UE-metadata shape via
         ``_tf_to_ue_extrinsics``. Returns the last successfully-resolved
@@ -742,9 +748,11 @@ class UiBridgeNode(Node):
         same "keep stale rather than drop" convention the Gen1 prototype
         bridge's own camera-extrinsics lookup used.
 
-        ``image_frame_id`` (issue #8) is the image's own ``header.frame_id``
-        (e.g. the depth frame's), normally a ROS optical-convention frame --
-        used (with the optical->body correction applied) unless
+        Looks up ``scene_camera_depth_frame_id`` (issue #8) -- a hardcoded
+        param, not the live depth ``Image``'s ``header.frame_id``, since
+        this node doesn't subscribe to depth at all when python-side
+        streaming is disabled -- normally a ROS optical-convention frame,
+        used with the optical->body correction applied, unless
         ``scene_camera_tf_frame`` is explicitly set, in which case that
         param overrides it and is assumed to already be in body
         convention (no correction applied)."""
@@ -753,7 +761,8 @@ class UiBridgeNode(Node):
         if override_frame:
             camera_frame, optical = override_frame, False
         else:
-            camera_frame, optical = image_frame_id, True
+            camera_frame = self.get_parameter("scene_camera_depth_frame_id").value
+            optical = True
         if not camera_frame:
             return self._last_scene_camera_extrinsics
         try:
@@ -832,7 +841,7 @@ class UiBridgeNode(Node):
                 "cx": camera_info.k[2],
                 "cy": camera_info.k[5],
             }
-        extrinsics = self._lookup_scene_camera_extrinsics(image_frame_id=msg.header.frame_id)
+        extrinsics = self._lookup_scene_camera_extrinsics()
         if extrinsics is not None:
             meta["transform"] = extrinsics
             meta["transform_space"] = "relative"

@@ -852,18 +852,22 @@ not two interchangeable sources:
   "relative"`) -- the scene camera's pose relative to `tf_base_frame`, so
   UE can reproject depth pixels into world space without any hardcoded
   camera-mount assumption (§7, issue #8). The pose is looked up by TF
-  against the depth image's own `header.frame_id` (its intrinsics'
-  frame -- normally a ROS *optical*-convention frame, e.g.
-  `scene_camera_color_optical_frame`: +Z forward, +X right, +Y down, REP
-  103), **not** a separately-named body frame -- that's the only frame
-  guaranteed to match the intrinsics/pixels actually being sent,
-  including any body<->optical translation offset. Its rotation is then
-  corrected back to UE's own +X-forward camera convention by a single
-  fixed rotation (`_tf_to_ue_extrinsics(..., optical=True)`,
+  against `scene_camera_depth_frame_id` (a hardcoded param, not the live
+  depth `Image`'s `header.frame_id` -- this node doesn't need to
+  subscribe to depth at all when python-side streaming is disabled, the
+  common deployment, where the C++ `rammp_ui_bridge_streaming` node
+  handles pixels instead), normally a ROS *optical*-convention frame,
+  e.g. the default `scene_camera_color_optical_frame`: +Z forward, +X
+  right, +Y down, REP 103), **not** a separately-named body frame --
+  that's the only frame guaranteed to match the intrinsics/pixels
+  actually being sent, including any body<->optical translation offset.
+  Its rotation is then corrected back to UE's own +X-forward camera
+  convention by a single fixed rotation (`_tf_to_ue_extrinsics(...,
+  optical=True)`,
   `_OPTICAL_TO_BODY_QUAT` in `ui_bridge_node.py`) before the existing
   ROS->UE Y-axis flip. `scene_camera_tf_frame` is kept only as a manual
   override for a frame that's already in UE's body convention (left ""
-  by default, meaning "use the depth image's frame_id").
+  by default, meaning "use `scene_camera_depth_frame_id`").
 - **Overlay layer -- RGB from an active Engine node's own camera (§3.3),
   optional and additional.** An engine only opens this second stream
   when it has something detailed to show the user (e.g. a wrist-camera
