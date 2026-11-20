@@ -222,7 +222,9 @@ send_future = action_client.send_goal_async(goal, feedback_callback=on_feedback)
 ### 2.3 React to taps (Case B only) via feedback + `~/request_user_input/update`
 
 Every tap while the goal is active arrives as feedback
-(`feedback_json` parses to `{"event_type": "object_tapped", "instance_id": ...}`)
+(`feedback_json` parses to `{"event_type": "object_tapped", "instance_id": ...}`,
+plus `stream_id`, and for a tap on a camera image `tap_point` `[x, y]` and
+`image_size` `[w, h]`, in that camera's frame pixels: USER_INPUT_JSON_SCHEMA.md §5)
 -- it does **not** complete the goal by itself; the user may tap several
 cups before deciding. On each tap, update your own tracked "currently
 selected" state and tell the bridge to reflect it (highlight + message
@@ -233,6 +235,9 @@ def on_feedback(feedback_msg):
     fb = json.loads(feedback_msg.feedback.feedback_json)
     if fb.get("event_type") == "object_tapped":
         selected = fb["instance_id"]
+        # Where on the camera image the user tapped, if they tapped the image
+        # (absent for a tap in the 3D view): pixels of that camera's frame.
+        tap_point, image_size = fb.get("tap_point"), fb.get("image_size")
         update_client.call(UpdateUserInputPanel.Request(
             token=token,
             request_json=json.dumps({
@@ -346,7 +351,8 @@ All in `rammp-interfaces-ros2`:
 - `rammp_ui_bridge_interfaces/action/RequestUserInput` -- goal
   (`engine_id`, `token`, `request_json` -- JSON `panel_json`/`objects[]`/
   `selected_instance_id`, all optional), feedback (`feedback_json` --
-  JSON `{"event_type": "object_tapped", "instance_id": str}`), result
+  JSON `{"event_type": "object_tapped", "instance_id": str}`, plus optional
+  `stream_id`, `tap_point` `[x, y]` and `image_size` `[w, h]`), result
   (`result_json` -- JSON `{"status": "button", "button_id": str}` or
   `{"status": "cancelled"}`).
 - `rammp_ui_bridge_interfaces/srv/UpdateUserInputPanel` -- request

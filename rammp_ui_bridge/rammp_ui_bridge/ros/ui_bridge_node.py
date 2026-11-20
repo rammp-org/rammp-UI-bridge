@@ -181,6 +181,43 @@ def panel_button_ids(panel_json: str) -> frozenset[str]:
     return frozenset(b.get("button_id", "") for b in payload.get("buttons", []) if b.get("button_id"))
 
 
+def _is_number_pair(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 2
+        and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in value)
+    )
+
+
+def object_tapped_feedback(command: dict[str, Any]) -> dict[str, Any]:
+    """The ``feedback_json`` object for a tap that matched the active
+    ``RequestUserInput`` goal (USER_INPUT_JSON_SCHEMA.md §5):
+    ``event_type`` and ``instance_id``, plus whichever of UE's optional
+    keys came with the tap and are well-formed.
+
+    - ``stream_id``: the camera the box was tapped on.
+    - ``tap_point``: ``[x, y]`` where the tap landed, in pixels of that
+      camera's frame. The origin is the top-left corner, x right, y down:
+      the same space as the ``box``/``centroid`` this bridge sends UE.
+    - ``image_size``: ``[width, height]`` of that frame.
+
+    UE sends the two image keys only for a tap on a camera image, never
+    for one in the 3D view, so their presence says where the tap was.
+    They are forwarded together or not at all: a point without its frame
+    size can't be checked or rescaled. Anything else UE adds (``seq``,
+    ...) stays out of the engine-facing contract.
+    """
+    feedback: dict[str, Any] = {"event_type": "object_tapped", "instance_id": command.get("instance_id", "")}
+    stream_id = command.get("stream_id")
+    if isinstance(stream_id, str) and stream_id:
+        feedback["stream_id"] = stream_id
+    point, size = command.get("tap_point"), command.get("image_size")
+    if _is_number_pair(point) and _is_number_pair(size) and size[0] > 0 and size[1] > 0:
+        feedback["tap_point"] = [float(point[0]), float(point[1])]
+        feedback["image_size"] = [int(size[0]), int(size[1])]
+    return feedback
+
+
 def parse_request_json(request_json: str) -> dict[str, Any]:
     """Parses a ``RequestUserInput`` goal's or ``UpdateUserInputPanel``
     request's ``request_json`` (§3.3.2) into a plain dict -- keys present:
@@ -1251,7 +1288,7 @@ class UiBridgeNode(Node):
             else:
                 return False
         feedback = RequestUserInput.Feedback()
-        feedback.feedback_json = json.dumps({"event_type": "object_tapped", "instance_id": instance_id})
+        feedback.feedback_json = json.dumps(object_tapped_feedback(command))
         goal_handle.publish_feedback(feedback)
         return True
 

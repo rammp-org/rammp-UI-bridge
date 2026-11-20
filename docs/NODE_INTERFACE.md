@@ -248,7 +248,12 @@ string result_json
 # never after the result above is sent. An object tap does NOT complete
 # the goal by itself (see point 3 below).
 string feedback_json
-# JSON object: {"event_type": "object_tapped", "instance_id": str}
+# JSON object: {"event_type": "object_tapped", "instance_id": str}, plus,
+# when UE sent them: "stream_id": str (an image tap: the camera's stream id,
+# e.g. "camera/scene/color"; a 3D-view tap: the object's source, e.g.
+# "scene"), "tap_point": [x, y] (where on that camera's image, in pixels of
+# its frame) and "image_size": [width, height] (that frame). See
+# USER_INPUT_JSON_SCHEMA.md §5.
 ```
 
 ```
@@ -777,12 +782,25 @@ as one command object.
 ```json
 {"event_type": "button_press",  "button_id": "deselect", "seq": 7}
 {"event_type": "object_tapped", "instance_id": "cup_1", "stream_id": "camera/scene/color", "seq": 8}
+{"event_type": "object_tapped", "instance_id": "cup_1", "stream_id": "camera/scene/color",
+ "tap_point": [412.5, 233.25], "image_size": [1280, 720], "seq": 9}
 ```
 
 - `seq` is present on every event and increases monotonically.
-- `stream_id` is included on `object_tapped` when the UI knows which camera
-  the box was tapped on, and omitted when empty. It is the same stream id
-  space as §5.2.A's `stream_id`s.
+- `stream_id` is included on `object_tapped` when the UI knows where the
+  object was tapped, and omitted when empty.
+  - A tap on a camera image sends the camera's stream id, the same id space
+    as §5.2.A's `stream_id`s (`camera/scene/color`, `engine/overlay`).
+  - A tap in the 3D view sends the detection's `source` instead (`scene`,
+    `overlay`).
+- `tap_point` and `image_size` come with an `object_tapped` on a camera
+  image (rammp-org/ramms-ui#64), and are absent for a tap in the 3D view:
+  - `tap_point` is `[x, y]` where the tap landed, in pixels of that
+    camera's frame. The origin is the top-left corner, x right, y down:
+    the same space as the `box`/`centroid` this bridge sends UE.
+  - `image_size` is `[width, height]` of that frame.
+  - Both are forwarded to the active goal's `feedback_json`
+    (USER_INPUT_JSON_SCHEMA.md §5), together or not at all.
 - `object_tapped` is the name UE actually sends. Earlier revisions of this
   document called it `select_object`; the bridge still accepts that spelling
   from the legacy property path, and treats the two as identical.

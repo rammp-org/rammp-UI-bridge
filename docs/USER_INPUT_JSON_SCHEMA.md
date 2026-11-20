@@ -201,12 +201,41 @@ Sent once per object tap while the goal is still active, never after
 (§2, point 3).
 
 ```jsonc
-{"event_type": "object_tapped", "instance_id": "string"}
+{
+  "event_type": "object_tapped",
+  "instance_id": "string",
+  "stream_id": "string",          // optional: which camera or view (see below)
+  "tap_point": [412.5, 233.25],   // optional: [x, y] where on that camera's image
+  "image_size": [1280, 720]       // optional: [width, height] of that image
+}
 ```
 
 `event_type` is the only event type implemented today; the key exists so
 future event types (e.g. a drag/gesture) can be added without a new
 feedback field.
+
+- `stream_id`: present when UE knows where the object was tapped. Its form
+  depends on where the tap was, so don't compare it with your objects'
+  `source` directly; to learn a tapped object's camera, look it up by
+  `instance_id`.
+  - A tap on a camera image (`tap_point` present) carries that camera's
+    stream id: `"camera/scene/color"` for `source` `"scene"`,
+    `"engine/overlay"` for `source` `"overlay"`. This is the image
+    `tap_point` is in.
+  - A tap in the 3D view carries the object's own `source` (`"scene"`,
+    `"overlay"`).
+- `tap_point` and `image_size`: present, always together, only when the
+  tap was on a camera image. A tap in the 3D view carries neither, so
+  their presence says the user tapped the picture, and where.
+  - `tap_point` is `[x, y]` in pixels of that camera's frame. The origin
+    is the top-left corner, x right, y down: the same space as the `box`
+    and `centroid` you send in `objects`. The values are floats, clamped to
+    the frame.
+  - `image_size` is `[width, height]` of the frame the point is in (the
+    camera's streamed resolution). Use it to normalize the point, or to
+    rescale it to another image of the same camera.
+- All three are optional additions. Read them with `.get()` and fall back
+  to `instance_id` alone.
 
 ---
 
