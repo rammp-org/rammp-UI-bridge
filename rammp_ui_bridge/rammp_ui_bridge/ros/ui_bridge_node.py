@@ -310,7 +310,19 @@ class UiBridgeNode(Node):
 
         self.declare_parameter("ue_host", "127.0.0.1")
         self.declare_parameter("ue_ws_port", 30020)
-        self.declare_parameter("ue_preset", "RCP_RammsBridge")
+        # issue #13: "RCPS" (not "RCP_RammsBridge") is the preset name the
+        # Jetson/robot-deployed UE build actually exposes -- the bridge's
+        # own "preset.register" WS call never fails loudly on a name
+        # mismatch, it just never resolves any functions (see
+        # resolve_functions()'s "could not resolve" warning). UE's Remote
+        # Control subsystem also accumulates every name ever registered for
+        # the lifetime of the UE process (it isn't cleared when the
+        # bridge's WS client disconnects/reconnects) -- that's why a Jetson
+        # UE instance that's previously also been connected to with the old
+        # "RCP_RammsBridge" default lists *both* names via get_presets(),
+        # while a UE process that's only ever been registered against
+        # "RCPS" (e.g. a fresh local-PC dev build) only lists that one.
+        self.declare_parameter("ue_preset", "RCPS")
         # Controls the unreal_remote_websocket/ramms_tools.streaming loggers'
         # level (see their own module docstrings/comments) -- both default to
         # INFO on import to stay quiet; set this to "DEBUG" (e.g.

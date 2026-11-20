@@ -26,7 +26,7 @@ implementation-language question itself.
 |---|---|---|---|
 | `ue_host` | string | `127.0.0.1` | IP/hostname of the UE instance |
 | `ue_ws_port` | int | `30020` | UE Remote Control WebSocket API port |
-| `ue_preset` | string | `RCP_RammsBridge` | UE Remote Control preset name to register against |
+| `ue_preset` | string | `RCPS` | UE Remote Control preset name to register against (issue #13: the Jetson/robot-deployed UE build exposes `RCPS`, not the older `RCP_RammsBridge`; a name mismatch here doesn't fail loudly -- functions just never resolve, see `resolve_functions()`) |
 | `ue_user_input_property_label` | string | `LastUIEventJSON` | Preset property watched by the legacy property-push path (§5.1). The shipped receiver's own property is `UIEventsJson`; this one is kept for older UI builds and runs alongside the poll below |
 | `ue_ui_event_poll_rate_hz` | double (Hz) | `15.0` | How often the bridge calls `PollUIEvents` for buffered taps (§5.1) |
 | `connection_publish_period` | double (seconds) | `1.0` | Interval between connection-status publishes |
@@ -727,7 +727,7 @@ every connect (including reconnects after a dropped connection).
 **Preset functions are addressed by their exposed label, not their C++ name.**
 The receiver's `PollUIEvents` is exposed as `Poll UIEvents`, `UpdatePanel` as
 `Update Panel`, and so on, so the call is
-`PUT /remote/preset/RCP_RammsBridge/function/Poll%20UIEvents`;
+`PUT /remote/preset/RCPS/function/Poll%20UIEvents`;
 `.../function/PollUIEvents` fails with
 `"Unable to resolve the preset field."`
 
