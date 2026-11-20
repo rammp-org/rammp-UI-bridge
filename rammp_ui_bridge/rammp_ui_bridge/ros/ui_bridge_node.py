@@ -229,7 +229,40 @@ def _quat_to_euler_zyx_deg(x: float, y: float, z: float, w: float) -> tuple[floa
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 
-def _tf_to_ue_extrinsics(transform_stamped) -> dict[str, float]:
+# §7/issue #8: the fixed REP-103 "optical frame" rotation -- a ROS camera
+# frame's own TF frame (e.g. "scene_camera") is X-forward/Y-left/Z-up
+# ("body" convention, matching UE's +X-forward camera), but the *image*
+# frame_id a depth (or color) topic is actually stamped with is almost
+# always the sensor's OPTICAL frame instead (Z-forward/X-right/Y-down --
+# REP 103), related to the body frame by one fixed static rotation
+# (RPY -90/0/-90 deg, body->optical). Looking up TF by the image's own
+# frame_id (rather than guessing a separately-configured body frame name,
+# see ``scene_camera_tf_frame``) is the only way to get a transform that's
+# actually correct for *that* image's intrinsics/pixels, including any
+# body<->optical translation offset -- but its rotation then needs this
+# fixed correction undone before it matches the body/UE convention
+# ``_tf_to_ue_extrinsics`` otherwise assumes. Quaternion below (x, y, z,
+# w) is the inverse (optical->body) of the standard body->optical
+# rotation.
+_OPTICAL_TO_BODY_QUAT = (0.5, -0.5, 0.5, 0.5)
+
+
+def _quat_multiply(
+    q1: tuple[float, float, float, float], q2: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Hamilton product ``q1 ⊗ q2`` of two quaternions in ROS order
+    ``(x, y, z, w)`` -- applies ``q2``'s rotation first, then ``q1``'s."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    )
+
+
+def _tf_to_ue_extrinsics(transform_stamped, *, optical: bool = False) -> dict[str, float]:
     """Converts a ``geometry_msgs/TransformStamped`` (e.g. from a
     ``tf2_ros.Buffer.lookup_transform`` call) into the
     ``{"x","y","z","roll","pitch","yaw"}`` shape UE's RMSS stream metadata
@@ -237,10 +270,19 @@ def _tf_to_ue_extrinsics(transform_stamped) -> dict[str, float]:
     conversion the Gen1 prototype bridge's ``_tf_to_ue_extrinsics`` used,
     including its ROS->UE Y-axis-flip adjustment (UE's Y axis is flipped
     relative to ROS's, so the Y position and the pitch/yaw that depend on
-    it are negated)."""
+    it are negated).
+
+    ``optical=True`` (issue #8) means ``transform_stamped`` was looked up
+    against a ROS *optical*-convention frame (e.g. an image's own
+    ``header.frame_id``, typically ``*_optical_frame``) rather than a
+    body/UE-forward one -- its rotation is corrected by
+    ``_OPTICAL_TO_BODY_QUAT`` before the Y-flip/Euler conversion below."""
     t = transform_stamped.transform.translation
     r = transform_stamped.transform.rotation
-    roll_deg, pitch_deg, yaw_deg = _quat_to_euler_zyx_deg(r.x, r.y, r.z, r.w)
+    qx, qy, qz, qw = r.x, r.y, r.z, r.w
+    if optical:
+        qx, qy, qz, qw = _quat_multiply((qx, qy, qz, qw), _OPTICAL_TO_BODY_QUAT)
+    roll_deg, pitch_deg, yaw_deg = _quat_to_euler_zyx_deg(qx, qy, qz, qw)
     return {
         "x": t.x * 100.0,
         "y": -t.y * 100.0,
@@ -316,10 +358,29 @@ class UiBridgeNode(Node):
         # hardcoded camera-mount assumption. ``tf_base_frame`` is the
         # common root every sensor frame (including this one) is ultimately
         # relative to (ROS_Specification_Gen1.5.md: "/tf ... rooted at
-        # base_link"); ``scene_camera_tf_frame`` is the scene camera's own
-        # static TF frame (same doc's sensor table: "scene_camera").
+        # base_link").
+        #
+        # issue #8: the extrinsics pose is looked up against the depth
+        # camera's own optical TF frame (normally a ROS optical-convention
+        # frame, e.g. "scene_camera_color_optical_frame") rather than a
+        # separately-configured body frame -- that's the only frame
+        # guaranteed to actually match the intrinsics/pixels being sent,
+        # including any body<->optical translation offset, and
+        # ``_tf_to_ue_extrinsics(..., optical=True)`` corrects its rotation
+        # back to UE's +X-forward camera convention. This is a hardcoded
+        # param (``scene_camera_depth_frame_id``), not read from the live
+        # depth ``Image``'s ``header.frame_id`` -- this node doesn't need
+        # to subscribe to depth at all when python-side streaming is
+        # disabled (``use_python_streaming:=false``, the C++
+        # ``rammp_ui_bridge_streaming`` node handles pixels instead), so
+        # the frame name can't depend on a message it may never receive.
+        # ``scene_camera_tf_frame`` is kept only as a manual override for a
+        # frame that's already in UE's body convention (e.g.
+        # "scene_camera" itself) -- leave it "" (default) to use
+        # ``scene_camera_depth_frame_id``.
         self.declare_parameter("tf_base_frame", "base_link")
-        self.declare_parameter("scene_camera_tf_frame", "scene_camera")
+        self.declare_parameter("scene_camera_tf_frame", "")
+        self.declare_parameter("scene_camera_depth_frame_id", "scene_camera_color_optical_frame")
         # §3.3.1/§5.2.A overlay layer: one fixed, shared topic every engine
         # publishes its own camera to -- not a per-engine topic/parameter
         # table. Only one engine can ever be *active* at a time (the
@@ -685,14 +746,30 @@ class UiBridgeNode(Node):
         on a transient lookup failure -- e.g. the camera's static
         transform not having been broadcast yet right after startup --
         same "keep stale rather than drop" convention the Gen1 prototype
-        bridge's own camera-extrinsics lookup used."""
+        bridge's own camera-extrinsics lookup used.
+
+        Looks up ``scene_camera_depth_frame_id`` (issue #8) -- a hardcoded
+        param, not the live depth ``Image``'s ``header.frame_id``, since
+        this node doesn't subscribe to depth at all when python-side
+        streaming is disabled -- normally a ROS optical-convention frame,
+        used with the optical->body correction applied, unless
+        ``scene_camera_tf_frame`` is explicitly set, in which case that
+        param overrides it and is assumed to already be in body
+        convention (no correction applied)."""
         base_frame = self.get_parameter("tf_base_frame").value
-        camera_frame = self.get_parameter("scene_camera_tf_frame").value
+        override_frame = self.get_parameter("scene_camera_tf_frame").value
+        if override_frame:
+            camera_frame, optical = override_frame, False
+        else:
+            camera_frame = self.get_parameter("scene_camera_depth_frame_id").value
+            optical = True
+        if not camera_frame:
+            return self._last_scene_camera_extrinsics
         try:
             transform = self.tf_buffer.lookup_transform(
                 base_frame, camera_frame, rclpy.time.Time(), timeout=Duration(seconds=1.0)
             )
-            extrinsics = _tf_to_ue_extrinsics(transform)
+            extrinsics = _tf_to_ue_extrinsics(transform, optical=optical)
             self._last_scene_camera_extrinsics = extrinsics
             return extrinsics
         except Exception as exc:  # tf2's own exception hierarchy, kept broad on purpose
